@@ -7,6 +7,7 @@ using SHA
 using JSON
 
 # Security configuration structure
+# This struct was moved from MCPRepl.jl to be self-contained here.
 struct SecurityConfig
     mode::Symbol  # :strict, :relaxed, or :lax
     api_keys::Vector{String}
