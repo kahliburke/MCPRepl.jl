@@ -14,9 +14,15 @@ using DataFrames
 export init_db!,
     log_event!,
     get_events,
+    get_events_by_time_range,
     get_session_stats,
     register_session!,
     get_active_sessions,
+    get_all_sessions,
+    update_session_status!,
+    cleanup_old_events!,
+    get_global_stats,
+    get_recent_session_events,
     close_db!
 
 # Global database connection
@@ -26,7 +32,7 @@ const DB = Ref{Union{SQLite.DB,Nothing}}(nothing)
 Initialize the SQLite database with schema.
 Creates tables if they don't exist.
 """
-function init_db!(db_path::String = ".mcprepl/events.db")
+function init_db!(db_path::String=".mcprepl/events.db")
     # Create .mcprepl directory if it doesn't exist
     mkpath(dirname(db_path))
 
@@ -96,8 +102,8 @@ Register or update a session in the database.
 """
 function register_session!(
     session_id::String,
-    status::String = "active";
-    metadata::Dict = Dict(),
+    status::String="active";
+    metadata::Dict=Dict(),
 )
     db = DB[]
     if db === nothing
@@ -129,7 +135,7 @@ function log_event!(
     session_id::String,
     event_type::String,
     data::Dict;
-    duration_ms::Union{Float64,Nothing} = nothing,
+    duration_ms::Union{Float64,Nothing}=nothing,
 )
     db = DB[]
     if db === nothing
@@ -164,10 +170,10 @@ end
 Retrieve recent events from the database.
 """
 function get_events(;
-    session_id::Union{String,Nothing} = nothing,
-    event_type::Union{String,Nothing} = nothing,
-    limit::Int = 100,
-    offset::Int = 0,
+    session_id::Union{String,Nothing}=nothing,
+    event_type::Union{String,Nothing}=nothing,
+    limit::Int=100,
+    offset::Int=0,
 )
     db = DB[]
     if db === nothing
@@ -258,6 +264,184 @@ function get_active_sessions()
     SELECT * FROM sessions WHERE status = 'active'
     ORDER BY last_activity DESC
 """,
+    ) |> DataFrame
+end
+
+"""
+Get events within a time range.
+"""
+function get_events_by_time_range(;
+    session_id::Union{String,Nothing}=nothing,
+    start_time::DateTime,
+    end_time::DateTime=now(),
+    event_type::Union{String,Nothing}=nothing,
+    limit::Int=1000,
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    query = "SELECT * FROM events WHERE timestamp >= ? AND timestamp <= ?"
+    params = [Dates.format(start_time, "yyyy-mm-dd HH:MM:SS.sss"), Dates.format(end_time, "yyyy-mm-dd HH:MM:SS.sss")]
+
+    if session_id !== nothing
+        query *= " AND session_id = ?"
+        push!(params, session_id)
+    end
+
+    if event_type !== nothing
+        query *= " AND event_type = ?"
+        push!(params, event_type)
+    end
+
+    query *= " ORDER BY timestamp DESC LIMIT ?"
+    push!(params, limit)
+
+    return DBInterface.execute(db, query, params) |> DataFrame
+end
+
+"""
+Get session history (all sessions, not just active).
+"""
+function get_all_sessions(; limit::Int=100)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    return DBInterface.execute(
+        db,
+        """
+    SELECT * FROM sessions 
+    ORDER BY last_activity DESC
+    LIMIT ?
+""",
+        (limit,),
+    ) |> DataFrame
+end
+
+"""
+Update session status.
+"""
+function update_session_status!(session_id::String, status::String)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+
+    DBInterface.execute(
+        db,
+        """
+    UPDATE sessions 
+    SET status = ?, last_activity = ?
+    WHERE session_id = ?
+""",
+        (status, now_str, session_id),
+    )
+end
+
+"""
+Delete old events beyond a certain age to prevent database growth.
+"""
+function cleanup_old_events!(days_to_keep::Int=30)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    cutoff_date = now() - Dates.Day(days_to_keep)
+    cutoff_str = Dates.format(cutoff_date, "yyyy-mm-dd HH:MM:SS.sss")
+
+    result = DBInterface.execute(
+        db,
+        """
+    DELETE FROM events 
+    WHERE timestamp < ?
+""",
+        (cutoff_str,),
+    )
+
+    return result
+end
+
+"""
+Get aggregate statistics across all sessions.
+"""
+function get_global_stats()
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    # Total sessions
+    total_sessions = DBInterface.execute(
+        db,
+        "SELECT COUNT(DISTINCT session_id) as count FROM sessions"
+    ) |> DataFrame
+
+    # Active sessions
+    active_sessions = DBInterface.execute(
+        db,
+        "SELECT COUNT(*) as count FROM sessions WHERE status = 'active'"
+    ) |> DataFrame
+
+    # Total events
+    total_events = DBInterface.execute(
+        db,
+        "SELECT COUNT(*) as count FROM events"
+    ) |> DataFrame
+
+    # Events by type
+    events_by_type = DBInterface.execute(
+        db,
+        """
+        SELECT event_type, COUNT(*) as count
+        FROM events
+        GROUP BY event_type
+        ORDER BY count DESC
+    """
+    ) |> DataFrame
+
+    # Total execution time
+    total_execution_time = DBInterface.execute(
+        db,
+        """
+        SELECT SUM(duration_ms) as total_ms
+        FROM events
+        WHERE duration_ms IS NOT NULL
+    """
+    ) |> DataFrame
+
+    return Dict(
+        "total_sessions" => total_sessions,
+        "active_sessions" => active_sessions,
+        "total_events" => total_events,
+        "events_by_type" => events_by_type,
+        "total_execution_time_ms" => total_execution_time,
+    )
+end
+
+"""
+Get most recent N events for a session (optimized query).
+"""
+function get_recent_session_events(session_id::String, limit::Int=50)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    return DBInterface.execute(
+        db,
+        """
+    SELECT * FROM events
+    WHERE session_id = ?
+    ORDER BY timestamp DESC
+    LIMIT ?
+""",
+        (session_id, limit),
     ) |> DataFrame
 end
 
