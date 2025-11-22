@@ -1,13 +1,16 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
 repos:
-  - repo: https://github.com/domluna/JuliaFormatter.jl
-    rev: v2.2.0
-    hooks:
-      - id: julia-formatter
-  
   - repo: local
     hooks:
+      - id: julia-formatter
+        name: Julia Formatter
+        entry: julia scripts/format-check.jl
+        language: system
+        files: \.jl$
+        pass_filenames: true
+        description: "Format Julia files only if formatting changes are needed"
+      
       - id: julia-jet-analysis
         name: JET.jl Static Analysis
         entry: julia scripts/pre-commit-jet.jl
