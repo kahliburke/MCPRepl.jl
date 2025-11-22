@@ -44,10 +44,22 @@ const EVENT_LOG_LOCK = ReentrantLock()
 const WS_CLIENTS = Set{HTTP.WebSockets.WebSocket}()
 const WS_CLIENTS_LOCK = ReentrantLock()
 
+# Database logging callback (set by proxy during initialization)
+const DB_LOG_CALLBACK = Ref{Union{Function,Nothing}}(nothing)
+
+"""
+Set the database logging callback.
+Called by proxy.jl during initialization to enable database persistence.
+"""
+function set_db_callback!(callback::Function)
+    DB_LOG_CALLBACK[] = callback
+end
+
 """
     log_event(id::String, event_type::EventType, data::Dict; duration_ms=nothing)
 
 Log a session event and broadcast to connected dashboard clients.
+Also persists to database if callback is configured.
 """
 function log_event(id::String, event_type::EventType, data::Dict; duration_ms = nothing)
     event = AgentEvent(id, event_type, now(), data, duration_ms)
@@ -57,7 +69,17 @@ function log_event(id::String, event_type::EventType, data::Dict; duration_ms = 
         push!(EVENT_LOG, event)
         # Keep only last MAX_EVENTS
         if length(EVENT_LOG) > MAX_EVENTS
-            deleteat!(EVENT_LOG, 1:length(EVENT_LOG)-MAX_EVENTS)
+            deleteat!(EVENT_LOG, 1:(length(EVENT_LOG) - MAX_EVENTS))
+        end
+    end
+
+    # Persist to database (async to avoid blocking)
+    if DB_LOG_CALLBACK[] !== nothing
+        @async try
+            DB_LOG_CALLBACK[](id, string(event_type), event.timestamp, event.data, duration_ms)
+        catch e
+            # Silently ignore database errors to not disrupt real-time operations
+            @debug "Failed to persist event to database" exception = e
         end
     end
 

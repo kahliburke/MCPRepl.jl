@@ -3149,6 +3149,18 @@ function start_foreground_server(port::Int = 3000)
     Database.init_db!(db_path)
     @info "Database initialized for event storage" db_path = db_path
 
+    # Set up dashboard to use database for event persistence
+    Dashboard.set_db_callback!() do session_id, event_type, timestamp, data, duration_ms
+        Database.log_event!(
+            session_id,
+            event_type,
+            timestamp,
+            data;
+            duration_ms = duration_ms,
+        )
+    end
+    @info "Dashboard configured to persist events to database"
+
     @info "Starting MCP Proxy Server" port = port pid = getpid()
 
     # Start Vite dev server if in development mode
