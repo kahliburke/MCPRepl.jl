@@ -2214,32 +2214,24 @@ function handle_request(http::HTTP.Stream)
 
         if method == "proxy/status"
             repls = list_repls()
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_jsonrpc_result(
                 http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict(
-                            "status" => "running",
-                            "pid" => getpid(),
-                            "port" => SERVER_PORT[],
-                            "connected_repls" => length(repls),
-                            "repls" => [
-                                Dict(
-                                    "id" => r.id,
-                                    "port" => r.port,
-                                    "status" => string(r.status),
-                                    "pid" => r.pid,
-                                    "last_error" => r.last_error,
-                                ) for r in repls
-                            ],
-                            "uptime" => time(),
-                        ),
-                    ),
+                get(request, "id", nothing),
+                Dict(
+                    "status" => "running",
+                    "pid" => getpid(),
+                    "port" => SERVER_PORT[],
+                    "connected_repls" => length(repls),
+                    "repls" => [
+                        Dict(
+                            "id" => r.id,
+                            "port" => r.port,
+                            "status" => string(r.status),
+                            "pid" => r.pid,
+                            "last_error" => r.last_error,
+                        ) for r in repls
+                    ],
+                    "uptime" => time(),
                 ),
             )
             return nothing
@@ -2257,21 +2249,12 @@ function handle_request(http::HTTP.Stream)
                 Dict(String(k) => v for (k, v) in pairs(metadata_raw))
 
             if id === nothing || port === nothing
-                HTTP.setstatus(http, 400)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "error" => Dict(
-                                "code" => -32602,
-                                "message" => "Invalid params: 'id' and 'port' are required",
-                            ),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid params: 'id' and 'port' are required";
+                    status = 400,
                 )
                 return nothing
             end
@@ -2291,26 +2274,17 @@ function handle_request(http::HTTP.Stream)
                     @error "Duplicate registration attempted" id = id existing_pid =
                         existing_session.pid new_pid = pid existing_port =
                         existing_session.port new_port = port
-                    HTTP.setstatus(http, 409)  # Conflict
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_jsonrpc_error(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "error" => Dict(
-                                    "code" => -32000,
-                                    "message" => "Session ID '$id' is already registered by another process (PID $(existing_session.pid) on port $(existing_session.port)). Choose a different session name or stop the existing session first.",
-                                    "data" => Dict(
-                                        "existing_pid" => existing_session.pid,
-                                        "existing_port" => existing_session.port,
-                                        "requested_pid" => pid,
-                                        "requested_port" => port,
-                                    ),
-                                ),
-                            ),
+                        get(request, "id", nothing),
+                        -32000,
+                        "Session ID '$id' is already registered by another process (PID $(existing_session.pid) on port $(existing_session.port)). Choose a different session name or stop the existing session first.";
+                        status = 409,
+                        data = Dict(
+                            "existing_pid" => existing_session.pid,
+                            "existing_port" => existing_session.port,
+                            "requested_pid" => pid,
+                            "requested_port" => port,
                         ),
                     )
                     return nothing
@@ -2319,18 +2293,10 @@ function handle_request(http::HTTP.Stream)
 
             register_repl(id, port; pid = pid, metadata = metadata)
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_jsonrpc_result(
                 http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("status" => "registered", "id" => id),
-                    ),
-                ),
+                get(request, "id", nothing),
+                Dict("status" => "registered", "id" => id),
             )
             return nothing
         elseif method == "proxy/unregister"
@@ -2339,39 +2305,22 @@ function handle_request(http::HTTP.Stream)
             id = get(params, "id", nothing)
 
             if id === nothing
-                HTTP.setstatus(http, 400)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "error" => Dict(
-                                "code" => -32602,
-                                "message" => "Invalid params: 'id' is required",
-                            ),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid params: 'id' is required";
+                    status = 400,
                 )
                 return nothing
             end
 
             unregister_repl(id)
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_jsonrpc_result(
                 http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("status" => "unregistered", "id" => id),
-                    ),
-                ),
+                get(request, "id", nothing),
+                Dict("status" => "unregistered", "id" => id),
             )
             return nothing
         elseif method == "proxy/heartbeat"
@@ -2380,21 +2329,12 @@ function handle_request(http::HTTP.Stream)
             id = get(params, "id", nothing)
 
             if id === nothing
-                HTTP.setstatus(http, 400)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "error" => Dict(
-                                "code" => -32602,
-                                "message" => "Invalid params: 'id' is required",
-                            ),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid params: 'id' is required";
+                    status = 400,
                 )
                 return nothing
             end
@@ -2474,19 +2414,7 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
-                http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("status" => "ok"),
-                    ),
-                ),
-            )
+            send_jsonrpc_result(http, get(request, "id", nothing), Dict("status" => "ok"))
             return nothing
         elseif method == "initialize"
             # Handle MCP initialize request according to spec
@@ -2554,21 +2482,11 @@ function handle_request(http::HTTP.Stream)
             ]
 
             if level === nothing || !(level in valid_levels)
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "error" => Dict(
-                                "code" => -32602,
-                                "message" => "Invalid params: level must be one of $(join(valid_levels, ", "))",
-                            ),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid params: level must be one of $(join(valid_levels, ", "))",
                 )
                 return nothing
             end
@@ -2592,39 +2510,17 @@ function handle_request(http::HTTP.Stream)
                 global_logger(ConsoleLogger(stderr, julia_level))
                 @info "Log level set" level = level julia_level = julia_level
             catch e
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "error" => Dict(
-                                "code" => -32603,
-                                "message" => "Internal error: $(string(e))",
-                            ),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    -32603,
+                    "Internal error: $(string(e))",
                 )
                 return nothing
             end
 
             # Success response (empty result as per spec)
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
-                http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict(),
-                    ),
-                ),
-            )
+            send_jsonrpc_result(http, get(request, "id", nothing), Dict())
             return nothing
         elseif method == "tools/list"
             # Get proxy tools (always available)
@@ -2650,18 +2546,10 @@ function handle_request(http::HTTP.Stream)
                 repls = list_repls()
                 @debug "tools/list - no target REPL" num_repls = length(repls) returning = "proxy tools only"
 
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_result(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "result" => Dict("tools" => proxy_tools),
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    Dict("tools" => proxy_tools),
                 )
                 return nothing
             end
@@ -2709,51 +2597,19 @@ function handle_request(http::HTTP.Stream)
             end
 
             # Return combined tools from proxy + target REPL
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_jsonrpc_result(
                 http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("tools" => all_tools),
-                    ),
-                ),
+                get(request, "id", nothing),
+                Dict("tools" => all_tools),
             )
             return nothing
         elseif method == "prompts/list"
             # Return empty prompts list (proxy doesn't provide prompts)
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
-                http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("prompts" => []),
-                    ),
-                ),
-            )
+            send_jsonrpc_result(http, get(request, "id", nothing), Dict("prompts" => []))
             return nothing
         elseif method == "resources/list"
             # Return empty resources list (proxy doesn't provide resources)
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
-                http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => get(request, "id", nothing),
-                        "result" => Dict("resources" => []),
-                    ),
-                ),
-            )
+            send_jsonrpc_result(http, get(request, "id", nothing), Dict("resources" => []))
             return nothing
         elseif method == "tools/call"
             # Handle proxy-level tools (always available)
