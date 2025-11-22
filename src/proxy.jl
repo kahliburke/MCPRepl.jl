@@ -2360,6 +2360,348 @@ function handle_request(http::HTTP.Stream)
             return nothing
         end
 
+        # ============================================================================
+        # Analytics API Endpoints - Structured analytics from ETL
+        # ============================================================================
+
+        # Get tool execution analytics
+        if path == "/dashboard/api/analytics/tool-executions"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+            tool_name = get(query_params, "tool_name", nothing)
+            status = get(query_params, "status", nothing)
+            limit = parse(Int, get(query_params, "limit", "100"))
+
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                # Build query with filters
+                where_clauses = String[]
+                params = Any[]
+
+                if session_id !== nothing
+                    push!(where_clauses, "session_id = ?")
+                    push!(params, session_id)
+                end
+
+                if tool_name !== nothing
+                    push!(where_clauses, "tool_name = ?")
+                    push!(params, tool_name)
+                end
+
+                if status !== nothing
+                    push!(where_clauses, "status = ?")
+                    push!(params, status)
+                end
+
+                where_clause =
+                    isempty(where_clauses) ? "" : "WHERE " * join(where_clauses, " AND ")
+
+                query = """
+                    SELECT * FROM tool_executions
+                    $where_clause
+                    ORDER BY request_time DESC
+                    LIMIT ?
+                """
+                push!(params, limit)
+
+                result = DBInterface.execute(db, query, params) |> DataFrame
+
+                # Convert to JSON
+                executions = [
+                    Dict(
+                        "id" => row.id,
+                        "session_id" => row.session_id,
+                        "request_id" => row.request_id,
+                        "tool_name" => row.tool_name,
+                        "tool_method" => row.tool_method,
+                        "request_time" => row.request_time,
+                        "response_time" =>
+                            ismissing(row.response_time) ? nothing : row.response_time,
+                        "duration_ms" =>
+                            ismissing(row.duration_ms) ? nothing : row.duration_ms,
+                        "input_size" => row.input_size,
+                        "output_size" => row.output_size,
+                        "argument_count" => row.argument_count,
+                        "status" => row.status,
+                        "result_type" =>
+                            ismissing(row.result_type) ? nothing : row.result_type,
+                        "result_summary" =>
+                            ismissing(row.result_summary) ? nothing : row.result_summary,
+                    ) for row in eachrow(result)
+                ]
+
+                send_json_response(http, executions)
+            catch e
+                @error "Failed to get tool executions" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Get error analytics
+        if path == "/dashboard/api/analytics/errors"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+            tool_name = get(query_params, "tool_name", nothing)
+            error_type = get(query_params, "error_type", nothing)
+            resolved = get(query_params, "resolved", nothing)
+            limit = parse(Int, get(query_params, "limit", "100"))
+
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                # Build query with filters
+                where_clauses = String[]
+                params = Any[]
+
+                if session_id !== nothing
+                    push!(where_clauses, "session_id = ?")
+                    push!(params, session_id)
+                end
+
+                if tool_name !== nothing
+                    push!(where_clauses, "tool_name = ?")
+                    push!(params, tool_name)
+                end
+
+                if error_type !== nothing
+                    push!(where_clauses, "error_type = ?")
+                    push!(params, error_type)
+                end
+
+                if resolved !== nothing
+                    push!(where_clauses, "resolved = ?")
+                    push!(params, resolved == "true" ? 1 : 0)
+                end
+
+                where_clause =
+                    isempty(where_clauses) ? "" : "WHERE " * join(where_clauses, " AND ")
+
+                query = """
+                    SELECT * FROM errors
+                    $where_clause
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                """
+                push!(params, limit)
+
+                result = DBInterface.execute(db, query, params) |> DataFrame
+
+                # Convert to JSON
+                errors = [
+                    Dict(
+                        "id" => row.id,
+                        "session_id" => row.session_id,
+                        "timestamp" => row.timestamp,
+                        "error_type" => row.error_type,
+                        "error_code" =>
+                            ismissing(row.error_code) ? nothing : row.error_code,
+                        "error_category" =>
+                            ismissing(row.error_category) ? nothing : row.error_category,
+                        "tool_name" =>
+                            ismissing(row.tool_name) ? nothing : row.tool_name,
+                        "method" => ismissing(row.method) ? nothing : row.method,
+                        "request_id" =>
+                            ismissing(row.request_id) ? nothing : row.request_id,
+                        "message" => row.message,
+                        "stack_trace" =>
+                            ismissing(row.stack_trace) ? nothing : row.stack_trace,
+                        "resolved" => row.resolved,
+                    ) for row in eachrow(result)
+                ]
+
+                send_json_response(http, errors)
+            catch e
+                @error "Failed to get errors" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Get tool usage summary
+        if path == "/dashboard/api/analytics/tool-summary"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+            days = parse(Int, get(query_params, "days", "7"))
+
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                # Query daily tool usage view
+                where_clause =
+                    session_id !== nothing ? "WHERE session_id = ?" :
+                    "WHERE date >= date('now', '-$days days')"
+                params = session_id !== nothing ? [session_id] : []
+
+                query = """
+                    SELECT 
+                        tool_name,
+                        SUM(execution_count) as total_executions,
+                        AVG(avg_duration_ms) as avg_duration_ms,
+                        MIN(min_duration_ms) as min_duration_ms,
+                        MAX(max_duration_ms) as max_duration_ms,
+                        SUM(error_count) as total_errors,
+                        ROUND(AVG(error_rate_pct), 2) as avg_error_rate_pct
+                    FROM v_daily_tool_usage
+                    $where_clause
+                    GROUP BY tool_name
+                    ORDER BY total_executions DESC
+                """
+
+                result = DBInterface.execute(db, query, params) |> DataFrame
+
+                # Convert to JSON
+                summary = [
+                    Dict(
+                        "tool_name" => row.tool_name,
+                        "total_executions" => row.total_executions,
+                        "avg_duration_ms" =>
+                            ismissing(row.avg_duration_ms) ? nothing : row.avg_duration_ms,
+                        "min_duration_ms" =>
+                            ismissing(row.min_duration_ms) ? nothing : row.min_duration_ms,
+                        "max_duration_ms" =>
+                            ismissing(row.max_duration_ms) ? nothing : row.max_duration_ms,
+                        "total_errors" => row.total_errors,
+                        "avg_error_rate_pct" =>
+                            ismissing(row.avg_error_rate_pct) ? nothing :
+                            row.avg_error_rate_pct,
+                    ) for row in eachrow(result)
+                ]
+
+                send_json_response(http, summary)
+            catch e
+                @error "Failed to get tool summary" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Get error hotspots
+        if path == "/dashboard/api/analytics/error-hotspots"
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                query = "SELECT * FROM v_error_hotspots LIMIT 50"
+                result = DBInterface.execute(db, query) |> DataFrame
+
+                # Convert to JSON
+                hotspots = [
+                    Dict(
+                        "tool_name" =>
+                            ismissing(row.tool_name) ? "unknown" : row.tool_name,
+                        "error_type" => row.error_type,
+                        "error_category" => row.error_category,
+                        "error_count" => row.error_count,
+                        "affected_sessions" => row.affected_sessions,
+                        "last_occurrence" => row.last_occurrence,
+                    ) for row in eachrow(result)
+                ]
+
+                send_json_response(http, hotspots)
+            catch e
+                @error "Failed to get error hotspots" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Run ETL manually
+        if path == "/dashboard/api/analytics/run-etl"
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                result = Database.run_etl_pipeline(db; mode = :incremental)
+
+                send_json_response(http, result)
+            catch e
+                @error "Failed to run ETL" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Get ETL status
+        if path == "/dashboard/api/analytics/etl-status"
+            try
+                db = Database.DB[]
+                if db === nothing
+                    send_json_response(
+                        http,
+                        Dict("error" => "Database not initialized"),
+                        status = 500,
+                    )
+                    return nothing
+                end
+
+                result =
+                    DBInterface.execute(db, "SELECT * FROM etl_metadata WHERE id = 1") |>
+                    DataFrame
+
+                if nrow(result) > 0
+                    row = result[1, :]
+                    status = Dict(
+                        "last_processed_interaction_id" =>
+                            row.last_processed_interaction_id,
+                        "last_processed_event_id" => row.last_processed_event_id,
+                        "last_run_time" =>
+                            ismissing(row.last_run_time) ? nothing : row.last_run_time,
+                        "last_run_status" =>
+                            ismissing(row.last_run_status) ? nothing : row.last_run_status,
+                        "last_error" =>
+                            ismissing(row.last_error) ? nothing : row.last_error,
+                    )
+                    send_json_response(http, status)
+                else
+                    send_json_response(http, Dict("error" => "No ETL metadata found"))
+                end
+            catch e
+                @error "Failed to get ETL status" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
         # Dashboard WebSocket (for future implementation)
         if path == "/dashboard/ws"
             send_json_response(http, "WebSocket not yet implemented", 501, "text/plain")
@@ -3266,8 +3608,12 @@ function start_foreground_server(port::Int = 3000)
 
     # Initialize database for persistent event storage
     db_path = joinpath(dirname(@__DIR__), ".mcprepl", "events.db")
-    Database.init_db!(db_path)
+    db = Database.init_db!(db_path)
     @info "Database initialized for event storage" db_path = db_path
+
+    # Start ETL scheduler for analytics
+    etl_task = Database.start_etl_scheduler(db; interval_seconds = 30)
+    @info "ETL scheduler started for analytics processing" interval_seconds = 30
 
     # Set up dashboard to use database for event persistence
     Dashboard.set_db_callback!() do session_id, event_type, timestamp, data, duration_ms

@@ -1,0 +1,239 @@
+digraph MCPRepl_Complete_Schema {
+    // Graph settings - Dark Theme
+    rankdir=TB;
+    bgcolor="#1E1E1E";
+    node [shape=record, fontname="Arial", fontsize=9, fontcolor="white"];
+    edge [fontname="Arial", fontsize=8, fontcolor="#B0B0B0", color="#606060"];
+    graph [fontname="Arial", fontsize=11, fontcolor="white", label="MCPRepl Complete Database Architecture\nRaw Data Layer → ETL Pipeline → Analytics Layer", labelloc=t];
+    
+    node [style=filled];
+    
+    // ============================================================================
+    // RAW DATA LAYER - Generic JSON storage
+    // ============================================================================
+    
+    subgraph cluster_raw {
+        label="Raw Data Layer\n(JSON Blobs)";
+        style=filled;
+        fillcolor="#263238";
+        color="#607D8B";
+        fontcolor="white";
+        fontsize=10;
+        
+        sessions_raw [
+            label="{<table>sessions|{<pk>session_id : TEXT (PK)|start_time : DATETIME|last_activity : DATETIME|status : TEXT|metadata : TEXT (JSON)}}",
+            fillcolor="#1565C0",
+            color="#42A5F5",
+            penwidth=2,
+            fontcolor="white"
+        ];
+        
+        events_raw [
+            label="{<table>events|{<pk>id : INTEGER (PK, AUTO)|<fk>session_id : TEXT (FK)|event_type : TEXT|timestamp : DATETIME|duration_ms : REAL|data : TEXT (JSON)}}",
+            fillcolor="#6A1B9A",
+            color="#BA68C8",
+            fontcolor="white"
+        ];
+        
+        interactions_raw [
+            label="{<table>interactions|{<pk>id : INTEGER (PK, AUTO)|<fk>session_id : TEXT (FK)|timestamp : DATETIME|direction : TEXT|message_type : TEXT|request_id : TEXT|method : TEXT|content : TEXT (JSON)|content_size : INTEGER}}",
+            fillcolor="#2E7D32",
+            color="#66BB6A",
+            fontcolor="white"
+        ];
+        
+        events_raw:fk -> sessions_raw:pk [label="FK", color="#42A5F5", fontcolor="#B0B0B0"];
+        interactions_raw:fk -> sessions_raw:pk [label="FK", color="#42A5F5", fontcolor="#B0B0B0"];
+    }
+    
+    // ============================================================================
+    // ETL PIPELINE
+    // ============================================================================
+    
+    etl_process [
+        label="ETL Pipeline\n(DatabaseETL module)\n\n• Extract from JSON\n• Transform to structured\n• Load into analytics\n• Runs every 30s",
+        shape=box,
+        style="filled,rounded",
+        fillcolor="#D84315",
+        color="#FF5722",
+        fontcolor="white",
+        fontsize=9
+    ];
+    
+    etl_metadata [
+        label="{etl_metadata|{id : INTEGER (PK)|last_processed_interaction_id|last_processed_event_id|last_run_time|last_run_status|last_error}}",
+        fillcolor="#455A64",
+        color="#78909C",
+        fontcolor="white",
+        fontsize=8
+    ];
+    
+    // ============================================================================
+    // ANALYTICS LAYER - Structured queryable data
+    // ============================================================================
+    
+    subgraph cluster_analytics {
+        label="Analytics Layer\n(Structured Tables)";
+        style=filled;
+        fillcolor="#1A237E";
+        color="#5C6BC0";
+        fontcolor="white";
+        fontsize=10;
+        
+        tool_executions [
+            label="{<table>tool_executions|{id : INTEGER (PK)|<fk>session_id : TEXT (FK)|request_id : TEXT|tool_name : TEXT 🔥|tool_method : TEXT|request_time : DATETIME|response_time : DATETIME|duration_ms : REAL 📊|input_size : INTEGER|output_size : INTEGER|argument_count : INTEGER|arguments : TEXT (JSON)|status : TEXT 🔥|result_type : TEXT|result_summary : TEXT|interaction_request_id : INTEGER|interaction_response_id : INTEGER}}",
+            fillcolor="#283593",
+            color="#5C6BC0",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        errors [
+            label="{<table>errors|{id : INTEGER (PK)|<fk>session_id : TEXT (FK)|timestamp : DATETIME|error_type : TEXT 🔥|error_code : INTEGER|error_category : TEXT 🔥|tool_name : TEXT|method : TEXT|request_id : TEXT|message : TEXT|stack_trace : TEXT|client_info : TEXT|input_that_caused_error : TEXT|resolved : BOOLEAN|resolution_notes : TEXT|interaction_id : INTEGER|event_id : INTEGER}}",
+            fillcolor="#C62828",
+            color="#E57373",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        performance_metrics [
+            label="{<table>performance_metrics|{id : INTEGER (PK)|<fk>session_id : TEXT (FK)|timestamp : DATETIME|metric_type : TEXT|metric_name : TEXT|duration_ms : REAL|throughput : REAL 📈|memory_mb : REAL|cpu_percent : REAL|tool_name : TEXT|agent_id : TEXT|p50_ms : REAL|p95_ms : REAL|p99_ms : REAL}}",
+            fillcolor="#1B5E20",
+            color="#66BB6A",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        client_sessions [
+            label="{<table>client_sessions|{id : INTEGER (PK)|<fk>session_id : TEXT (FK)|client_name : TEXT 🔥|client_version : TEXT|connect_time : DATETIME|disconnect_time : DATETIME|last_activity : DATETIME|supports_streaming : BOOLEAN|supports_notifications : BOOLEAN|supported_content_types : TEXT|protocol_version : TEXT|initialization_params : TEXT|target_repl : TEXT|total_requests : INTEGER|total_errors : INTEGER|total_data_sent : INTEGER|total_data_received : INTEGER}}",
+            fillcolor="#004D40",
+            color="#4DB6AC",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        session_lifecycle [
+            label="{<table>session_lifecycle|{id : INTEGER (PK)|<fk>session_id : TEXT (FK)|timestamp : DATETIME|event_type : TEXT 🔥|from_state : TEXT|to_state : TEXT|reason : TEXT|triggered_by : TEXT|metadata : TEXT}}",
+            fillcolor="#4A148C",
+            color="#AB47BC",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        tool_executions:fk -> sessions_raw:pk [label="FK", color="#5C6BC0", fontcolor="#B0B0B0", style=dashed];
+        errors:fk -> sessions_raw:pk [label="FK", color="#E57373", fontcolor="#B0B0B0", style=dashed];
+        performance_metrics:fk -> sessions_raw:pk [label="FK", color="#66BB6A", fontcolor="#B0B0B0", style=dashed];
+        client_sessions:fk -> sessions_raw:pk [label="FK", color="#4DB6AC", fontcolor="#B0B0B0", style=dashed];
+        session_lifecycle:fk -> sessions_raw:pk [label="FK", color="#AB47BC", fontcolor="#B0B0B0", style=dashed];
+    }
+    
+    // ETL flow arrows
+    interactions_raw -> etl_process [label="extract", color="#FF5722", fontcolor="#B0B0B0", penwidth=2];
+    events_raw -> etl_process [label="extract", color="#FF5722", fontcolor="#B0B0B0", penwidth=2];
+    sessions_raw -> etl_process [label="extract", color="#FF5722", fontcolor="#B0B0B0", penwidth=2];
+    
+    etl_process -> tool_executions [label="transform & load", color="#5C6BC0", fontcolor="#B0B0B0", penwidth=2];
+    etl_process -> errors [label="transform & load", color="#E57373", fontcolor="#B0B0B0", penwidth=2];
+    etl_process -> performance_metrics [label="transform & load", color="#66BB6A", fontcolor="#B0B0B0", penwidth=2];
+    etl_process -> client_sessions [label="transform & load", color="#4DB6AC", fontcolor="#B0B0B0", penwidth=2];
+    
+    etl_process -> etl_metadata [label="update status", color="#78909C", fontcolor="#B0B0B0", style=dashed];
+    
+    // ============================================================================
+    // ANALYTICS VIEWS
+    // ============================================================================
+    
+    subgraph cluster_views {
+        label="Analytics Views\n(Pre-computed Aggregations)";
+        style=filled;
+        fillcolor="#37474F";
+        color="#90A4AE";
+        fontcolor="white";
+        fontsize=10;
+        
+        view_daily [
+            label="v_daily_tool_usage\n\nAggregates by date + tool:\n• execution_count\n• avg/min/max duration\n• error_count, error_rate",
+            shape=note,
+            fillcolor="#546E7A",
+            color="#90A4AE",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        view_session [
+            label="v_session_summary\n\nJoins across all tables:\n• total_tool_calls\n• total_errors\n• total/avg execution time\n• client info",
+            shape=note,
+            fillcolor="#546E7A",
+            color="#90A4AE",
+            fontcolor="white",
+            fontsize=8
+        ];
+        
+        view_hotspots [
+            label="v_error_hotspots\n\nUnresolved errors by:\n• tool_name\n• error_type\n• error_category\n• affected_sessions",
+            shape=note,
+            fillcolor="#546E7A",
+            color="#90A4AE",
+            fontcolor="white",
+            fontsize=8
+        ];
+    }
+    
+    tool_executions -> view_daily [style=dotted, color="#90A4AE"];
+    tool_executions -> view_session [style=dotted, color="#90A4AE"];
+    errors -> view_hotspots [style=dotted, color="#90A4AE"];
+    errors -> view_session [style=dotted, color="#90A4AE"];
+    client_sessions -> view_session [style=dotted, color="#90A4AE"];
+    
+    // ============================================================================
+    // API ENDPOINTS
+    // ============================================================================
+    
+    subgraph cluster_api {
+        label="Dashboard API Endpoints";
+        style=filled;
+        fillcolor="#263238";
+        color="#00BCD4";
+        fontcolor="white";
+        fontsize=10;
+        
+        api_endpoints [
+            label="Analytics REST API\n\nGET /dashboard/api/analytics/...\n• tool-executions (filtered)\n• errors (filtered)\n• tool-summary (aggregated)\n• error-hotspots\n• run-etl (manual trigger)\n• etl-status",
+            shape=box,
+            style="filled,rounded",
+            fillcolor="#00838F",
+            color="#00BCD4",
+            fontcolor="white",
+            fontsize=8
+        ];
+    }
+    
+    view_daily -> api_endpoints [style=dashed, color="#00BCD4", fontcolor="#B0B0B0"];
+    view_session -> api_endpoints [style=dashed, color="#00BCD4", fontcolor="#B0B0B0"];
+    view_hotspots -> api_endpoints [style=dashed, color="#00BCD4", fontcolor="#B0B0B0"];
+    tool_executions -> api_endpoints [style=dashed, color="#00BCD4", fontcolor="#B0B0B0"];
+    errors -> api_endpoints [style=dashed, color="#00BCD4", fontcolor="#B0B0B0"];
+    
+    // ============================================================================
+    // Legend
+    // ============================================================================
+    
+    subgraph cluster_legend {
+        label="Legend";
+        style=filled;
+        fillcolor="#2D2D2D";
+        color="#9E9E9E";
+        fontcolor="white";
+        fontsize=9;
+        
+        legend_1 [label="🔥 = Indexed column (fast queries)", shape=plaintext, fontcolor="white", fontsize=8];
+        legend_2 [label="📊 = Performance metric", shape=plaintext, fontcolor="white", fontsize=8];
+        legend_3 [label="📈 = Time-series data", shape=plaintext, fontcolor="white", fontsize=8];
+        legend_4 [label="Solid arrow = Direct FK relationship", shape=plaintext, fontcolor="white", fontsize=8];
+        legend_5 [label="Dashed arrow = ETL transformation", shape=plaintext, fontcolor="white", fontsize=8];
+        legend_6 [label="Dotted arrow = View dependency", shape=plaintext, fontcolor="white", fontsize=8];
+        
+        {rank=same; legend_1; legend_2; legend_3}
+        {rank=same; legend_4; legend_5; legend_6}
+    }
+}

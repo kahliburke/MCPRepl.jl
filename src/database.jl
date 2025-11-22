@@ -136,6 +136,410 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
+    # ============================================================================
+    # Analytics Tables - Structured data extracted from JSON blobs
+    # ============================================================================
+
+    # Tool executions table - structured tool call analytics
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS tool_executions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        
+        tool_name TEXT NOT NULL,
+        tool_method TEXT,
+        
+        request_time DATETIME NOT NULL,
+        response_time DATETIME,
+        duration_ms REAL,
+        
+        input_size INTEGER,
+        output_size INTEGER,
+        argument_count INTEGER,
+        arguments TEXT,
+        
+        status TEXT NOT NULL,
+        result_type TEXT,
+        result_summary TEXT,
+        
+        interaction_request_id INTEGER,
+        interaction_response_id INTEGER,
+        
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (interaction_request_id) REFERENCES interactions(id),
+        FOREIGN KEY (interaction_response_id) REFERENCES interactions(id)
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_session 
+    ON tool_executions(session_id, request_time DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_tool 
+    ON tool_executions(tool_name, request_time DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_status 
+    ON tool_executions(status, request_time DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_duration 
+    ON tool_executions(duration_ms DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_request 
+    ON tool_executions(request_id)
+""",
+    )
+
+    # Errors table - structured error tracking
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        
+        error_type TEXT NOT NULL,
+        error_code INTEGER,
+        error_category TEXT,
+        
+        tool_name TEXT,
+        method TEXT,
+        request_id TEXT,
+        
+        message TEXT NOT NULL,
+        stack_trace TEXT,
+        
+        client_info TEXT,
+        input_that_caused_error TEXT,
+        
+        resolved BOOLEAN DEFAULT 0,
+        resolution_notes TEXT,
+        
+        interaction_id INTEGER,
+        event_id INTEGER,
+        
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (interaction_id) REFERENCES interactions(id),
+        FOREIGN KEY (event_id) REFERENCES events(id)
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_session 
+    ON errors(session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_type 
+    ON errors(error_type, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_code 
+    ON errors(error_code, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_tool 
+    ON errors(tool_name, timestamp DESC) WHERE tool_name IS NOT NULL
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_unresolved 
+    ON errors(resolved, timestamp DESC)
+""",
+    )
+
+    # Performance metrics table - time-series performance data
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS performance_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        
+        metric_type TEXT NOT NULL,
+        metric_name TEXT NOT NULL,
+        
+        duration_ms REAL,
+        throughput REAL,
+        memory_mb REAL,
+        cpu_percent REAL,
+        
+        tool_name TEXT,
+        agent_id TEXT,
+        
+        p50_ms REAL,
+        p95_ms REAL,
+        p99_ms REAL,
+        
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_metrics_session 
+    ON performance_metrics(session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_metrics_type 
+    ON performance_metrics(metric_type, metric_name, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_metrics_tool 
+    ON performance_metrics(tool_name, timestamp DESC) WHERE tool_name IS NOT NULL
+""",
+    )
+
+    # Client sessions table - rich client metadata
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS client_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        
+        client_name TEXT NOT NULL,
+        client_version TEXT,
+        
+        connect_time DATETIME NOT NULL,
+        disconnect_time DATETIME,
+        last_activity DATETIME,
+        
+        supports_streaming BOOLEAN,
+        supports_notifications BOOLEAN,
+        supported_content_types TEXT,
+        
+        protocol_version TEXT,
+        initialization_params TEXT,
+        
+        target_repl TEXT,
+        
+        total_requests INTEGER DEFAULT 0,
+        total_errors INTEGER DEFAULT 0,
+        total_data_sent INTEGER DEFAULT 0,
+        total_data_received INTEGER DEFAULT 0,
+        
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_session 
+    ON client_sessions(session_id)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_client 
+    ON client_sessions(client_name, connect_time DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_client_sessions_active 
+    ON client_sessions(disconnect_time, last_activity DESC) WHERE disconnect_time IS NULL
+""",
+    )
+
+    # Session lifecycle table - detailed state transitions
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS session_lifecycle (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        
+        event_type TEXT NOT NULL,
+        from_state TEXT,
+        to_state TEXT NOT NULL,
+        
+        reason TEXT,
+        triggered_by TEXT,
+        
+        metadata TEXT,
+        
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_session 
+    ON session_lifecycle(session_id, timestamp)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_event 
+    ON session_lifecycle(event_type, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_state 
+    ON session_lifecycle(to_state, timestamp DESC)
+""",
+    )
+
+    # ETL metadata table - track processing state
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS etl_metadata (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_processed_interaction_id INTEGER DEFAULT 0,
+        last_processed_event_id INTEGER DEFAULT 0,
+        last_run_time DATETIME,
+        last_run_status TEXT,
+        last_error TEXT
+    )
+""",
+    )
+
+    # Initialize ETL metadata if not exists
+    DBInterface.execute(
+        db,
+        """
+    INSERT OR IGNORE INTO etl_metadata (id, last_processed_interaction_id, last_processed_event_id)
+    VALUES (1, 0, 0)
+""",
+    )
+
+    # ============================================================================
+    # Analytics Views
+    # ============================================================================
+
+    # Daily tool usage summary view
+    DBInterface.execute(
+        db,
+        """
+    CREATE VIEW IF NOT EXISTS v_daily_tool_usage AS
+    SELECT 
+        DATE(request_time) as date,
+        tool_name,
+        COUNT(*) as execution_count,
+        AVG(duration_ms) as avg_duration_ms,
+        MIN(duration_ms) as min_duration_ms,
+        MAX(duration_ms) as max_duration_ms,
+        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count,
+        ROUND(100.0 * SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) / COUNT(*), 2) as error_rate_pct
+    FROM tool_executions
+    GROUP BY DATE(request_time), tool_name
+    ORDER BY date DESC, execution_count DESC
+""",
+    )
+
+    # Session summary view
+    DBInterface.execute(
+        db,
+        """
+    CREATE VIEW IF NOT EXISTS v_session_summary AS
+    SELECT 
+        s.session_id,
+        s.start_time,
+        s.last_activity,
+        s.status,
+        cs.client_name,
+        cs.client_version,
+        COUNT(DISTINCT te.id) as total_tool_calls,
+        COUNT(DISTINCT e.id) as total_errors,
+        SUM(te.duration_ms) as total_execution_time_ms,
+        AVG(te.duration_ms) as avg_execution_time_ms
+    FROM sessions s
+    LEFT JOIN client_sessions cs ON s.session_id = cs.session_id
+    LEFT JOIN tool_executions te ON s.session_id = te.session_id
+    LEFT JOIN errors e ON s.session_id = e.session_id
+    GROUP BY s.session_id
+""",
+    )
+
+    # Error hot spots view
+    DBInterface.execute(
+        db,
+        """
+    CREATE VIEW IF NOT EXISTS v_error_hotspots AS
+    SELECT 
+        tool_name,
+        error_type,
+        error_category,
+        COUNT(*) as error_count,
+        COUNT(DISTINCT session_id) as affected_sessions,
+        MAX(timestamp) as last_occurrence
+    FROM errors
+    WHERE resolved = 0
+    GROUP BY tool_name, error_type, error_category
+    ORDER BY error_count DESC
+""",
+    )
+
     return db
 end
 
@@ -795,5 +1199,13 @@ function close_db!()
         DB[] = nothing
     end
 end
+
+# Include ETL submodule
+include("database_etl.jl")
+using .DatabaseETL
+
+# Re-export ETL functions
+export DatabaseETL,
+    run_etl_pipeline, start_etl_scheduler, extract_tool_executions, extract_errors
 
 end # module
