@@ -38,8 +38,12 @@ function setup_proxy_logging(port::Int)
 
     log_file = joinpath(cache_dir, "proxy-$port.log")
 
-    # Use FileLogger with automatic flushing
-    logger = LoggingExtras.FileLogger(log_file; append = true, always_flush = true)
+    # Use FileLogger with automatic flushing and timestamp formatting
+    logger = LoggingExtras.TransformerLogger(
+        LoggingExtras.FileLogger(log_file; append = true, always_flush = true),
+    ) do log
+        merge(log, (; message = "$(Dates.format(now(), "HH:MM:SS.sss")) $(log.message)"))
+    end
     global_logger(logger)
 
     @info "Proxy logging initialized" log_file = log_file
@@ -279,7 +283,7 @@ Send notifications/tools/list_changed to all connected MCP clients.
 This tells clients to refresh their tools list after a Julia session registers.
 """
 function notify_tools_list_changed()
-    @info "Broadcasting tools/list_changed notification to all connected clients"
+    @debug "Broadcasting tools/list_changed notification to all connected clients"
 
     notification = Dict(
         "jsonrpc" => "2.0",
@@ -723,8 +727,17 @@ function flush_pending_requests(repl_id::String, pending::Vector{Tuple{Dict,HTTP
                     @info "Buffered request executed and response sent to client" repl_id =
                         repl_id request_id = get(request, "id", nothing)
                 catch stream_err
-                    @debug "Client stream closed, response discarded" repl_id = repl_id exception =
-                        stream_err
+                    # Only log if it's not a normal disconnect
+                    if stream_err isa Base.IOError && (
+                        occursin("connection reset", stream_err.msg) ||
+                        occursin("broken pipe", stream_err.msg)
+                    )
+                        @debug "Client disconnected before reading response" repl_id =
+                            repl_id
+                    else
+                        @debug "Client stream closed, response discarded" repl_id = repl_id exception =
+                            stream_err
+                    end
                 end
             else
                 @debug "Client stream already closed" repl_id = repl_id request_id =
@@ -1143,8 +1156,6 @@ function route_to_repl_streaming(
         end
 
         start_time = time()
-        @info "Sending request to backend" url = backend_url method = method body_length =
-            length(body_str)
 
         # Emit progress notification at start of tool execution
         if method == "tools/call" && !isempty(tool_name)
@@ -1188,9 +1199,6 @@ function route_to_repl_streaming(
             response_headers[name] = value
         end
 
-        @info "Received response from backend" status = response_status body_length =
-            length(response_body)
-
         # Parse response to extract result/error for dashboard
         response_data = Dict("status" => response_status[], "method" => method)
         try
@@ -1218,8 +1226,6 @@ function route_to_repl_streaming(
         update_repl_status(target_id, :ready)
 
         # Forward response to client with proper headers
-        @info "Returning response to client" status = response_status body_length =
-            length(response_body)
         HTTP.setstatus(http, response_status)
 
         # Forward all headers from backend, ensuring Content-Type is set
@@ -1307,8 +1313,8 @@ function handle_request(http::HTTP.Stream)
         # Read the full request body FIRST (required by HTTP.jl before writing response)
         body = String(read(http))
 
-        # Log all incoming requests for debugging
-        @info "Incoming request" method = req.method target = req.target content_length =
+        # Log incoming requests at debug level
+        @debug "Incoming request" method = req.method target = req.target content_length =
             length(body)
 
         # Handle dashboard HTTP routes
@@ -2105,9 +2111,7 @@ function handle_request(http::HTTP.Stream)
             return nothing
         end
 
-        @info "Checking if body is empty" is_empty = isempty(body)
         if isempty(body)
-            @info "Body IS empty - handling empty body case"
             # Handle OPTIONS requests (CORS preflight for streamable-http)
             if req.method == "OPTIONS"
                 HTTP.setstatus(http, 200)
@@ -2123,24 +2127,40 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
 
-            # Handle GET requests (health checks, metadata)
-            if req.method == "GET"
-                HTTP.setstatus(http, 200)
+            # Handle DELETE requests - session cleanup
+            if req.method == "DELETE"
+                # VS Code sends DELETE to clean up sessions before reconnecting
+                @debug "Handling DELETE request" target = req.target
+                HTTP.setstatus(http, 200)  # OK
                 HTTP.setheader(http, "Content-Type" => "application/json")
+                response = JSON.json(Dict("status" => "ok"))
+                HTTP.setheader(http, "Content-Length" => string(length(response)))
                 HTTP.startwrite(http)
-                write(
-                    http,
-                    JSON.json(
-                        Dict(
-                            "status" => "ok",
-                            "type" => "mcprepl-proxy",
-                            "version" => "0.1.0",
-                            "pid" => getpid(),
-                            "uptime" => time(),
-                            "protocol" => "MCP 2024-11-05",
+                write(http, response)
+                return nothing
+            end
+
+            # Handle GET requests - SSE not supported
+            # Per MCP spec 2.2: "The server MUST either return Content-Type: text/event-stream
+            # in response to this HTTP GET, or else return HTTP 405 Method Not Allowed"
+            if req.method == "GET"
+                HTTP.setstatus(http, 405)  # Method Not Allowed (per spec)
+                HTTP.setheader(http, "Allow" => "POST, DELETE, OPTIONS")
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                # Return a valid JSON-RPC error message
+                error_body = JSON.json(
+                    Dict(
+                        "jsonrpc" => "2.0",
+                        "error" => Dict(
+                            "code" => -32601,
+                            "message" => "SSE transport not supported. Use POST for requests.",
                         ),
+                        "id" => nothing,
                     ),
                 )
+                HTTP.setheader(http, "Content-Length" => string(length(error_body)))
+                HTTP.startwrite(http)
+                write(http, error_body)
                 return nothing
             end
             # Empty POST body - invalid request
@@ -2164,14 +2184,46 @@ function handle_request(http::HTTP.Stream)
         end
 
         # Parse JSON-RPC request
-        request = JSON.parse(body)
+        request = try
+            JSON.parse(body)
+        catch e
+            @error "Failed to parse JSON request" body = body exception = e
+            HTTP.setstatus(http, 200)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.startwrite(http)
+            write(
+                http,
+                JSON.json(
+                    Dict(
+                        "jsonrpc" => "2.0",
+                        "error" => Dict(
+                            "code" => -32700,
+                            "message" => "Parse error: invalid JSON",
+                        ),
+                        "id" => nothing,
+                    ),
+                ),
+            )
+            return nothing
+        end
 
         # Log all incoming requests with full details
         method = get(request, "method", "")
         request_id = get(request, "id", nothing)
         params = get(request, "params", nothing)
-        @info "📨 MCP Request" method = method id = request_id has_params =
+        @debug "📨 MCP Request" method = method id = request_id has_params =
             !isnothing(params)
+
+        # Handle notifications (methods that start with "notifications/")
+        if startswith(method, "notifications/")
+            @debug "✉️  Received notification" method = method params = params
+            # Notifications don't require a response, just return 200
+            HTTP.setstatus(http, 200)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.setheader(http, "Content-Length" => "0")
+            HTTP.startwrite(http)
+            return nothing
+        end
 
         if method == "proxy/status"
             repls = list_repls()
@@ -2609,7 +2661,7 @@ function handle_request(http::HTTP.Stream)
             # If no session or no target REPL, return only proxy tools
             if target_repl_id === nothing
                 repls = list_repls()
-                @info "tools/list - no target REPL" num_repls = length(repls) returning = "proxy tools only"
+                @debug "tools/list - no target REPL" num_repls = length(repls) returning = "proxy tools only"
 
                 HTTP.setstatus(http, 200)
                 HTTP.setheader(http, "Content-Type" => "application/json")
@@ -2655,7 +2707,7 @@ function handle_request(http::HTTP.Stream)
                            haskey(backend_data["result"], "tools")
                             backend_tools = backend_data["result"]["tools"]
                             append!(all_tools, backend_tools)
-                            @info "tools/list - combined tools" target_repl_id =
+                            @debug "tools/list - combined tools" target_repl_id =
                                 target_repl_id proxy_tools = length(proxy_tools) backend_tools =
                                 length(backend_tools) total = length(all_tools)
                         end
@@ -2665,7 +2717,7 @@ function handle_request(http::HTTP.Stream)
                         target_repl_id exception = e
                 end
             else
-                @info "Target REPL not ready, returning proxy tools only" target_repl_id =
+                @debug "Target REPL not ready, returning proxy tools only" target_repl_id =
                     target_repl_id status = repl !== nothing ? repl.status : :not_found
             end
 
@@ -2680,6 +2732,38 @@ function handle_request(http::HTTP.Stream)
                         "jsonrpc" => "2.0",
                         "id" => get(request, "id", nothing),
                         "result" => Dict("tools" => all_tools),
+                    ),
+                ),
+            )
+            return nothing
+        elseif method == "prompts/list"
+            # Return empty prompts list (proxy doesn't provide prompts)
+            HTTP.setstatus(http, 200)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.startwrite(http)
+            write(
+                http,
+                JSON.json(
+                    Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => get(request, "id", nothing),
+                        "result" => Dict("prompts" => []),
+                    ),
+                ),
+            )
+            return nothing
+        elseif method == "resources/list"
+            # Return empty resources list (proxy doesn't provide resources)
+            HTTP.setstatus(http, 200)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.startwrite(http)
+            write(
+                http,
+                JSON.json(
+                    Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => get(request, "id", nothing),
+                        "result" => Dict("resources" => []),
                     ),
                 ),
             )
@@ -2902,8 +2986,16 @@ function handle_request(http::HTTP.Stream)
                     # If project has .mcprepl/agents.json with this agent name, it uses that
                     # Otherwise falls back to .mcprepl/security.json or lax mode with warning
                     # Use wait() to keep the process alive until the server is stopped
+                    # Set stdout/stderr to unbuffered mode for real-time log updates
 
-                    julia_cmd = `julia --project=$project_path -e "using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path))); wait()"`
+                    startup_code = """
+                    Base.stderr = Base.IOContext(Base.stderr, :color => false)
+                    Base.stdout = Base.IOContext(Base.stdout, :color => false)
+                    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t), Base.stdout.io, C_NULL, 0, 0)
+                    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t), Base.stderr.io, C_NULL, 0, 0)
+                    using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path))); wait()
+                    """
+                    julia_cmd = `julia --project=$project_path -e $startup_code`
 
                     # Add environment variable tag for easy identification
                     env = copy(ENV)
@@ -3047,7 +3139,7 @@ function handle_request(http::HTTP.Stream)
             repls = list_repls()
             if isempty(repls)
                 # No backends available - return a friendly message
-                @info "No backends available for method" method = method
+                @debug "No backends available for method" method = method
                 HTTP.setstatus(http, 200)
                 HTTP.setheader(http, "Content-Type" => "application/json")
                 HTTP.startwrite(http)
@@ -3073,23 +3165,38 @@ function handle_request(http::HTTP.Stream)
         end
 
     catch e
-        @error "Error handling request" exception = (e, catch_backtrace())
-        HTTP.setstatus(http, 500)
-        HTTP.setheader(http, "Content-Type" => "application/json")
-        HTTP.startwrite(http)
-        write(
-            http,
-            JSON.json(
-                Dict(
-                    "jsonrpc" => "2.0",
-                    "error" => Dict(
-                        "code" => -32603,
-                        "message" => "Internal error: $(sprint(showerror, e))",
+        # Don't log connection reset/broken pipe errors - these are normal when clients disconnect
+        if e isa Base.IOError &&
+           (occursin("connection reset", e.msg) || occursin("broken pipe", e.msg))
+            @debug "Client disconnected during response" exception = e
+        else
+            @error "Error handling request" exception = (e, catch_backtrace())
+        end
+
+        # Try to send error response if stream is still open
+        try
+            if isopen(http)
+                HTTP.setstatus(http, 500)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.startwrite(http)
+                write(
+                    http,
+                    JSON.json(
+                        Dict(
+                            "jsonrpc" => "2.0",
+                            "error" => Dict(
+                                "code" => -32603,
+                                "message" => "Internal error: $(sprint(showerror, e))",
+                            ),
+                            "id" => nothing,
+                        ),
                     ),
-                    "id" => nothing,
-                ),
-            ),
-        )
+                )
+            end
+        catch write_err
+            # Ignore errors when trying to write error response
+            @debug "Failed to send error response" exception = write_err
+        end
         return nothing
     end
 end
