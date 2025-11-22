@@ -3,6 +3,7 @@ import { fetchSessions, fetchEvents, subscribeToEvents, fetchTools, callTool, fe
 import { Session, SessionEvent } from './types';
 import { SessionCard } from './components/SessionCard';
 import { MetricCard } from './components/MetricCard';
+import { SessionHistory } from './components/SessionHistory';
 import { JsonViewer } from '@textea/json-viewer';
 import './App.css';
 import './quick-start.css';
@@ -59,7 +60,7 @@ export const App: React.FC = () => {
     const [sessions, setSessions] = useState<Record<string, Session>>({});
     const [events, setEvents] = useState<SessionEvent[]>([]);
     const [selectedSession, setSelectedSession] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<'overview' | 'events' | 'terminal' | 'tools' | 'logs'>('overview');
+    const [activeTab, setActiveTab] = useState<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history'>('overview');
     const [eventFilter, setEventFilter] = useState<string>('interesting');
     const [selectedEvent, setSelectedEvent] = useState<SessionEvent | null>(null);
     const terminalRef = useRef<HTMLDivElement>(null);
@@ -843,6 +844,12 @@ export const App: React.FC = () => {
                         >
                             📋 Logs
                         </button>
+                        <button
+                            className={`tab ${activeTab === 'history' ? 'active' : ''}`}
+                            onClick={() => setActiveTab('history')}
+                        >
+                            🕐 History
+                        </button>
                     </div>
 
                     <div className="view-container">
@@ -1515,6 +1522,12 @@ export const App: React.FC = () => {
                             )}
                         </div>
                     </div>
+                </div>
+            )}
+
+            {activeTab === 'history' && (
+                <div className="view active" id="history-view">
+                    <SessionHistory sessionId={selectedSession} />
                 </div>
             )}
 

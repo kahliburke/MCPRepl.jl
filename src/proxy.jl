@@ -2135,6 +2135,142 @@ function handle_request(http::HTTP.Stream)
             return nothing
         end
 
+        # Dashboard API: Get interactions for a session
+        if path == "/dashboard/api/interactions"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+            request_id = get(query_params, "request_id", nothing)
+            direction = get(query_params, "direction", nothing)
+            limit = parse(Int, get(query_params, "limit", "100"))
+
+            try
+                interactions = Database.get_interactions(
+                    session_id = session_id,
+                    request_id = request_id,
+                    direction = direction,
+                    limit = limit,
+                )
+
+                # Convert DataFrame to JSON array
+                interactions_json = [
+                    Dict(
+                        "id" => row.id,
+                        "session_id" => row.session_id,
+                        "timestamp" => row.timestamp,
+                        "direction" => row.direction,
+                        "message_type" => row.message_type,
+                        "request_id" => row.request_id,
+                        "method" => row.method,
+                        "content" => row.content,
+                        "content_size" => row.content_size,
+                    ) for row in eachrow(interactions)
+                ]
+
+                send_json_response(http, interactions_json)
+            catch e
+                @error "Failed to get interactions" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Dashboard API: Reconstruct session timeline
+        if path == "/dashboard/api/session-timeline"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+            limit = parse(Int, get(query_params, "limit", "1000"))
+
+            if session_id === nothing
+                send_json_response(
+                    http,
+                    Dict("error" => "session_id parameter required"),
+                    status = 400,
+                )
+                return nothing
+            end
+
+            try
+                timeline = Database.reconstruct_session(session_id, limit = limit)
+
+                # Convert DataFrame to JSON array
+                timeline_json = [
+                    Dict(
+                        "timestamp" => row.timestamp,
+                        "type" => row.type,
+                        "direction" =>
+                            ismissing(row.direction) ? nothing : row.direction,
+                        "message_type" =>
+                            ismissing(row.message_type) ? nothing : row.message_type,
+                        "content" => row.content,
+                        "request_id" =>
+                            ismissing(row.request_id) ? nothing : row.request_id,
+                        "method" => ismissing(row.method) ? nothing : row.method,
+                        "event_type" =>
+                            ismissing(row.event_type) ? nothing : row.event_type,
+                        "duration_ms" =>
+                            ismissing(row.duration_ms) ? nothing : row.duration_ms,
+                    ) for row in eachrow(timeline)
+                ]
+
+                send_json_response(http, timeline_json)
+            catch e
+                @error "Failed to reconstruct session" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Dashboard API: Get session summary
+        if path == "/dashboard/api/session-summary"
+            query_params = HTTP.queryparams(uri)
+            session_id = get(query_params, "session_id", nothing)
+
+            if session_id === nothing
+                send_json_response(
+                    http,
+                    Dict("error" => "session_id parameter required"),
+                    status = 400,
+                )
+                return nothing
+            end
+
+            try
+                summary = Database.get_session_summary(session_id)
+                send_json_response(http, summary)
+            catch e
+                @error "Failed to get session summary" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
+        # Dashboard API: Get all sessions from database
+        if path == "/dashboard/api/db-sessions"
+            query_params = HTTP.queryparams(uri)
+            limit = parse(Int, get(query_params, "limit", "100"))
+
+            try
+                sessions = Database.get_all_sessions(limit = limit)
+
+                # Convert DataFrame to JSON array
+                sessions_json = [
+                    Dict(
+                        "session_id" => row.session_id,
+                        "start_time" => row.start_time,
+                        "last_activity" => row.last_activity,
+                        "status" => row.status,
+                        "metadata" => row.metadata,
+                    ) for row in eachrow(sessions)
+                ]
+
+                send_json_response(http, sessions_json)
+            catch e
+                @error "Failed to get sessions from database" exception = e
+                send_json_response(http, Dict("error" => string(e)), status = 500)
+            end
+            return nothing
+        end
+
         # Dashboard API: Generate test events
         if path == "/dashboard/api/test-events"
             # Use first available session, or "test-agent" if none

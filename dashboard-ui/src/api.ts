@@ -276,3 +276,91 @@ export async function clearLogs(sessionId: string): Promise<ClearLogsResponse> {
 }
 
 // Quick start now uses callTool() directly
+
+// Database API
+
+export interface Interaction {
+    id: number;
+    session_id: string;
+    timestamp: string;
+    direction: 'inbound' | 'outbound';
+    message_type: string;
+    request_id?: string;
+    method?: string;
+    content: string;
+    content_size: number;
+}
+
+export interface TimelineItem {
+    timestamp: string;
+    type: 'interaction' | 'event';
+    direction?: 'inbound' | 'outbound';
+    message_type?: string;
+    content: string;
+    request_id?: string;
+    method?: string;
+    event_type?: string;
+    duration_ms?: number;
+}
+
+export interface SessionSummary {
+    session_id: string;
+    session_info: any;
+    total_interactions: number;
+    total_events: number;
+    total_data_bytes: number;
+    complete_request_response_pairs: number;
+}
+
+export interface DBSession {
+    session_id: string;
+    start_time: string;
+    last_activity: string;
+    status: string;
+    metadata: string;
+}
+
+export async function fetchInteractions(params: {
+    session_id?: string;
+    request_id?: string;
+    direction?: 'inbound' | 'outbound';
+    limit?: number;
+}): Promise<Interaction[]> {
+    const searchParams = new URLSearchParams();
+    if (params.session_id) searchParams.set('session_id', params.session_id);
+    if (params.request_id) searchParams.set('request_id', params.request_id);
+    if (params.direction) searchParams.set('direction', params.direction);
+    if (params.limit) searchParams.set('limit', params.limit.toString());
+
+    const response = await fetch(`${API_BASE}/interactions?${searchParams}`);
+    if (!response.ok) throw new Error('Failed to fetch interactions');
+    return response.json();
+}
+
+export async function fetchSessionTimeline(sessionId: string, limit: number = 1000): Promise<TimelineItem[]> {
+    const params = new URLSearchParams();
+    params.set('session_id', sessionId);
+    params.set('limit', limit.toString());
+
+    const response = await fetch(`${API_BASE}/session-timeline?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch session timeline');
+    return response.json();
+}
+
+export async function fetchSessionSummary(sessionId: string): Promise<SessionSummary> {
+    const params = new URLSearchParams();
+    params.set('session_id', sessionId);
+
+    const response = await fetch(`${API_BASE}/session-summary?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch session summary');
+    return response.json();
+}
+
+export async function fetchDBSessions(limit: number = 100): Promise<DBSession[]> {
+    const params = new URLSearchParams();
+    params.set('limit', limit.toString());
+
+    const response = await fetch(`${API_BASE}/db-sessions?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch database sessions');
+    return response.json();
+}
