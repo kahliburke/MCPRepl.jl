@@ -14,7 +14,10 @@ using DataFrames
 export init_db!,
     log_event!,
     log_event_safe!,
+    log_interaction!,
+    log_interaction_safe!,
     get_events,
+    get_interactions,
     get_events_by_time_range,
     get_session_stats,
     register_session!,
@@ -92,6 +95,42 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         """
     CREATE INDEX IF NOT EXISTS idx_events_timestamp 
     ON events(timestamp DESC)
+""",
+    )
+
+    # Create interactions table for complete message capture
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS interactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        direction TEXT NOT NULL,
+        message_type TEXT NOT NULL,
+        request_id TEXT,
+        method TEXT,
+        content TEXT NOT NULL,
+        content_size INTEGER,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+    )
+""",
+    )
+
+    # Create index for interactions
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_interactions_session 
+    ON interactions(session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_interactions_request 
+    ON interactions(request_id, timestamp)
 """,
     )
 
@@ -189,6 +228,96 @@ function log_event_safe!(
 end
 
 """
+Log a complete interaction (request or response) to the database.
+This captures the full message content for session reconstruction.
+
+Arguments:
+- session_id: Session identifier
+- direction: "inbound" (to proxy) or "outbound" (from proxy)
+- message_type: "request", "response", "error", "log", etc.
+- content: The complete message content (will be stored as JSON string)
+- request_id: Optional request ID to link requests and responses
+- method: Optional method name for RPC calls
+"""
+function log_interaction!(
+    session_id::String,
+    direction::String,
+    message_type::String,
+    content::Union{String,Dict};
+    request_id::Union{String,Nothing} = nothing,
+    method::Union{String,Nothing} = nothing,
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    content_str = content isa String ? content : JSON.json(content)
+    content_size = sizeof(content_str)
+    timestamp = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+
+    DBInterface.execute(
+        db,
+        """
+    INSERT INTO interactions (session_id, timestamp, direction, message_type, 
+                             request_id, method, content, content_size)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+""",
+        (
+            session_id,
+            timestamp,
+            direction,
+            message_type,
+            request_id,
+            method,
+            content_str,
+            content_size,
+        ),
+    )
+
+    # Update session last_activity
+    DBInterface.execute(
+        db,
+        """
+    UPDATE sessions 
+    SET last_activity = ?
+    WHERE session_id = ?
+""",
+        (timestamp, session_id),
+    )
+end
+
+"""
+Log an interaction with automatic session creation.
+Safe wrapper that won't error if database is not initialized.
+"""
+function log_interaction_safe!(
+    session_id::String,
+    direction::String,
+    message_type::String,
+    content::Union{String,Dict};
+    request_id::Union{String,Nothing} = nothing,
+    method::Union{String,Nothing} = nothing,
+)
+    try
+        # Ensure session exists
+        register_session!(session_id; metadata = Dict("auto_created" => true))
+        log_interaction!(
+            session_id,
+            direction,
+            message_type,
+            content;
+            request_id = request_id,
+            method = method,
+        )
+    catch e
+        # Silent failure - log to stderr but don't crash
+        @warn "Failed to log interaction to database" session_id = session_id direction =
+            direction message_type = message_type exception = e
+    end
+end
+
+"""
 Retrieve recent events from the database.
 """
 function get_events(;
@@ -216,6 +345,52 @@ function get_events(;
     end
 
     query *= " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+    push!(params, limit, offset)
+
+    return DBInterface.execute(db, query, params) |> DataFrame
+end
+
+"""
+Retrieve interactions from the database.
+Interactions contain full message content for complete session reconstruction.
+"""
+function get_interactions(;
+    session_id::Union{String,Nothing} = nothing,
+    request_id::Union{String,Nothing} = nothing,
+    direction::Union{String,Nothing} = nothing,
+    message_type::Union{String,Nothing} = nothing,
+    limit::Int = 100,
+    offset::Int = 0,
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    query = "SELECT * FROM interactions WHERE 1=1"
+    params = []
+
+    if session_id !== nothing
+        query *= " AND session_id = ?"
+        push!(params, session_id)
+    end
+
+    if request_id !== nothing
+        query *= " AND request_id = ?"
+        push!(params, request_id)
+    end
+
+    if direction !== nothing
+        query *= " AND direction = ?"
+        push!(params, direction)
+    end
+
+    if message_type !== nothing
+        query *= " AND message_type = ?"
+        push!(params, message_type)
+    end
+
+    query *= " ORDER BY timestamp ASC LIMIT ? OFFSET ?"
     push!(params, limit, offset)
 
     return DBInterface.execute(db, query, params) |> DataFrame

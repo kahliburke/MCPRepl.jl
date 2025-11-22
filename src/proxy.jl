@@ -31,35 +31,61 @@ include("proxy_tools.jl")
 # ============================================================================
 
 """
-    send_json_response(http::HTTP.Stream, data; status::Int=200)
+    send_json_response(http::HTTP.Stream, data; status::Int=200, session_id::String="proxy", request_id=nothing)
 
-Send a JSON response with proper headers.
+Send a JSON response with proper headers and log to database.
 """
-function send_json_response(http::HTTP.Stream, data; status::Int = 200)
+function send_json_response(
+    http::HTTP.Stream,
+    data;
+    status::Int = 200,
+    session_id::String = "proxy",
+    request_id = nothing,
+)
+    json_str = JSON.json(data)
+
+    # Log outbound response
+    log_db_interaction(
+        session_id,
+        "outbound",
+        "response",
+        json_str;
+        request_id = request_id,
+        method = nothing,
+    )
+
     HTTP.setstatus(http, status)
     HTTP.setheader(http, "Content-Type" => "application/json")
     HTTP.startwrite(http)
-    write(http, JSON.json(data))
+    write(http, json_str)
     return nothing
 end
 
 """
-    send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int=200)
+    send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int=200, session_id::String="proxy")
 
-Send a JSON-RPC success response.
+Send a JSON-RPC success response and log to database.
 """
-function send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int = 200)
+function send_jsonrpc_result(
+    http::HTTP.Stream,
+    id,
+    result;
+    status::Int = 200,
+    session_id::String = "proxy",
+)
     send_json_response(
         http,
         Dict("jsonrpc" => "2.0", "id" => id, "result" => result);
         status = status,
+        session_id = session_id,
+        request_id = id,
     )
 end
 
 """
-    send_jsonrpc_error(http::HTTP.Stream, id, code::Int, message::String; status::Int=200, data=nothing)
+    send_jsonrpc_error(http::HTTP.Stream, id, code::Int, message::String; status::Int=200, data=nothing, session_id::String="proxy")
 
-Send a JSON-RPC error response.
+Send a JSON-RPC error response and log to database.
 """
 function send_jsonrpc_error(
     http::HTTP.Stream,
@@ -68,6 +94,7 @@ function send_jsonrpc_error(
     message::String;
     status::Int = 200,
     data = nothing,
+    session_id::String = "proxy",
 )
     error_dict = Dict("code" => code, "message" => message)
     if data !== nothing
@@ -77,20 +104,29 @@ function send_jsonrpc_error(
         http,
         Dict("jsonrpc" => "2.0", "id" => id, "error" => error_dict);
         status = status,
+        session_id = session_id,
+        request_id = id,
     )
 end
 
 """
-    send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int=200)
+    send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int=200, session_id::String="proxy")
 
-Send an MCP tool call result with text content.
+Send an MCP tool call result with text content and log to database.
 """
-function send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int = 200)
+function send_mcp_tool_result(
+    http::HTTP.Stream,
+    id,
+    text::String;
+    status::Int = 200,
+    session_id::String = "proxy",
+)
     send_jsonrpc_result(
         http,
         id,
         Dict("content" => [Dict("type" => "text", "text" => text)]);
         status = status,
+        session_id = session_id,
     )
 end
 
@@ -142,6 +178,30 @@ function log_db_event(
     catch e
         # Silent failure
         @debug "Failed to log to database" exception = e
+    end
+end
+
+# Helper function to log complete interactions (request/response messages)
+function log_db_interaction(
+    session_id::String,
+    direction::String,
+    message_type::String,
+    content::Union{String,Dict};
+    request_id = nothing,
+    method = nothing,
+)
+    try
+        Database.log_interaction_safe!(
+            session_id,
+            direction,
+            message_type,
+            content;
+            request_id = request_id,
+            method = method,
+        )
+    catch e
+        # Silent failure
+        @debug "Failed to log interaction to database" exception = e
     end
 end
 
@@ -1272,6 +1332,17 @@ function route_to_repl_streaming(
             HTTP.setheader(http, "Content-Type" => "application/json")
         end
 
+        # Log the backend response before sending to client
+        request_id_val = get(request, "id", nothing)
+        log_db_interaction(
+            target_id,
+            "outbound",
+            "response",
+            response_body;
+            request_id = request_id_val,
+            method = method,
+        )
+
         HTTP.startwrite(http)
         write(http, response_body)
         return nothing
@@ -1362,6 +1433,42 @@ function handle_request(http::HTTP.Stream)
         # Log incoming requests at debug level
         @debug "Incoming request" method = req.method target = req.target content_length =
             length(body)
+
+        # Log all incoming requests to database for complete session reconstruction
+        # Parse request to extract session ID and other metadata
+        request_parsed = nothing
+        request_id = nothing
+        request_method = nothing
+        session_id = "proxy"  # Default session ID
+        try
+            if !isempty(body) && req.method == "POST"
+                request_parsed = JSON.parse(body)
+                request_id = get(request_parsed, "id", nothing)
+                request_method = get(request_parsed, "method", nothing)
+
+                # Try to extract session ID from various sources
+                params = get(request_parsed, "params", Dict())
+                if haskey(params, "_meta") && haskey(params["_meta"], "progressToken")
+                    # Extract REPL ID from progress token if available
+                    session_id = params["_meta"]["progressToken"]
+                elseif haskey(params, "name")
+                    # For tool calls, use the tool name or REPL target
+                    session_id = string(params["name"])
+                end
+            end
+
+            # Log the inbound request
+            log_db_interaction(
+                session_id,
+                "inbound",
+                "request",
+                body;
+                request_id = request_id,
+                method = request_method,
+            )
+        catch e
+            @debug "Failed to parse request for logging" exception = e
+        end
 
         # Handle dashboard HTTP routes
         uri = HTTP.URI(req.target)
