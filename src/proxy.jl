@@ -791,10 +791,11 @@ function flush_pending_requests(repl_id::String, pending::Vector{Tuple{Dict,HTTP
             # Try to send response back to client if stream is still open
             if isopen(http)
                 try
-                    HTTP.setstatus(http, backend_response.status)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(http, String(backend_response.body))
+                    send_json_response(
+                        http,
+                        String(backend_response.body),
+                        backend_response.status,
+                    )
                     @info "Buffered request executed and response sent to client" repl_id =
                         repl_id request_id = get(request, "id", nothing)
                 catch stream_err
@@ -819,9 +820,6 @@ function flush_pending_requests(repl_id::String, pending::Vector{Tuple{Dict,HTTP
             # Try to send error to client
             if isopen(http)
                 try
-                    HTTP.setstatus(http, 500)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
                     send_jsonrpc_error(
                         http,
                         get(request, "id", nothing),
@@ -1327,9 +1325,7 @@ function handle_request(http::HTTP.Stream)
 
         # Redirect /dashboard to /dashboard/ (Vite expects trailing slash)
         if path == "/dashboard"
-            HTTP.setstatus(http, 301)
-            HTTP.setheader(http, "Location" => "/dashboard/")
-            HTTP.startwrite(http)
+            send_empty_response(http, 301, ["Location" => "/dashboard/"])
             return nothing
         end
 
@@ -1716,10 +1712,7 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(http, JSON.json(result))
+            send_json_response(http, result)
             return nothing
             # Dashboard API: Clear log file for a session
             if path == "/dashboard/api/clear-logs" && req.method == "POST"
@@ -1794,10 +1787,7 @@ function handle_request(http::HTTP.Stream)
                     result["error"] = "session_id parameter is required"
                 end
 
-                HTTP.setstatus(http, result["success"] ? 200 : 400)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(http, JSON.json(result))
+                send_json_response(http, result; status = result["success"] ? 200 : 400)
                 return nothing
             end
 
@@ -1807,12 +1797,9 @@ function handle_request(http::HTTP.Stream)
         if path == "/dashboard/api/restart" && req.method == "POST"
             @info "Restart endpoint called" pid = getpid()
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_json_response(
                 http,
-                JSON.json(Dict("status" => "ok", "message" => "Restarting proxy server")),
+                Dict("status" => "ok", "message" => "Restarting proxy server"),
             )
 
             @info "Response sent, scheduling restart"
@@ -1876,10 +1863,7 @@ function handle_request(http::HTTP.Stream)
         if path == "/dashboard/api/shutdown" && req.method == "POST"
             @info "Shutdown endpoint called" pid = getpid()
 
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_json_response(
                 http,
                 JSON.json(
                     Dict("status" => "ok", "message" => "Shutting down proxy server"),
@@ -2091,26 +2075,24 @@ function handle_request(http::HTTP.Stream)
 
         # Dashboard WebSocket (for future implementation)
         if path == "/dashboard/ws"
-            HTTP.setstatus(http, 501)
-            HTTP.setheader(http, "Content-Type" => "text/plain")
-            HTTP.startwrite(http)
-            write(http, "WebSocket not yet implemented")
+            send_json_response(http, "WebSocket not yet implemented", 501, "text/plain")
             return nothing
         end
 
         if isempty(body)
             # Handle OPTIONS requests (CORS preflight for streamable-http)
             if req.method == "OPTIONS"
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
-                HTTP.setheader(http, "Access-Control-Allow-Methods" => "GET, POST, OPTIONS")
-                HTTP.setheader(
+                send_empty_response(
                     http,
-                    "Access-Control-Allow-Headers" => "Content-Type, Authorization",
+                    200,
+                    [
+                        "Access-Control-Allow-Origin" => "*",
+                        "Access-Control-Allow-Methods" => "GET, POST, OPTIONS",
+                        "Access-Control-Allow-Headers" => "Content-Type, Authorization",
+                        "Access-Control-Max-Age" => "86400",
+                        "Content-Length" => "0",
+                    ],
                 )
-                HTTP.setheader(http, "Access-Control-Max-Age" => "86400")
-                HTTP.setheader(http, "Content-Length" => "0")
-                HTTP.startwrite(http)
                 return nothing
             end
 
@@ -2118,12 +2100,14 @@ function handle_request(http::HTTP.Stream)
             if req.method == "DELETE"
                 # VS Code sends DELETE to clean up sessions before reconnecting
                 @debug "Handling DELETE request" target = req.target
-                HTTP.setstatus(http, 200)  # OK
-                HTTP.setheader(http, "Content-Type" => "application/json")
                 response = JSON.json(Dict("status" => "ok"))
-                HTTP.setheader(http, "Content-Length" => string(length(response)))
-                HTTP.startwrite(http)
-                write(http, response)
+                send_json_response(
+                    http,
+                    response,
+                    200,
+                    "application/json",
+                    ["Content-Length" => string(length(response))],
+                )
                 return nothing
             end
 
@@ -2131,9 +2115,6 @@ function handle_request(http::HTTP.Stream)
             # Per MCP spec 2.2: "The server MUST either return Content-Type: text/event-stream
             # in response to this HTTP GET, or else return HTTP 405 Method Not Allowed"
             if req.method == "GET"
-                HTTP.setstatus(http, 405)  # Method Not Allowed (per spec)
-                HTTP.setheader(http, "Allow" => "POST, DELETE, OPTIONS")
-                HTTP.setheader(http, "Content-Type" => "application/json")
                 # Return a valid JSON-RPC error message
                 error_body = JSON.json(
                     Dict(
@@ -2151,21 +2132,12 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
             # Empty POST body - invalid request
-            HTTP.setstatus(http, 400)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
+            send_jsonrpc_error(
                 http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "error" => Dict(
-                            "code" => -32700,
-                            "message" => "Parse error: empty request body",
-                        ),
-                        "id" => nothing,
-                    ),
-                ),
+                nothing,
+                -32700,
+                "Parse error: empty request body";
+                status = 400,
             )
             return nothing
         end
@@ -2175,22 +2147,7 @@ function handle_request(http::HTTP.Stream)
             JSON.parse(body)
         catch e
             @error "Failed to parse JSON request" body = body exception = e
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-            write(
-                http,
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "error" => Dict(
-                            "code" => -32700,
-                            "message" => "Parse error: invalid JSON",
-                        ),
-                        "id" => nothing,
-                    ),
-                ),
-            )
+            send_jsonrpc_error(http, nothing, -32700, "Parse error: invalid JSON")
             return nothing
         end
 
@@ -2205,10 +2162,7 @@ function handle_request(http::HTTP.Stream)
         if startswith(method, "notifications/")
             @debug "✉️  Received notification" method = method params = params
             # Notifications don't require a response, just return 200
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.setheader(http, "Content-Length" => "0")
-            HTTP.startwrite(http)
+            send_empty_response(http)
             return nothing
         end
 
@@ -2641,22 +2595,7 @@ function handle_request(http::HTTP.Stream)
                     # Fall through to existing implementation
                 elseif result_text !== nothing
                     # Return result for other tools
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
-                        http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "result" => Dict(
-                                    "content" =>
-                                        [Dict("type" => "text", "text" => result_text)],
-                                ),
-                            ),
-                        ),
-                    )
+                    send_mcp_tool_result(http, get(request, "id", nothing), result_text)
                     return nothing
                 end
             end
@@ -2739,22 +2678,7 @@ function handle_request(http::HTTP.Stream)
                     result_text = "❌ Error scanning for stale sessions: $e"
                 end
 
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
-                    http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "result" => Dict(
-                                "content" =>
-                                    [Dict("type" => "text", "text" => result_text)],
-                            ),
-                        ),
-                    ),
-                )
+                send_mcp_tool_result(http, get(request, "id", nothing), result_text)
                 return nothing
             end
 
@@ -2766,21 +2690,11 @@ function handle_request(http::HTTP.Stream)
                 session_name = get(args, "session_name", basename(project_path))
 
                 if isempty(project_path)
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_jsonrpc_error(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "error" => Dict(
-                                    "code" => -32602,
-                                    "message" => "project_path is required",
-                                ),
-                            ),
-                        ),
+                        get(request, "id", nothing),
+                        -32602,
+                        "project_path is required",
                     )
                     return nothing
                 end
@@ -2788,25 +2702,10 @@ function handle_request(http::HTTP.Stream)
                 # Check if Julia session already exists
                 existing = findfirst(r -> r.id == session_name, repls)
                 if existing !== nothing
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_mcp_tool_result(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "result" => Dict(
-                                    "content" => [
-                                        Dict(
-                                            "type" => "text",
-                                            "text" => "Julia session '$session_name' is already running on port $(repls[existing].port)",
-                                        ),
-                                    ],
-                                ),
-                            ),
-                        ),
+                        get(request, "id", nothing),
+                        "Julia session '$session_name' is already running on port $(repls[existing].port)",
                     )
                     return nothing
                 end
@@ -2868,25 +2767,10 @@ function handle_request(http::HTTP.Stream)
                         if idx !== nothing
                             registered = true
                             new_repl = current_repls[idx]
-                            HTTP.setstatus(http, 200)
-                            HTTP.setheader(http, "Content-Type" => "application/json")
-                            HTTP.startwrite(http)
-                            write(
+                            send_mcp_tool_result(
                                 http,
-                                JSON.json(
-                                    Dict(
-                                        "jsonrpc" => "2.0",
-                                        "id" => get(request, "id", nothing),
-                                        "result" => Dict(
-                                            "content" => [
-                                                Dict(
-                                                    "type" => "text",
-                                                    "text" => "✅ Successfully started Julia session '$(new_repl.id)' on port $(new_repl.port)\n\nProject: $project_path\nPID: $(new_repl.pid)\nStatus: $(new_repl.status)\nLog: $log_file",
-                                                ),
-                                            ],
-                                        ),
-                                    ),
-                                ),
+                                get(request, "id", nothing),
+                                "✅ Successfully started Julia session '$(new_repl.id)' on port $(new_repl.port)\n\nProject: $project_path\nPID: $(new_repl.pid)\nStatus: $(new_repl.status)\nLog: $log_file",
                             )
                             return nothing
                         end
@@ -2906,66 +2790,31 @@ function handle_request(http::HTTP.Stream)
                         log_contents = "(unable to read log file)"
                     end
 
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_jsonrpc_error(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "error" => Dict(
-                                    "code" => -32603,
-                                    "message" => "Julia session process started but did not register within 30 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents",
-                                ),
-                            ),
-                        ),
+                        get(request, "id", nothing),
+                        -32603,
+                        "Julia session process started but did not register within 30 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents",
                     )
                     return nothing
                 catch e
                     @error "Failed to start Julia session" exception =
                         (e, catch_backtrace())
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_jsonrpc_error(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "error" => Dict(
-                                    "code" => -32603,
-                                    "message" => "Failed to start REPL backend: $(sprint(showerror, e))",
-                                ),
-                            ),
-                        ),
+                        get(request, "id", nothing),
+                        -32603,
+                        "Failed to start REPL backend: $(sprint(showerror, e))",
                     )
                     return nothing
                 end
             else
                 # Tool requires backend REPL - check if any are available
                 if isempty(repls)
-                    HTTP.setstatus(http, 200)
-                    HTTP.setheader(http, "Content-Type" => "application/json")
-                    HTTP.startwrite(http)
-                    write(
+                    send_mcp_tool_result(
                         http,
-                        JSON.json(
-                            Dict(
-                                "jsonrpc" => "2.0",
-                                "id" => get(request, "id", nothing),
-                                "result" => Dict(
-                                    "content" => [
-                                        Dict(
-                                            "type" => "text",
-                                            "text" => "⚠️ Tool '$tool_name' requires a Julia session.\n\nNo Julia sessions are currently connected to the proxy.\n\nTo enable Julia tools:\n1. Start a Julia session\n2. Run: using MCPRepl; MCPRepl.start!()\n3. The session will automatically register with this proxy\n\nAvailable proxy tools: help, proxy_status, list_julia_sessions, dashboard_url, start_julia_session",
-                                        ),
-                                    ],
-                                ),
-                            ),
-                        ),
+                        get(request, "id", nothing),
+                        "⚠️ Tool '$tool_name' requires a Julia session.\n\nNo Julia sessions are currently connected to the proxy.\n\nTo enable Julia tools:\n1. Start a Julia session\n2. Run: using MCPRepl; MCPRepl.start!()\n3. The session will automatically register with this proxy\n\nAvailable proxy tools: help, proxy_status, list_julia_sessions, dashboard_url, start_julia_session",
                     )
                     return nothing
                 else
@@ -2983,18 +2832,10 @@ function handle_request(http::HTTP.Stream)
             if isempty(repls)
                 # No backends available - return a friendly message
                 @debug "No backends available for method" method = method
-                HTTP.setstatus(http, 200)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_result(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => get(request, "id", nothing),
-                            "result" => nothing,  # Many MCP methods (like notifications) expect null result
-                        ),
-                    ),
+                    get(request, "id", nothing),
+                    nothing,  # Many MCP methods (like notifications) expect null result
                 )
                 return nothing
             else
@@ -3019,21 +2860,12 @@ function handle_request(http::HTTP.Stream)
         # Try to send error response if stream is still open
         try
             if isopen(http)
-                HTTP.setstatus(http, 500)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-                write(
+                send_jsonrpc_error(
                     http,
-                    JSON.json(
-                        Dict(
-                            "jsonrpc" => "2.0",
-                            "error" => Dict(
-                                "code" => -32603,
-                                "message" => "Internal error: $(sprint(showerror, e))",
-                            ),
-                            "id" => nothing,
-                        ),
-                    ),
+                    nothing,
+                    -32603,
+                    "Internal error: $(sprint(showerror, e))";
+                    status = 500,
                 )
             end
         catch write_err

@@ -69,14 +69,20 @@ function log_event(id::String, event_type::EventType, data::Dict; duration_ms = 
         push!(EVENT_LOG, event)
         # Keep only last MAX_EVENTS
         if length(EVENT_LOG) > MAX_EVENTS
-            deleteat!(EVENT_LOG, 1:(length(EVENT_LOG) - MAX_EVENTS))
+            deleteat!(EVENT_LOG, 1:(length(EVENT_LOG)-MAX_EVENTS))
         end
     end
 
     # Persist to database (async to avoid blocking)
     if DB_LOG_CALLBACK[] !== nothing
         @async try
-            DB_LOG_CALLBACK[](id, string(event_type), event.timestamp, event.data, duration_ms)
+            DB_LOG_CALLBACK[](
+                id,
+                string(event_type),
+                event.timestamp,
+                event.data,
+                duration_ms,
+            )
         catch e
             # Silently ignore database errors to not disrupt real-time operations
             @debug "Failed to persist event to database" exception = e

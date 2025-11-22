@@ -37,3 +37,4 @@ crush.json
 **/coverage-lcov.info
 
 HANDOFF.md
+.mcprepl/events.db

@@ -65,6 +65,7 @@ export const App: React.FC = () => {
     const terminalRef = useRef<HTMLDivElement>(null);
     const terminalBottomRef = useRef<HTMLDivElement>(null);
     const [isNearBottom, setIsNearBottom] = useState(true);
+    const logsViewerRef = useRef<HTMLDivElement>(null);
     const [terminalSearch, setTerminalSearch] = useState('');
     const [showServerModal, setShowServerModal] = useState(false);
     const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
@@ -99,7 +100,15 @@ export const App: React.FC = () => {
         if (autoRefreshLogs && activeTab === 'logs' && logSessionId) {
             const interval = setInterval(() => {
                 fetchLogs(logSessionId).then(data => {
-                    if (data.content) setLogContent(data.content);
+                    if (data.content) {
+                        setLogContent(data.content);
+                        // Scroll to bottom after content updates
+                        setTimeout(() => {
+                            if (logsViewerRef.current) {
+                                logsViewerRef.current.scrollTop = logsViewerRef.current.scrollHeight;
+                            }
+                        }, 0);
+                    }
                 });
             }, 2000);
             return () => clearInterval(interval);
@@ -1100,7 +1109,15 @@ export const App: React.FC = () => {
                                         onClick={() => {
                                             if (logSessionId) {
                                                 fetchLogs(logSessionId).then(data => {
-                                                    if (data.content) setLogContent(data.content);
+                                                    if (data.content) {
+                                                        setLogContent(data.content);
+                                                        // Scroll to bottom after refresh
+                                                        setTimeout(() => {
+                                                            if (logsViewerRef.current) {
+                                                                logsViewerRef.current.scrollTop = logsViewerRef.current.scrollHeight;
+                                                            }
+                                                        }, 0);
+                                                    }
                                                     else if (data.error) setLogContent(`Error: ${data.error}`);
                                                 });
                                             }
@@ -1112,7 +1129,7 @@ export const App: React.FC = () => {
                                     </button>
                                 </div>
 
-                                <div className="logs-viewer">
+                                <div className="logs-viewer" ref={logsViewerRef}>
                                     <pre className="log-content" dangerouslySetInnerHTML={{
                                         __html: logContent ? convertAnsiToHtml(logContent) : 'Select a session to view logs'
                                     }} />
