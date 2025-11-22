@@ -33,6 +33,24 @@
     box-shadow: 0 0 20px rgba(125, 211, 252, 0.2);
 }
 
+.session-card.has-progress {
+    border-color: #3b82f6;
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    animation: pulse-border 2s ease-in-out infinite;
+}
+
+@keyframes pulse-border {
+
+    0%,
+    100% {
+        box-shadow: 0 0 20px rgba(59, 130, 246, 0.3);
+    }
+
+    50% {
+        box-shadow: 0 0 30px rgba(59, 130, 246, 0.5);
+    }
+}
+
 .session-header {
     display: flex;
     justify-content: space-between;
@@ -151,4 +169,97 @@
 .heartbeat-container {
     height: 45px;
     margin-top: 0.5rem;
+}
+
+/* Progress indicators */
+.progress-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(15, 23, 42, 0.92);
+    backdrop-filter: blur(4px);
+    border-radius: 12px;
+    z-index: 10;
+    padding: 1rem;
+}
+
+.progress-determinate {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    width: 100%;
+    max-width: 280px;
+}
+
+.progress-bar-container {
+    width: 100%;
+    height: 8px;
+    background: rgba(59, 130, 246, 0.2);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #3b82f6, #60a5fa);
+    border-radius: 4px;
+    transition: width 0.3s ease-out;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+}
+
+.progress-indeterminate {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+}
+
+.progress-spinner {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+}
+
+.spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid rgba(59, 130, 246, 0.2);
+    border-top-color: #3b82f6;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.progress-text {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.875rem;
+    flex: 1;
+    width: 100%;
+}
+
+.progress-message {
+    color: #e2e8f0;
+    font-weight: 500;
+    flex: 1;
+    text-align: center;
+}
+
+.progress-percent,
+.progress-steps {
+    color: #60a5fa;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1rem;
 }

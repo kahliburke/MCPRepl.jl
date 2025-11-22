@@ -23,6 +23,7 @@ using Scratch
     OUTPUT
     ERROR
     HEARTBEAT
+    PROGRESS
 end
 
 # Structure for session events
@@ -51,6 +52,7 @@ Log a session event and broadcast to connected dashboard clients.
 function log_event(id::String, event_type::EventType, data::Dict; duration_ms = nothing)
     event = AgentEvent(id, event_type, now(), data, duration_ms)
 
+    # Store in memory for real-time broadcasting
     lock(EVENT_LOG_LOCK) do
         push!(EVENT_LOG, event)
         # Keep only last MAX_EVENTS
@@ -107,6 +109,53 @@ function get_events(; id = nothing, limit = 100)
         start_idx = max(1, length(events) - limit + 1)
         return events[start_idx:end]
     end
+end
+
+"""
+    emit_progress(session_id::String, token::String, step::Int; total::Union{Int,Nothing}=nothing, message::String="")
+
+Emit a progress notification for long-running operations.
+
+# Arguments
+- `session_id`: The session identifier
+- `token`: Unique progress token to identify this operation
+- `step`: Current progress step (increments to show activity)
+- `total`: Optional total steps (omit for indeterminate progress)
+- `message`: Optional human-readable status message
+
+# Examples
+```julia
+# Indeterminate progress (unknown total)
+emit_progress("session-1", "pkg-precompile", 5, message="Precompiling DataFrames...")
+
+# Determinate progress (known total)
+emit_progress("session-1", "file-process", 10, total=100, message="Processing file 10/100")
+```
+"""
+function emit_progress(
+    session_id::String,
+    token::String,
+    step::Int;
+    total::Union{Int,Nothing} = nothing,
+    message::String = "",
+)
+    params = Dict{String,Any}("progressToken" => token, "progress" => step)
+
+    # Only include total if provided (omit for indeterminate progress)
+    if total !== nothing
+        params["total"] = total
+    end
+
+    # Include message if provided
+    if !isempty(message)
+        params["message"] = message
+    end
+
+    notification =
+        Dict("jsonrpc" => "2.0", "method" => "notifications/progress", "params" => params)
+
+    # Log as PROGRESS event
+    log_event(session_id, PROGRESS, Dict("notification" => notification))
 end
 
 """

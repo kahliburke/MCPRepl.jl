@@ -10,7 +10,7 @@ Uses JET.jl to catch errors at "compile time" including:
 Run this before commits to catch issues like missing exports from modules.
 """
 
-using Test
+using ReTest
 using JET
 
 @testset "Static Analysis" begin
@@ -18,7 +18,6 @@ using JET
         # Test that all modules load without UndefVarError
         @test_call report_call = true begin
             using MCPRepl
-            MCPRepl
         end
     end
 

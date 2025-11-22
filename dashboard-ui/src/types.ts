@@ -13,7 +13,8 @@ export type EventType =
     | 'CODE_EXECUTION'
     | 'OUTPUT'
     | 'ERROR'
-    | 'HEARTBEAT';
+    | 'HEARTBEAT'
+    | 'PROGRESS';
 
 export interface SessionEvent {
     id: string;

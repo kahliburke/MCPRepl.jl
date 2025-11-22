@@ -93,6 +93,7 @@ export const App: React.FC = () => {
     const [recentSessions, setRecentSessions] = useState<Array<{ path: string, name: string, timestamp: number }>>([]);
     const [recentSessionLoading, setRecentSessionLoading] = useState<string | null>(null);
     const [confirmSessionAction, setConfirmSessionAction] = useState<{ action: 'shutdown' | 'restart', sessionId: string } | null>(null);
+    const [activeProgress, setActiveProgress] = useState<Record<string, { token: string, progress: number, total?: number, message: string }>>({});
 
     useEffect(() => {
         if (autoRefreshLogs && activeTab === 'logs' && logSessionId) {
@@ -183,6 +184,30 @@ export const App: React.FC = () => {
 
         // Subscribe to event stream
         const unsubscribe = subscribeToEvents((newEvent) => {
+            // Handle progress events separately
+            if (newEvent.type === 'PROGRESS' && newEvent.data.notification?.params) {
+                const params = newEvent.data.notification.params;
+                const token = params.progressToken;
+                const progress = params.progress;
+                const total = params.total;
+                const message = params.message || '';
+
+                setActiveProgress(prev => {
+                    // If progress is complete (progress >= total when total is defined), remove it
+                    if (total !== undefined && progress >= total) {
+                        const next = { ...prev };
+                        delete next[newEvent.id];
+                        return next;
+                    }
+
+                    // Otherwise update or add the progress
+                    return {
+                        ...prev,
+                        [newEvent.id]: { token, progress, total, message }
+                    };
+                });
+            }
+
             setEvents(prev => {
                 // Check if event already exists
                 const exists = prev.some(e =>
@@ -747,6 +772,7 @@ export const App: React.FC = () => {
                                 key={id}
                                 session={session}
                                 isSelected={selectedSession === id}
+                                progress={activeProgress[id]}
                                 onClick={() => {
                                     setSelectedSession(id);
                                     setActiveTab('logs');
@@ -999,6 +1025,20 @@ export const App: React.FC = () => {
                                                                 return <span className="terminal-info">→ Session started on port {event.data.port}</span>;
                                                             case 'SESSION_STOP':
                                                                 return <span className="terminal-info">→ Session stopped</span>;
+                                                            case 'PROGRESS':
+                                                                const progressData = event.data.notification?.params;
+                                                                if (progressData) {
+                                                                    const { progress, total, message } = progressData;
+                                                                    const progressText = total !== undefined
+                                                                        ? `${Math.round((progress / total) * 100)}%`
+                                                                        : `step ${progress}`;
+                                                                    return (
+                                                                        <span className="terminal-info">
+                                                                            🔄 {message || 'Processing'} ({progressText})
+                                                                        </span>
+                                                                    );
+                                                                }
+                                                                return <span className="terminal-default">{JSON.stringify(event.data)}</span>;
                                                             default:
                                                                 return <span className="terminal-default">{JSON.stringify(event.data)}</span>;
                                                         }

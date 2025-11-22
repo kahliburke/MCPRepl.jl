@@ -2654,6 +2654,7 @@ Terminates the active debug session and returns to normal execution.
                 ["Content-Type" => "application/json"],
                 JSON.json(registration);
                 readtimeout = 5,
+                status_exception = false,
             )
 
             if response.status == 200
@@ -2664,11 +2665,38 @@ Terminates the active debug session and returns to normal execution.
                         bold = true,
                     )
                 end
+            elseif response.status == 409
+                # Duplicate registration - parse error message and show to user
+                response_data = JSON.parse(String(response.body))
+                error_msg = get(
+                    get(response_data, "error", Dict()),
+                    "message",
+                    "Session ID already in use",
+                )
+                printstyled("❌ Registration failed: ", color = :red, bold = true)
+                println(error_msg)
+                printstyled("💡 Tip: ", color = :yellow, bold = true)
+                println("Use a different agent_name or stop the existing session")
+                # Don't start heartbeat if registration failed
+                return nothing
+            else
+                @warn "Failed to register with proxy" status = response.status
+                return nothing
+            end
+
+            # Only start heartbeat if registration succeeded
+            if response.status == 200
 
                 # Start heartbeat task to keep proxy updated
                 @async begin
                     @debug "Heartbeat task started" repl_id = repl_id proxy_port =
                         proxy_port
+                    # Capture metadata in closure for heartbeat
+                    heartbeat_metadata = Dict(
+                        "workspace" => workspace_dir,
+                        "supervisor" => supervisor,
+                        "agent_name" => agent_name,
+                    )
                     while SERVER[] !== nothing
                         try
                             sleep(5)  # Send heartbeat every 5 seconds
@@ -2679,7 +2707,12 @@ Terminates the active debug session and returns to normal execution.
                                     "jsonrpc" => "2.0",
                                     "id" => rand(1:1000000),
                                     "method" => "proxy/heartbeat",
-                                    "params" => Dict("id" => repl_id),
+                                    "params" => Dict(
+                                        "id" => repl_id,
+                                        "port" => actual_port,
+                                        "pid" => getpid(),
+                                        "metadata" => heartbeat_metadata,
+                                    ),
                                 )
                                 @debug "Sending heartbeat" repl_id = repl_id
                                 HTTP.post(
@@ -2702,7 +2735,7 @@ Terminates the active debug session and returns to normal execution.
                     end
                     @info "Heartbeat task ended" repl_id = repl_id
                 end
-            end
+            end  # if response.status == 200
         catch e
             @warn "Failed to register with proxy" exception = e
         end

@@ -252,4 +252,27 @@ export async function killStaleSessions(force: boolean = false): Promise<string>
     return data.result?.content?.[0]?.text || 'Unknown result';
 }
 
+export interface ClearLogsResponse {
+    success: boolean;
+    message?: string;
+    files?: string[];
+    error?: string;
+}
+
+export async function clearLogs(sessionId: string): Promise<ClearLogsResponse> {
+    const params = new URLSearchParams();
+    params.set('session_id', sessionId);
+
+    const response = await fetch(`${API_BASE}/clear-logs?${params}`, {
+        method: 'POST'
+    });
+
+    if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to clear logs');
+    }
+
+    return response.json();
+}
+
 // Quick start now uses callTool() directly

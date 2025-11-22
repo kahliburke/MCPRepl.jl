@@ -18,6 +18,9 @@ using UUIDs
 include("dashboard.jl")
 using .Dashboard
 
+include("database.jl")
+using .Database
+
 include("session.jl")
 using .Session
 
@@ -378,6 +381,13 @@ function register_repl(
             nothing,
         )
         @info "REPL registered with proxy" id = id port = port pid = pid
+
+        # Register session in database
+        try
+            Database.register_session!(id, "active"; metadata = metadata)
+        catch e
+            @warn "Failed to register session in database" id = id exception = e
+        end
 
         # Log registration event to dashboard
         Dashboard.log_event(
@@ -1136,6 +1146,17 @@ function route_to_repl_streaming(
         @info "Sending request to backend" url = backend_url method = method body_length =
             length(body_str)
 
+        # Emit progress notification at start of tool execution
+        if method == "tools/call" && !isempty(tool_name)
+            progress_token = "tool-$(tool_name)-$(round(Int, start_time))"
+            Dashboard.emit_progress(
+                target_id,
+                progress_token,
+                1,
+                message = "🔧 $(tool_name): Executing...",
+            )
+        end
+
         # Make request to backend - use simple HTTP.request with response streaming disabled
         backend_response = HTTP.request(
             "POST",
@@ -1148,6 +1169,18 @@ function route_to_repl_streaming(
         )
 
         duration_ms = (time() - start_time) * 1000
+
+        # Complete progress notification after tool execution
+        if method == "tools/call" && !isempty(tool_name)
+            progress_token = "tool-$(tool_name)-$(round(Int, start_time))"
+            Dashboard.emit_progress(
+                target_id,
+                progress_token,
+                2,
+                total = 2,
+                message = "✅ $(tool_name): Complete",
+            )
+        end
         response_body = String(backend_response.body)
         response_status = backend_response.status
         response_headers = Dict{String,String}()
@@ -1688,6 +1721,86 @@ function handle_request(http::HTTP.Stream)
             HTTP.startwrite(http)
             write(http, JSON.json(result))
             return nothing
+            # Dashboard API: Clear log file for a session
+            if path == "/dashboard/api/clear-logs" && req.method == "POST"
+                # Get session_id from query params or body
+                session_id = nothing
+
+                if !isempty(req.target)
+                    uri = HTTP.URI(req.target)
+                    params = HTTP.queryparams(uri.query)
+                    session_id = get(params, "session_id", nothing)
+                end
+
+                if session_id === nothing && !isempty(body)
+                    try
+                        body_params = JSON.parse(body)
+                        session_id = get(body_params, "session_id", nothing)
+                    catch
+                    end
+                end
+
+                result = Dict{String,Any}()
+
+                if session_id !== nothing
+                    # Clear log file for specific session
+                    log_dir = joinpath(dirname(@__DIR__), "logs")
+                    if isdir(log_dir)
+                        # Find log files for this session
+                        log_files = filter(
+                            f -> startswith(f, "session_$(session_id)_"),
+                            readdir(log_dir),
+                        )
+
+                        if !isempty(log_files)
+                            cleared_files = String[]
+                            for log_file in log_files
+                                full_path = joinpath(log_dir, log_file)
+                                try
+                                    # Truncate the file instead of deleting (keeps file handle valid)
+                                    open(full_path, "w") do io
+                                        # Write a header indicating when it was cleared
+                                        write(
+                                            io,
+                                            "# Log cleared at $(Dates.format(now(), "yyyy-mm-dd HH:MM:SS"))\n",
+                                        )
+                                    end
+                                    push!(cleared_files, log_file)
+                                    @info "Cleared log file" file = log_file
+                                catch e
+                                    @warn "Failed to clear log file" file = log_file exception =
+                                        e
+                                end
+                            end
+
+                            if !isempty(cleared_files)
+                                result["success"] = true
+                                result["message"] = "Cleared $(length(cleared_files)) log file(s)"
+                                result["files"] = cleared_files
+                            else
+                                result["success"] = false
+                                result["error"] = "Failed to clear any log files"
+                            end
+                        else
+                            result["success"] = false
+                            result["error"] = "No log files found for session: $session_id"
+                        end
+                    else
+                        result["success"] = false
+                        result["error"] = "Logs directory does not exist"
+                    end
+                else
+                    result["success"] = false
+                    result["error"] = "session_id parameter is required"
+                end
+
+                HTTP.setstatus(http, result["success"] ? 200 : 400)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.startwrite(http)
+                write(http, JSON.json(result))
+                return nothing
+            end
+
         end
 
         # Dashboard API: Restart proxy server
@@ -1892,11 +2005,8 @@ function handle_request(http::HTTP.Stream)
 
         # Dashboard API: Generate test events
         if path == "/dashboard/api/test-events"
-            HTTP.setstatus(http, 200)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
-
-            test_agent = "test-agent"
+            # Use first available session, or "test-agent" if none
+            test_agent = isempty(REPL_REGISTRY) ? "test-agent" : first(keys(REPL_REGISTRY))
 
             # Generate sample events of all types
             Dashboard.log_event(test_agent, Dashboard.HEARTBEAT, Dict("status" => "ok"))
@@ -1942,10 +2052,47 @@ function handle_request(http::HTTP.Stream)
                 Dict("reason" => "shutdown"),
             )
 
-            write(
-                http,
-                JSON.json(Dict("status" => "ok", "message" => "Test events generated")),
+            # Spawn async task to generate progress notifications
+            # This way we return immediately but events continue to emit
+            @async begin
+                sleep(1)  # Wait a bit after initial events
+
+                # Test indeterminate progress (no total) - simulate package loading
+                for i = 1:5
+                    Dashboard.emit_progress(
+                        test_agent,
+                        "pkg-load",
+                        i,
+                        message = "📦 Loading package dependencies ($i)...",
+                    )
+                    sleep(0.5)
+                end
+
+                # Test determinate progress (with total) - simulate file processing
+                for i = 1:10
+                    Dashboard.emit_progress(
+                        test_agent,
+                        "file-process",
+                        i,
+                        total = 10,
+                        message = "📄 Processing files: $(i)/10",
+                    )
+                    sleep(0.3)
+                end
+            end
+
+            # Return response immediately
+            response_body = JSON.json(
+                Dict(
+                    "status" => "ok",
+                    "message" => "Test events queued, progress will emit over next few seconds",
+                ),
             )
+            HTTP.setstatus(http, 200)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.setheader(http, "Content-Length" => string(length(response_body)))
+            HTTP.startwrite(http)
+            write(http, response_body)
             return nothing
         end
 
@@ -2090,6 +2237,47 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
 
+            # Check if a session with this ID already exists
+            existing_session = lock(REPL_REGISTRY_LOCK) do
+                get(REPL_REGISTRY, id, nothing)
+            end
+
+            if existing_session !== nothing
+                # Session already exists - check if it's the same process or a duplicate
+                if existing_session.pid == pid
+                    @warn "Re-registration from same process - updating" id = id port = port pid =
+                        pid
+                    # Allow re-registration from same PID (process restart case)
+                else
+                    @error "Duplicate registration attempted" id = id existing_pid =
+                        existing_session.pid new_pid = pid existing_port =
+                        existing_session.port new_port = port
+                    HTTP.setstatus(http, 409)  # Conflict
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(
+                        http,
+                        JSON.json(
+                            Dict(
+                                "jsonrpc" => "2.0",
+                                "id" => get(request, "id", nothing),
+                                "error" => Dict(
+                                    "code" => -32000,
+                                    "message" => "Session ID '$id' is already registered by another process (PID $(existing_session.pid) on port $(existing_session.port)). Choose a different session name or stop the existing session first.",
+                                    "data" => Dict(
+                                        "existing_pid" => existing_session.pid,
+                                        "existing_port" => existing_session.port,
+                                        "requested_pid" => pid,
+                                        "requested_port" => port,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                    return nothing
+                end
+            end
+
             register_repl(id, port; pid = pid, metadata = metadata)
 
             HTTP.setstatus(http, 200)
@@ -2175,6 +2363,19 @@ function handle_request(http::HTTP.Stream)
             # Update heartbeat and recover from disconnected/stopped state
             lock(REPL_REGISTRY_LOCK) do
                 if haskey(REPL_REGISTRY, id)
+                    existing_session = REPL_REGISTRY[id]
+                    heartbeat_pid = get(params, "pid", nothing)
+
+                    # Check if this heartbeat is from the registered process
+                    if heartbeat_pid !== nothing && existing_session.pid != heartbeat_pid
+                        @error "Duplicate heartbeat detected - different PID for same session ID" id =
+                            id registered_pid = existing_session.pid heartbeat_pid =
+                            heartbeat_pid
+                        # Reject this heartbeat - don't update the legitimate session
+                        # The duplicate process will not be registered
+                        return nothing
+                    end
+
                     REPL_REGISTRY[id].last_heartbeat = now()
                     REPL_REGISTRY[id].missed_heartbeats = 0  # Reset counter on successful heartbeat
                     # Automatically recover from disconnected or stopped state on heartbeat
@@ -2188,6 +2389,49 @@ function handle_request(http::HTTP.Stream)
 
                     # Log heartbeat event (don't spam - could be rate limited in Dashboard module)
                     Dashboard.log_event(id, Dashboard.HEARTBEAT, Dict("status" => "ok"))
+                else
+                    # Session not in registry - proxy may have restarted
+                    # Try to re-register by extracting info from heartbeat params
+                    port = get(params, "port", nothing)
+                    pid = get(params, "pid", nothing)
+                    metadata_raw = get(params, "metadata", Dict())
+
+                    if port !== nothing && pid !== nothing
+                        @info "Re-registering session from heartbeat (proxy restart detected)" id =
+                            id port = port pid = pid
+                        metadata =
+                            metadata_raw isa Dict ? metadata_raw :
+                            Dict(String(k) => v for (k, v) in pairs(metadata_raw))
+
+                        # Register the session
+                        REPL_REGISTRY[id] = REPLConnection(
+                            id,
+                            port,
+                            pid,
+                            :ready,
+                            now(),
+                            metadata,
+                            nothing,
+                            0,
+                            Tuple{Dict,HTTP.Stream}[],
+                            nothing,
+                        )
+
+                        # Log registration event
+                        Dashboard.log_event(
+                            id,
+                            Dashboard.AGENT_START,
+                            Dict(
+                                "port" => port,
+                                "pid" => pid,
+                                "metadata" => metadata,
+                                "reason" => "reregistered_from_heartbeat",
+                            ),
+                        )
+                    else
+                        @warn "Heartbeat from unknown session without port/pid info - cannot re-register" id =
+                            id has_port = (port !== nothing) has_pid = (pid !== nothing)
+                    end
                 end
             end
 
@@ -2899,6 +3143,11 @@ function start_foreground_server(port::Int = 3000)
     # Set up file logging
     log_file = setup_proxy_logging(port)
     println("Proxy log file: $log_file")
+
+    # Initialize database for persistent event storage
+    db_path = joinpath(dirname(@__DIR__), ".mcprepl", "events.db")
+    Database.init_db!(db_path)
+    @info "Database initialized for event storage" db_path = db_path
 
     @info "Starting MCP Proxy Server" port = port pid = getpid()
 

@@ -9,9 +9,10 @@ interface SessionCardProps {
     onClick: () => void;
     onShutdown?: (sessionId: string) => void;
     onRestart?: (sessionId: string) => void;
+    progress?: { token: string; progress: number; total?: number; message: string };
 }
 
-export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, onClick, onShutdown, onRestart }) => {
+export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, onClick, onShutdown, onRestart, progress }) => {
     const getStatusColor = (status: string) => {
         switch (status) {
             case 'ready': return '#10b981';       // Green
@@ -26,7 +27,7 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
 
     return (
         <div
-            className={`session-card ${isSelected ? 'selected' : ''}`}
+            className={`session-card ${isSelected ? 'selected' : ''} ${progress ? 'has-progress' : ''}`}
             onClick={onClick}
             title="Click to view logs"
         >
@@ -79,6 +80,37 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
                     <span className="meta-value">{session.pid}</span>
                 </div>
             </div>
+
+            {progress && (
+                <div className="progress-container">
+                    {progress.total !== undefined ? (
+                        // Determinate progress (known total)
+                        <div className="progress-determinate">
+                            <div className="progress-bar-container">
+                                <div
+                                    className="progress-bar"
+                                    style={{ width: `${(progress.progress / progress.total) * 100}%` }}
+                                />
+                            </div>
+                            <div className="progress-text">
+                                {progress.message && <span className="progress-message">{progress.message}</span>}
+                                <span className="progress-percent">{Math.round((progress.progress / progress.total) * 100)}%</span>
+                            </div>
+                        </div>
+                    ) : (
+                        // Indeterminate progress (unknown total)
+                        <div className="progress-indeterminate">
+                            <div className="progress-spinner">
+                                <div className="spinner"></div>
+                            </div>
+                            <div className="progress-text">
+                                {progress.message && <span className="progress-message">{progress.message}</span>}
+                                <span className="progress-steps">Step {progress.progress}</span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
 
             <div className="heartbeat-container">
                 <HeartbeatChart sessionId={session.id} />
