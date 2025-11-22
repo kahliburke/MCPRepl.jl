@@ -20,6 +20,8 @@ export init_db!,
     get_interactions,
     get_events_by_time_range,
     get_session_stats,
+    get_session_summary,
+    reconstruct_session,
     register_session!,
     get_active_sessions,
     get_all_sessions,
@@ -645,6 +647,143 @@ function get_recent_session_events(session_id::String, limit::Int = 50)
 """,
         (session_id, limit),
     ) |> DataFrame
+end
+
+"""
+Reconstruct a complete session timeline from interactions and events.
+Returns a chronologically ordered list of all interactions with their context.
+
+This function provides everything needed to replay or analyze a session:
+- All inbound requests (what the client/agent sent)
+- All outbound responses (what the system replied)
+- All events (tool calls, errors, lifecycle)
+- Complete message contents for full reconstruction
+
+# Arguments
+- `session_id::String`: The session to reconstruct
+- `limit::Int=1000`: Maximum number of items to return (default 1000)
+
+# Returns
+A DataFrame with columns:
+- timestamp: When the interaction occurred
+- type: "interaction" or "event"
+- direction: "inbound" or "outbound" (for interactions)
+- message_type: Type of message/event
+- content: Full message content or event data
+- request_id: Request ID for correlation
+- method: RPC method name if applicable
+"""
+function reconstruct_session(session_id::String; limit::Int = 1000)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    # Query both interactions and events, union them together in chronological order
+    query = """
+    SELECT 
+        timestamp,
+        'interaction' as type,
+        direction,
+        message_type,
+        content,
+        request_id,
+        method,
+        NULL as event_type,
+        NULL as duration_ms
+    FROM interactions
+    WHERE session_id = ?
+
+    UNION ALL
+
+    SELECT 
+        timestamp,
+        'event' as type,
+        NULL as direction,
+        NULL as message_type,
+        data as content,
+        NULL as request_id,
+        NULL as method,
+        event_type,
+        duration_ms
+    FROM events
+    WHERE session_id = ?
+
+    ORDER BY timestamp ASC
+    LIMIT ?
+    """
+
+    return DBInterface.execute(db, query, (session_id, session_id, limit)) |> DataFrame
+end
+
+"""
+Get a summary of a session including all key statistics.
+Returns total interactions, events, timespan, and more.
+"""
+function get_session_summary(session_id::String)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    # Get session info
+    session_info =
+        DBInterface.execute(
+            db,
+            "SELECT * FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ) |> DataFrame
+
+    if nrow(session_info) == 0
+        error("Session not found: $session_id")
+    end
+
+    # Count interactions
+    interaction_count =
+        DBInterface.execute(
+            db,
+            "SELECT COUNT(*) as count FROM interactions WHERE session_id = ?",
+            (session_id,),
+        ) |> DataFrame
+
+    # Count events
+    event_count =
+        DBInterface.execute(
+            db,
+            "SELECT COUNT(*) as count FROM events WHERE session_id = ?",
+            (session_id,),
+        ) |> DataFrame
+
+    # Get total data size
+    data_size =
+        DBInterface.execute(
+            db,
+            "SELECT SUM(content_size) as total_bytes FROM interactions WHERE session_id = ?",
+            (session_id,),
+        ) |> DataFrame
+
+    # Get request/response pairs
+    request_response_pairs =
+        DBInterface.execute(
+            db,
+            """
+            SELECT request_id, COUNT(*) as pair_count
+            FROM interactions
+            WHERE session_id = ? AND request_id IS NOT NULL
+            GROUP BY request_id
+            HAVING pair_count >= 2
+            """,
+            (session_id,),
+        ) |> DataFrame
+
+    return Dict(
+        "session_id" => session_id,
+        "session_info" => session_info,
+        "total_interactions" => interaction_count[1, :count],
+        "total_events" => event_count[1, :count],
+        "total_data_bytes" => data_size[1, :total_bytes],
+        "complete_request_response_pairs" => nrow(request_response_pairs),
+    )
 end
 
 """
