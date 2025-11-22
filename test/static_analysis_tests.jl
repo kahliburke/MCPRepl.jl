@@ -12,6 +12,7 @@ Run this before commits to catch issues like missing exports from modules.
 
 using ReTest
 using JET
+using MCPRepl
 
 @testset "Static Analysis" begin
     @testset "Module Loading" begin
@@ -41,7 +42,7 @@ using JET
     @testset "Top-level Module Analysis" begin
         # Run JET analysis on the entire MCPRepl module
         # This catches undefined variables, type issues, etc.
-        rep = report_package("MCPRepl"; ignored_modules = (AnyFrameModule(Test),))
+        rep = report_package(:MCPRepl, ignored_modules = (AnyFrameModule(Test),))
 
         # Filter out known acceptable issues
         issues = filter(rep.res.inference_error_reports) do report
