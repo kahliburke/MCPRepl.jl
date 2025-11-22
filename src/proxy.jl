@@ -130,6 +130,21 @@ function setup_proxy_logging(port::Int)
     return log_file
 end
 
+# Helper function to log events to database
+function log_db_event(
+    session_id::String,
+    event_type::String,
+    data::Dict;
+    duration_ms::Union{Float64,Nothing} = nothing,
+)
+    try
+        Database.log_event_safe!(session_id, event_type, data; duration_ms = duration_ms)
+    catch e
+        # Silent failure
+        @debug "Failed to log to database" exception = e
+    end
+end
+
 # REPL Connection tracking
 mutable struct REPLConnection
     id::String                          # Unique identifier (project name, agent name)
@@ -469,6 +484,11 @@ function register_repl(
         # Register session in database
         try
             Database.register_session!(id, "active"; metadata = metadata)
+            log_db_event(
+                id,
+                "repl.registered",
+                Dict("port" => port, "pid" => pid, "metadata" => metadata),
+            )
         catch e
             @warn "Failed to register session in database" id = id exception = e
         end
@@ -502,10 +522,23 @@ Remove a REPL from the proxy registry.
 function unregister_repl(id::String)
     lock(REPL_REGISTRY_LOCK) do
         if haskey(REPL_REGISTRY, id)
+            repl = REPL_REGISTRY[id]
             delete!(REPL_REGISTRY, id)
 
             # Log stop event to dashboard
             Dashboard.log_event(id, Dashboard.AGENT_STOP, Dict())
+
+            # Log unregistration to database
+            log_db_event(
+                id,
+                "repl.unregistered",
+                Dict(
+                    "port" => repl.port,
+                    "pid" => repl.pid,
+                    "status" => string(repl.status),
+                ),
+            )
+
             @info "REPL unregistered from proxy" id = id
         end
     end
@@ -1248,6 +1281,17 @@ function route_to_repl_streaming(
         showerror(io, e, catch_backtrace())
         error_msg = String(take!(io))
         @error "Error forwarding request to REPL" target = target_id exception = e
+
+        # Log error to database
+        log_db_event(
+            target_id,
+            "request.error",
+            Dict(
+                "error_type" => string(typeof(e)),
+                "error_message" => error_msg,
+                "method" => get(request, "method", "unknown"),
+            ),
+        )
 
         # Store the error and mark as disconnected
         error_summary = length(error_msg) > 500 ? error_msg[1:500] * "..." : error_msg
@@ -2158,6 +2202,22 @@ function handle_request(http::HTTP.Stream)
         @debug "📨 MCP Request" method = method id = request_id has_params =
             !isnothing(params)
 
+        # Extract session ID for logging
+        session_id_header = HTTP.header(req, "Mcp-Session-Id")
+        log_session_id = !isempty(session_id_header) ? String(session_id_header) : "proxy"
+
+        # Log request to database
+        log_db_event(
+            log_session_id,
+            "request.received",
+            Dict(
+                "method" => method,
+                "request_id" => request_id,
+                "has_params" => !isnothing(params),
+                "path" => req.target,
+            ),
+        )
+
         # Handle notifications (methods that start with "notifications/")
         if startswith(method, "notifications/")
             @debug "✉️  Received notification" method = method params = params
@@ -2398,6 +2458,17 @@ function handle_request(http::HTTP.Stream)
                 params isa Dict ? params : Dict(String(k) => v for (k, v) in pairs(params))
             result = initialize_session!(session, params_dict)
 
+            # Log session initialization
+            log_db_event(
+                session.id,
+                "session.initialized",
+                Dict(
+                    "client_name" => client_name,
+                    "target_repl_id" => target_repl_id,
+                    "capabilities" => get(params_dict, "capabilities", Dict()),
+                ),
+            )
+
             # Register client connection for notifications
             notification_channel = register_client_connection(session.id)
 
@@ -2571,6 +2642,18 @@ function handle_request(http::HTTP.Stream)
             tool_name = get(params, "name", "")
             repls = list_repls()
 
+            # Log tool call start
+            start_time = time()
+            log_db_event(
+                log_session_id,
+                "tool.call.start",
+                Dict(
+                    "tool_name" => tool_name,
+                    "is_proxy_tool" => haskey(PROXY_TOOLS, tool_name),
+                    "arguments" => get(params, "arguments", Dict()),
+                ),
+            )
+
             # Check if this is a proxy tool
             if haskey(PROXY_TOOLS, tool_name)
                 tool = PROXY_TOOLS[tool_name]
@@ -2594,6 +2677,18 @@ function handle_request(http::HTTP.Stream)
                 if tool_name == "start_julia_session" && result_text === nothing
                     # Fall through to existing implementation
                 elseif result_text !== nothing
+                    # Log successful tool completion
+                    duration_ms = (time() - start_time) * 1000
+                    log_db_event(
+                        log_session_id,
+                        "tool.call.complete",
+                        Dict(
+                            "tool_name" => tool_name,
+                            "success" => true,
+                            "result_length" => length(result_text),
+                        );
+                        duration_ms = duration_ms,
+                    )
                     # Return result for other tools
                     send_mcp_tool_result(http, get(request, "id", nothing), result_text)
                     return nothing

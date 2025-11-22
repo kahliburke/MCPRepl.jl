@@ -13,6 +13,7 @@ using DataFrames
 
 export init_db!,
     log_event!,
+    log_event_safe!,
     get_events,
     get_events_by_time_range,
     get_session_stats,
@@ -32,7 +33,7 @@ const DB = Ref{Union{SQLite.DB,Nothing}}(nothing)
 Initialize the SQLite database with schema.
 Creates tables if they don't exist.
 """
-function init_db!(db_path::String=".mcprepl/events.db")
+function init_db!(db_path::String = ".mcprepl/events.db")
     # Create .mcprepl directory if it doesn't exist
     mkpath(dirname(db_path))
 
@@ -102,8 +103,8 @@ Register or update a session in the database.
 """
 function register_session!(
     session_id::String,
-    status::String="active";
-    metadata::Dict=Dict(),
+    status::String = "active";
+    metadata::Dict = Dict(),
 )
     db = DB[]
     if db === nothing
@@ -135,7 +136,7 @@ function log_event!(
     session_id::String,
     event_type::String,
     data::Dict;
-    duration_ms::Union{Float64,Nothing}=nothing,
+    duration_ms::Union{Float64,Nothing} = nothing,
 )
     db = DB[]
     if db === nothing
@@ -167,13 +168,34 @@ function log_event!(
 end
 
 """
+Log an event to the database with automatic session creation if needed.
+Safe wrapper that won't error if database is not initialized.
+"""
+function log_event_safe!(
+    session_id::String,
+    event_type::String,
+    data::Dict;
+    duration_ms::Union{Float64,Nothing} = nothing,
+)
+    try
+        # Ensure session exists
+        register_session!(session_id; metadata = Dict("auto_created" => true))
+        log_event!(session_id, event_type, data; duration_ms = duration_ms)
+    catch e
+        # Silent failure - log to stderr but don't crash
+        @warn "Failed to log event to database" session_id = session_id event_type =
+            event_type exception = e
+    end
+end
+
+"""
 Retrieve recent events from the database.
 """
 function get_events(;
-    session_id::Union{String,Nothing}=nothing,
-    event_type::Union{String,Nothing}=nothing,
-    limit::Int=100,
-    offset::Int=0,
+    session_id::Union{String,Nothing} = nothing,
+    event_type::Union{String,Nothing} = nothing,
+    limit::Int = 100,
+    offset::Int = 0,
 )
     db = DB[]
     if db === nothing
@@ -271,11 +293,11 @@ end
 Get events within a time range.
 """
 function get_events_by_time_range(;
-    session_id::Union{String,Nothing}=nothing,
+    session_id::Union{String,Nothing} = nothing,
     start_time::DateTime,
-    end_time::DateTime=now(),
-    event_type::Union{String,Nothing}=nothing,
-    limit::Int=1000,
+    end_time::DateTime = now(),
+    event_type::Union{String,Nothing} = nothing,
+    limit::Int = 1000,
 )
     db = DB[]
     if db === nothing
@@ -283,7 +305,10 @@ function get_events_by_time_range(;
     end
 
     query = "SELECT * FROM events WHERE timestamp >= ? AND timestamp <= ?"
-    params = [Dates.format(start_time, "yyyy-mm-dd HH:MM:SS.sss"), Dates.format(end_time, "yyyy-mm-dd HH:MM:SS.sss")]
+    params = [
+        Dates.format(start_time, "yyyy-mm-dd HH:MM:SS.sss"),
+        Dates.format(end_time, "yyyy-mm-dd HH:MM:SS.sss"),
+    ]
 
     if session_id !== nothing
         query *= " AND session_id = ?"
@@ -304,7 +329,7 @@ end
 """
 Get session history (all sessions, not just active).
 """
-function get_all_sessions(; limit::Int=100)
+function get_all_sessions(; limit::Int = 100)
     db = DB[]
     if db === nothing
         error("Database not initialized. Call init_db!() first.")
@@ -346,7 +371,7 @@ end
 """
 Delete old events beyond a certain age to prevent database growth.
 """
-function cleanup_old_events!(days_to_keep::Int=30)
+function cleanup_old_events!(days_to_keep::Int = 30)
     db = DB[]
     if db === nothing
         error("Database not initialized. Call init_db!() first.")
@@ -377,43 +402,45 @@ function get_global_stats()
     end
 
     # Total sessions
-    total_sessions = DBInterface.execute(
-        db,
-        "SELECT COUNT(DISTINCT session_id) as count FROM sessions"
-    ) |> DataFrame
+    total_sessions =
+        DBInterface.execute(
+            db,
+            "SELECT COUNT(DISTINCT session_id) as count FROM sessions",
+        ) |> DataFrame
 
     # Active sessions
-    active_sessions = DBInterface.execute(
-        db,
-        "SELECT COUNT(*) as count FROM sessions WHERE status = 'active'"
-    ) |> DataFrame
+    active_sessions =
+        DBInterface.execute(
+            db,
+            "SELECT COUNT(*) as count FROM sessions WHERE status = 'active'",
+        ) |> DataFrame
 
     # Total events
-    total_events = DBInterface.execute(
-        db,
-        "SELECT COUNT(*) as count FROM events"
-    ) |> DataFrame
+    total_events =
+        DBInterface.execute(db, "SELECT COUNT(*) as count FROM events") |> DataFrame
 
     # Events by type
-    events_by_type = DBInterface.execute(
-        db,
-        """
-        SELECT event_type, COUNT(*) as count
-        FROM events
-        GROUP BY event_type
-        ORDER BY count DESC
-    """
-    ) |> DataFrame
+    events_by_type =
+        DBInterface.execute(
+            db,
+            """
+            SELECT event_type, COUNT(*) as count
+            FROM events
+            GROUP BY event_type
+            ORDER BY count DESC
+        """,
+        ) |> DataFrame
 
     # Total execution time
-    total_execution_time = DBInterface.execute(
-        db,
-        """
-        SELECT SUM(duration_ms) as total_ms
-        FROM events
-        WHERE duration_ms IS NOT NULL
-    """
-    ) |> DataFrame
+    total_execution_time =
+        DBInterface.execute(
+            db,
+            """
+            SELECT SUM(duration_ms) as total_ms
+            FROM events
+            WHERE duration_ms IS NOT NULL
+        """,
+        ) |> DataFrame
 
     return Dict(
         "total_sessions" => total_sessions,
@@ -427,7 +454,7 @@ end
 """
 Get most recent N events for a session (optimized query).
 """
-function get_recent_session_events(session_id::String, limit::Int=50)
+function get_recent_session_events(session_id::String, limit::Int = 50)
     db = DB[]
     if db === nothing
         error("Database not initialized. Call init_db!() first.")
