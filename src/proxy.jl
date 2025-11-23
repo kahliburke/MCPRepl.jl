@@ -2009,7 +2009,19 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            register_julia_session(id, port; pid = pid, metadata = metadata)
+            success, error_msg =
+                register_julia_session(id, port; pid = pid, metadata = metadata)
+
+            if !success
+                send_jsonrpc_error(
+                    http,
+                    get(request, "id", nothing),
+                    -32602,
+                    "Registration failed: $error_msg";
+                    status = 400,
+                )
+                return nothing
+            end
 
             send_jsonrpc_result(
                 http,
