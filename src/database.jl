@@ -45,12 +45,18 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     db = SQLite.DB(db_path)
     DB[] = db
 
-    # Create sessions table
+    # ============================================================================
+    # Core Session Tables - Separate client and REPL sessions
+    # ============================================================================
+
+    # MCP sessions table - MCP clients/agents that connect to the proxy
     DBInterface.execute(
         db,
         """
-    CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS mcp_sessions (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        session_type TEXT NOT NULL DEFAULT 'agent',
         start_time DATETIME NOT NULL,
         last_activity DATETIME NOT NULL,
         status TEXT NOT NULL,
@@ -59,18 +65,61 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
-    # Create events table
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_mcp_sessions_name 
+    ON mcp_sessions(name)
+""",
+    )
+
+    # Julia sessions table - Julia backend execution sessions
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS julia_sessions (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        port INTEGER NOT NULL,
+        pid INTEGER,
+        start_time DATETIME NOT NULL,
+        last_activity DATETIME NOT NULL,
+        status TEXT NOT NULL,
+        metadata TEXT
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_julia_sessions_name 
+    ON julia_sessions(name)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_julia_sessions_port 
+    ON julia_sessions(port)
+""",
+    )
+
+    # Create events table - links to both MCP and Julia sessions
     DBInterface.execute(
         db,
         """
     CREATE TABLE IF NOT EXISTS events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         event_type TEXT NOT NULL,
         timestamp DATETIME NOT NULL,
         duration_ms REAL,
         data TEXT,
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id)
     )
 """,
     )
@@ -79,8 +128,16 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_events_session 
-    ON events(session_id, timestamp DESC)
+    CREATE INDEX IF NOT EXISTS idx_events_mcp 
+    ON events(mcp_session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_events_julia 
+    ON events(julia_session_id, timestamp DESC)
 """,
     )
 
@@ -100,13 +157,14 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
-    # Create interactions table for complete message capture
+    # Create interactions table - complete HTTP request/response capture
     DBInterface.execute(
         db,
         """
     CREATE TABLE IF NOT EXISTS interactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         timestamp DATETIME NOT NULL,
         direction TEXT NOT NULL,
         message_type TEXT NOT NULL,
@@ -114,17 +172,37 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         method TEXT,
         content TEXT NOT NULL,
         content_size INTEGER,
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        
+        http_method TEXT,
+        http_path TEXT,
+        http_headers TEXT,
+        http_status_code INTEGER,
+        remote_addr TEXT,
+        user_agent TEXT,
+        content_type TEXT,
+        content_encoding TEXT,
+        processing_time_ms REAL,
+        
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id)
     )
 """,
     )
 
-    # Create index for interactions
+    # Create indices for interactions
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_interactions_session 
-    ON interactions(session_id, timestamp DESC)
+    CREATE INDEX IF NOT EXISTS idx_interactions_mcp 
+    ON interactions(mcp_session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_interactions_julia 
+    ON interactions(julia_session_id, timestamp DESC)
 """,
     )
 
@@ -146,7 +224,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         """
     CREATE TABLE IF NOT EXISTS tool_executions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         request_id TEXT NOT NULL,
         
         tool_name TEXT NOT NULL,
@@ -168,7 +247,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         interaction_request_id INTEGER,
         interaction_response_id INTEGER,
         
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id),
         FOREIGN KEY (interaction_request_id) REFERENCES interactions(id),
         FOREIGN KEY (interaction_response_id) REFERENCES interactions(id)
     )
@@ -178,8 +258,16 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_tool_executions_session 
-    ON tool_executions(session_id, request_time DESC)
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_mcp 
+    ON tool_executions(mcp_session_id, request_time DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_tool_executions_julia 
+    ON tool_executions(julia_session_id, request_time DESC)
 """,
     )
 
@@ -221,7 +309,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         """
     CREATE TABLE IF NOT EXISTS errors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         timestamp DATETIME NOT NULL,
         
         error_type TEXT NOT NULL,
@@ -244,7 +333,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         interaction_id INTEGER,
         event_id INTEGER,
         
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id),
         FOREIGN KEY (interaction_id) REFERENCES interactions(id),
         FOREIGN KEY (event_id) REFERENCES events(id)
     )
@@ -254,8 +344,16 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_errors_session 
-    ON errors(session_id, timestamp DESC)
+    CREATE INDEX IF NOT EXISTS idx_errors_mcp 
+    ON errors(mcp_session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_errors_julia 
+    ON errors(julia_session_id, timestamp DESC)
 """,
     )
 
@@ -297,7 +395,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         """
     CREATE TABLE IF NOT EXISTS performance_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         timestamp DATETIME NOT NULL,
         
         metric_type TEXT NOT NULL,
@@ -309,13 +408,13 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         cpu_percent REAL,
         
         tool_name TEXT,
-        agent_id TEXT,
         
         p50_ms REAL,
         p95_ms REAL,
         p99_ms REAL,
         
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id)
     )
 """,
     )
@@ -323,8 +422,16 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_metrics_session 
-    ON performance_metrics(session_id, timestamp DESC)
+    CREATE INDEX IF NOT EXISTS idx_metrics_mcp 
+    ON performance_metrics(mcp_session_id, timestamp DESC)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_metrics_julia 
+    ON performance_metrics(julia_session_id, timestamp DESC)
 """,
     )
 
@@ -344,71 +451,14 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
-    # Client sessions table - rich client metadata
-    DBInterface.execute(
-        db,
-        """
-    CREATE TABLE IF NOT EXISTS client_sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
-        
-        client_name TEXT NOT NULL,
-        client_version TEXT,
-        
-        connect_time DATETIME NOT NULL,
-        disconnect_time DATETIME,
-        last_activity DATETIME,
-        
-        supports_streaming BOOLEAN,
-        supports_notifications BOOLEAN,
-        supported_content_types TEXT,
-        
-        protocol_version TEXT,
-        initialization_params TEXT,
-        
-        target_repl TEXT,
-        
-        total_requests INTEGER DEFAULT 0,
-        total_errors INTEGER DEFAULT 0,
-        total_data_sent INTEGER DEFAULT 0,
-        total_data_received INTEGER DEFAULT 0,
-        
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
-    )
-""",
-    )
-
-    DBInterface.execute(
-        db,
-        """
-    CREATE INDEX IF NOT EXISTS idx_client_sessions_session 
-    ON client_sessions(session_id)
-""",
-    )
-
-    DBInterface.execute(
-        db,
-        """
-    CREATE INDEX IF NOT EXISTS idx_client_sessions_client 
-    ON client_sessions(client_name, connect_time DESC)
-""",
-    )
-
-    DBInterface.execute(
-        db,
-        """
-    CREATE INDEX IF NOT EXISTS idx_client_sessions_active 
-    ON client_sessions(disconnect_time, last_activity DESC) WHERE disconnect_time IS NULL
-""",
-    )
-
     # Session lifecycle table - detailed state transitions
     DBInterface.execute(
         db,
         """
     CREATE TABLE IF NOT EXISTS session_lifecycle (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        session_id TEXT NOT NULL,
+        mcp_session_id TEXT,
+        julia_session_id TEXT,
         timestamp DATETIME NOT NULL,
         
         event_type TEXT NOT NULL,
@@ -420,7 +470,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         
         metadata TEXT,
         
-        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+        FOREIGN KEY (mcp_session_id) REFERENCES mcp_sessions(id),
+        FOREIGN KEY (julia_session_id) REFERENCES julia_sessions(id)
     )
 """,
     )
@@ -428,8 +479,16 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_lifecycle_session 
-    ON session_lifecycle(session_id, timestamp)
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_mcp 
+    ON session_lifecycle(mcp_session_id, timestamp)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_lifecycle_julia 
+    ON session_lifecycle(julia_session_id, timestamp)
 """,
     )
 
@@ -497,27 +556,49 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
-    # Session summary view
+    # MCP session summary view
     DBInterface.execute(
         db,
         """
-    CREATE VIEW IF NOT EXISTS v_session_summary AS
+    CREATE VIEW IF NOT EXISTS v_mcp_session_summary AS
     SELECT 
-        s.session_id,
-        s.start_time,
-        s.last_activity,
-        s.status,
-        cs.client_name,
-        cs.client_version,
+        m.id as mcp_session_id,
+        m.name as mcp_session_name,
+        m.start_time,
+        m.last_activity,
+        m.status,
         COUNT(DISTINCT te.id) as total_tool_calls,
         COUNT(DISTINCT e.id) as total_errors,
         SUM(te.duration_ms) as total_execution_time_ms,
         AVG(te.duration_ms) as avg_execution_time_ms
-    FROM sessions s
-    LEFT JOIN client_sessions cs ON s.session_id = cs.session_id
-    LEFT JOIN tool_executions te ON s.session_id = te.session_id
-    LEFT JOIN errors e ON s.session_id = e.session_id
-    GROUP BY s.session_id
+    FROM mcp_sessions m
+    LEFT JOIN tool_executions te ON m.id = te.mcp_session_id
+    LEFT JOIN errors e ON m.id = e.mcp_session_id
+    GROUP BY m.id
+""",
+    )
+
+    # Julia session summary view
+    DBInterface.execute(
+        db,
+        """
+    CREATE VIEW IF NOT EXISTS v_julia_session_summary AS
+    SELECT 
+        j.id as julia_session_id,
+        j.name as julia_session_name,
+        j.port,
+        j.pid,
+        j.start_time,
+        j.last_activity,
+        j.status,
+        COUNT(DISTINCT te.id) as total_tool_calls,
+        COUNT(DISTINCT e.id) as total_errors,
+        SUM(te.duration_ms) as total_execution_time_ms,
+        AVG(te.duration_ms) as avg_execution_time_ms
+    FROM julia_sessions j
+    LEFT JOIN tool_executions te ON j.id = te.julia_session_id
+    LEFT JOIN errors e ON j.id = e.julia_session_id
+    GROUP BY j.id
 """,
     )
 
@@ -531,7 +612,8 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         error_type,
         error_category,
         COUNT(*) as error_count,
-        COUNT(DISTINCT session_id) as affected_sessions,
+        COUNT(DISTINCT mcp_session_id) as affected_mcp_sessions,
+        COUNT(DISTINCT julia_session_id) as affected_julia_sessions,
         MAX(timestamp) as last_occurrence
     FROM errors
     WHERE resolved = 0
