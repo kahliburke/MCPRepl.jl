@@ -39,19 +39,22 @@ function send_json_response(
     http::HTTP.Stream,
     data;
     status::Int = 200,
-    session_id::String = "proxy",
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     request_id = nothing,
 )
     json_str = JSON.json(data)
 
     # Log outbound response
     log_db_interaction(
-        session_id,
         "outbound",
         "response",
         json_str;
+        mcp_session_id = mcp_session_id,
+        julia_session_id = julia_session_id,
         request_id = request_id,
         method = nothing,
+        http_status_code = status,
     )
 
     HTTP.setstatus(http, status)
@@ -166,38 +169,65 @@ function setup_proxy_logging(port::Int)
     return log_file
 end
 
-# Helper function to log events to database
+# Helper function to log events to database with dual-session tracking
 function log_db_event(
-    session_id::String,
     event_type::String,
     data::Dict;
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     duration_ms::Union{Float64,Nothing} = nothing,
 )
     try
-        Database.log_event_safe!(session_id, event_type, data; duration_ms = duration_ms)
+        Database.log_event_safe!(
+            event_type,
+            data;
+            mcp_session_id = mcp_session_id,
+            julia_session_id = julia_session_id,
+            duration_ms = duration_ms,
+        )
     catch e
         # Silent failure
         @debug "Failed to log to database" exception = e
     end
 end
 
-# Helper function to log complete interactions (request/response messages)
+# Helper function to log complete interactions (request/response messages) with dual-session tracking
 function log_db_interaction(
-    session_id::String,
     direction::String,
     message_type::String,
     content::Union{String,Dict};
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     request_id = nothing,
     method = nothing,
+    http_method::Union{String,Nothing} = nothing,
+    http_path::Union{String,Nothing} = nothing,
+    http_headers::Union{String,Nothing} = nothing,
+    http_status_code::Union{Int,Nothing} = nothing,
+    remote_addr::Union{String,Nothing} = nothing,
+    user_agent::Union{String,Nothing} = nothing,
+    content_type::Union{String,Nothing} = nothing,
+    content_encoding::Union{String,Nothing} = nothing,
+    processing_time_ms::Union{Float64,Nothing} = nothing,
 )
     try
         Database.log_interaction_safe!(
-            session_id,
             direction,
             message_type,
             content;
+            mcp_session_id = mcp_session_id,
+            julia_session_id = julia_session_id,
             request_id = request_id,
             method = method,
+            http_method = http_method,
+            http_path = http_path,
+            http_headers = http_headers,
+            http_status_code = http_status_code,
+            remote_addr = remote_addr,
+            user_agent = user_agent,
+            content_type = content_type,
+            content_encoding = content_encoding,
+            processing_time_ms = processing_time_ms,
         )
     catch e
         # Silent failure
@@ -541,13 +571,20 @@ function register_repl(
         )
         @info "REPL registered with proxy" id = id port = port pid = pid
 
-        # Register session in database
+        # Register Julia session in database
         try
-            Database.register_session!(id, "active"; metadata = metadata)
-            log_db_event(
+            Database.register_julia_session!(
                 id,
+                id,  # Use ID as name (logical name)
+                "ready";
+                port = port,
+                pid = pid,
+                metadata = metadata,
+            )
+            log_db_event(
                 "repl.registered",
-                Dict("port" => port, "pid" => pid, "metadata" => metadata),
+                Dict("port" => port, "pid" => pid, "metadata" => metadata);
+                julia_session_id = id,
             )
         catch e
             @warn "Failed to register session in database" id = id exception = e
@@ -1435,36 +1472,55 @@ function handle_request(http::HTTP.Stream)
             length(body)
 
         # Log all incoming requests to database for complete session reconstruction
-        # Parse request to extract session ID and other metadata
+        # Parse request to extract session IDs and HTTP metadata
         request_parsed = nothing
         request_id = nothing
         request_method = nothing
-        session_id = "proxy"  # Default session ID
+        mcp_session_id = nothing  # MCP client session ID
+        julia_session_id = nothing  # Target Julia REPL session ID
+
+        # Extract HTTP metadata
+        remote_addr = string(get(req.context, :client_host, ""))
+        user_agent = HTTP.header(req, "User-Agent")
+        content_type = HTTP.header(req, "Content-Type")
+        content_encoding = HTTP.header(req, "Content-Encoding")
+        http_headers = JSON.json(Dict(req.headers))
+
         try
+            # Extract MCP session ID from standard header
+            mcp_session_header = HTTP.header(req, "Mcp-Session-Id")
+            if !isempty(mcp_session_header)
+                mcp_session_id = String(mcp_session_header)
+            end
+
+            # Extract Julia target session ID from custom header
+            target_header = HTTP.header(req, "X-MCPRepl-Target")
+            if !isempty(target_header)
+                julia_session_id = String(target_header)
+            end
+
             if !isempty(body) && req.method == "POST"
                 request_parsed = JSON.parse(body)
                 request_id = get(request_parsed, "id", nothing)
                 request_method = get(request_parsed, "method", nothing)
-
-                # Try to extract session ID from various sources
-                params = get(request_parsed, "params", Dict())
-                if haskey(params, "_meta") && haskey(params["_meta"], "progressToken")
-                    # Extract REPL ID from progress token if available
-                    session_id = params["_meta"]["progressToken"]
-                elseif haskey(params, "name")
-                    # For tool calls, use the tool name or REPL target
-                    session_id = string(params["name"])
-                end
             end
 
-            # Log the inbound request
+            # Log the inbound request with full HTTP details
             log_db_interaction(
-                session_id,
                 "inbound",
                 "request",
                 body;
+                mcp_session_id = mcp_session_id,
+                julia_session_id = julia_session_id,
                 request_id = request_id,
                 method = request_method,
+                http_method = req.method,
+                http_path = req.target,
+                http_headers = http_headers,
+                remote_addr = remote_addr,
+                user_agent = user_agent,
+                content_type = content_type,
+                content_encoding = content_encoding,
             )
         catch e
             @debug "Failed to parse request for logging" exception = e
