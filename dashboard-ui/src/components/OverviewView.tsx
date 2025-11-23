@@ -8,7 +8,7 @@ interface OverviewViewProps {
     eventCount: number;
     events: SessionEvent[];
     staleSessionCount: number;
-    setActiveTab: React.Dispatch<React.SetStateAction<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history'>>;
+    setActiveTab: React.Dispatch<React.SetStateAction<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history' | 'analytics'>>;
     setEventFilter: (filter: string) => void;
     setShowErrorsModal: (show: boolean) => void;
     setShowStaleSessionsModal: (show: boolean) => void;

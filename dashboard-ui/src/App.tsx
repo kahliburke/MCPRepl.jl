@@ -9,6 +9,7 @@ import { EventsView } from './components/EventsView';
 import { TerminalView } from './components/TerminalView';
 import { LogsView } from './components/LogsView';
 import { ToolsView } from './components/ToolsView';
+import { Analytics } from './components/Analytics';
 import { JsonViewer } from '@textea/json-viewer';
 import './App.css';
 import './quick-start.css';
@@ -65,7 +66,7 @@ export const App: React.FC = () => {
     const [sessions, setSessions] = useState<Record<string, Session>>({});
     const [events, setEvents] = useState<SessionEvent[]>([]);
     const [selectedSession, setSelectedSession] = useState<string | null>(null);
-    const [activeTab, setActiveTab] = useState<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history'>('overview');
+    const [activeTab, setActiveTab] = useState<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history' | 'analytics'>('overview');
     const [eventFilter, setEventFilter] = useState<string>('interesting');
     const [selectedEvent, setSelectedEvent] = useState<SessionEvent | null>(null);
     const terminalRef = useRef<HTMLDivElement>(null);
@@ -855,6 +856,12 @@ export const App: React.FC = () => {
                         >
                             🕐 History
                         </button>
+                        <button
+                            className={`tab ${activeTab === 'analytics' ? 'active' : ''}`}
+                            onClick={() => setActiveTab('analytics')}
+                        >
+                            📊 Analytics
+                        </button>
                     </div>
 
                     <div className="view-container">
@@ -918,6 +925,16 @@ export const App: React.FC = () => {
                                 setSelectedTool={setSelectedTool}
                                 fetchTools={fetchTools}
                             />
+                        )}
+
+                        {activeTab === 'analytics' && (
+                            <Analytics sessionId={selectedSession} />
+                        )}
+
+                        {activeTab === 'history' && (
+                            <div className="view active" id="history-view">
+                                <SessionHistory sessionId={selectedSession} />
+                            </div>
                         )}
                     </div>
                 </main>
@@ -1207,12 +1224,6 @@ export const App: React.FC = () => {
                             )}
                         </div>
                     </div>
-                </div>
-            )}
-
-            {activeTab === 'history' && (
-                <div className="view active" id="history-view">
-                    <SessionHistory sessionId={selectedSession} />
                 </div>
             )}
 
