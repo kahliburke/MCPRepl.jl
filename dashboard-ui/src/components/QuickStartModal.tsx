@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { fetchDirectories } from '../api';
 
 interface QuickStartModalProps {
@@ -7,10 +7,6 @@ interface QuickStartModalProps {
     quickStartName: string;
     setQuickStartName: (name: string) => void;
     quickStartLoading: boolean;
-    pathSuggestions: string[];
-    setPathSuggestions: (suggestions: string[]) => void;
-    isJuliaProject: boolean;
-    setIsJuliaProject: (isProject: boolean) => void;
     onClose: () => void;
     onStart: () => void;
 }
@@ -21,13 +17,12 @@ export const QuickStartModal: React.FC<QuickStartModalProps> = ({
     quickStartName,
     setQuickStartName,
     quickStartLoading,
-    pathSuggestions,
-    setPathSuggestions,
-    isJuliaProject,
-    setIsJuliaProject,
     onClose,
     onStart
 }) => {
+    const [pathSuggestions, setPathSuggestions] = useState<string[]>([]);
+    const [isJuliaProject, setIsJuliaProject] = useState<boolean>(false);
+
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal-content" onClick={(e) => e.stopPropagation()}>

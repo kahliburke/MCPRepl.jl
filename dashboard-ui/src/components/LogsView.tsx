@@ -1,6 +1,54 @@
 import React from 'react';
 import { Session } from '../types';
 
+// Convert ANSI escape codes to HTML with colors
+const convertAnsiToHtml = (text: string): string => {
+    // Handle carriage returns (\r) - keep only the last segment on each line
+    let html = text.split('\n').map(line => {
+        const segments = line.split('\r');
+        return segments[segments.length - 1]; // Keep only the final rewrite
+    }).join('\n');
+
+    // Remove cursor movement and clear codes
+    html = html
+        .replace(/\x1b\[K/g, '')
+        .replace(/\x1b\[[0-9;]*[ABCDEFGJKST]/g, '');
+
+    // ANSI color map
+    const colors: Record<string, string> = {
+        '30': '#000000', '31': '#cd3131', '32': '#0dbc79', '33': '#e5e510',
+        '34': '#2472c8', '35': '#bc3fbc', '36': '#11a8cd', '37': '#e5e5e5',
+        '90': '#666666', '91': '#f14c4c', '92': '#23d18b', '93': '#f5f543',
+        '94': '#3b8eea', '95': '#d670d6', '96': '#29b8db', '97': '#ffffff',
+    };
+
+    // Handle basic ANSI codes
+    html = html.replace(/\x1b\[([0-9;]+)m/g, (_match, codes) => {
+        const parts = codes.split(';');
+        let styles: string[] = [];
+
+        for (const code of parts) {
+            if (code === '0' || code === '') {
+                return '</span>';
+            } else if (code === '1') {
+                styles.push('font-weight: bold');
+            } else if (colors[code]) {
+                styles.push(`color: ${colors[code]}`);
+            } else if (code.startsWith('38;5;')) {
+                // 256 color support
+                const colorNum = parseInt(code.split(';')[2]);
+                if (colorNum === 24) styles.push('color: #076678');
+                else styles.push(`color: rgb(${colorNum}, ${colorNum}, ${colorNum})`);
+            }
+        }
+
+        return styles.length > 0 ? `<span style="${styles.join('; ')}">` : '';
+    });
+
+    // Escape HTML but preserve our spans
+    return html;
+};
+
 interface LogsViewProps {
     sessions: Record<string, Session>;
     logSessionId: string | null;
@@ -11,7 +59,6 @@ interface LogsViewProps {
     setAutoRefreshLogs: (autoRefresh: boolean) => void;
     logsViewerRef: React.RefObject<HTMLDivElement>;
     fetchLogs: (sessionId: string) => Promise<{ content?: string; error?: string }>;
-    convertAnsiToHtml: (ansi: string) => string;
 }
 
 export const LogsView: React.FC<LogsViewProps> = ({
@@ -23,8 +70,7 @@ export const LogsView: React.FC<LogsViewProps> = ({
     autoRefreshLogs,
     setAutoRefreshLogs,
     logsViewerRef,
-    fetchLogs,
-    convertAnsiToHtml
+    fetchLogs
 }) => {
     return (
         <div className="view active" id="logs-view">

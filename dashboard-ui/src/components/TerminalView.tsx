@@ -1,25 +1,39 @@
-import React from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { SessionEvent } from '../types';
 
 interface TerminalViewProps {
     events: SessionEvent[];
     selectedSession: string | null;
-    terminalSearch: string;
-    setTerminalSearch: (search: string) => void;
-    terminalRef: React.RefObject<HTMLDivElement>;
-    terminalBottomRef: React.RefObject<HTMLDivElement>;
-    handleTerminalScroll: (e: React.UIEvent<HTMLDivElement>) => void;
 }
 
 export const TerminalView: React.FC<TerminalViewProps> = ({
     events,
-    selectedSession,
-    terminalSearch,
-    setTerminalSearch,
-    terminalRef,
-    terminalBottomRef,
-    handleTerminalScroll
+    selectedSession
 }) => {
+    const [terminalSearch, setTerminalSearch] = useState('');
+    const [isNearBottom, setIsNearBottom] = useState(true);
+    const terminalRef = useRef<HTMLDivElement>(null);
+    const terminalBottomRef = useRef<HTMLDivElement>(null);
+
+    // Autoscroll to bottom when new events arrive (only if near bottom)
+    useEffect(() => {
+        if (terminalBottomRef.current && isNearBottom) {
+            const timer = setTimeout(() => {
+                terminalBottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
+            }, 50);
+            return () => clearTimeout(timer);
+        }
+    }, [events, isNearBottom]);
+
+    // Track scroll position to detect if user is near bottom
+    const handleTerminalScroll = () => {
+        if (terminalRef.current) {
+            const { scrollTop, scrollHeight, clientHeight } = terminalRef.current;
+            const threshold = 100; // pixels from bottom
+            const nearBottom = scrollHeight - scrollTop - clientHeight <= threshold;
+            setIsNearBottom(nearBottom);
+        }
+    };
     return (
         <div className="view active terminal-view" id="terminal-view">
             <div className="terminal-controls">

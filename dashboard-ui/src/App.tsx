@@ -19,54 +19,6 @@ import { ToolDetailsModal } from './components/ToolDetailsModal';
 import './App.css';
 import './quick-start.css';
 
-// Convert ANSI escape codes to HTML with colors
-const convertAnsiToHtml = (text: string): string => {
-    // Handle carriage returns (\r) - keep only the last segment on each line
-    let html = text.split('\n').map(line => {
-        const segments = line.split('\r');
-        return segments[segments.length - 1]; // Keep only the final rewrite
-    }).join('\n');
-
-    // Remove cursor movement and clear codes
-    html = html
-        .replace(/\x1b\[K/g, '')
-        .replace(/\x1b\[[0-9;]*[ABCDEFGJKST]/g, '');
-
-    // ANSI color map
-    const colors: Record<string, string> = {
-        '30': '#000000', '31': '#cd3131', '32': '#0dbc79', '33': '#e5e510',
-        '34': '#2472c8', '35': '#bc3fbc', '36': '#11a8cd', '37': '#e5e5e5',
-        '90': '#666666', '91': '#f14c4c', '92': '#23d18b', '93': '#f5f543',
-        '94': '#3b8eea', '95': '#d670d6', '96': '#29b8db', '97': '#ffffff',
-    };
-
-    // Handle basic ANSI codes
-    html = html.replace(/\x1b\[([0-9;]+)m/g, (_match, codes) => {
-        const parts = codes.split(';');
-        let styles: string[] = [];
-
-        for (const code of parts) {
-            if (code === '0' || code === '') {
-                return '</span>';
-            } else if (code === '1') {
-                styles.push('font-weight: bold');
-            } else if (colors[code]) {
-                styles.push(`color: ${colors[code]}`);
-            } else if (code.startsWith('38;5;')) {
-                // 256 color support
-                const colorNum = parseInt(code.split(';')[2]);
-                if (colorNum === 24) styles.push('color: #076678');
-                else styles.push(`color: rgb(${colorNum}, ${colorNum}, ${colorNum})`);
-            }
-        }
-
-        return styles.length > 0 ? `<span style="${styles.join('; ')}">` : '';
-    });
-
-    // Escape HTML but preserve our spans
-    return html;
-};
-
 export const App: React.FC = () => {
     const [sessions, setSessions] = useState<Record<string, Session>>({});
     const [events, setEvents] = useState<SessionEvent[]>([]);
@@ -74,11 +26,7 @@ export const App: React.FC = () => {
     const [activeTab, setActiveTab] = useState<'overview' | 'events' | 'terminal' | 'tools' | 'logs' | 'history' | 'analytics'>('overview');
     const [eventFilter, setEventFilter] = useState<string>('interesting');
     const [selectedEvent, setSelectedEvent] = useState<SessionEvent | null>(null);
-    const terminalRef = useRef<HTMLDivElement>(null);
-    const terminalBottomRef = useRef<HTMLDivElement>(null);
-    const [isNearBottom, setIsNearBottom] = useState(true);
     const logsViewerRef = useRef<HTMLDivElement>(null);
-    const [terminalSearch, setTerminalSearch] = useState('');
     const [showServerModal, setShowServerModal] = useState(false);
     const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
     const [proxyPid, setProxyPid] = useState<number | null>(null);
@@ -90,8 +38,6 @@ export const App: React.FC = () => {
     const [logContent, setLogContent] = useState<string>('');
     const [logSessionId, setLogSessionId] = useState<string | null>(null);
     const [autoRefreshLogs, setAutoRefreshLogs] = useState(false);
-    const [pathSuggestions, setPathSuggestions] = useState<string[]>([]);
-    const [isJuliaProject, setIsJuliaProject] = useState<boolean>(false);
     const [staleSessions, setStaleSessions] = useState<any[]>([]);
     const [staleSessionCount, setStaleSessionCount] = useState(0);
     const [showStaleSessionsModal, setShowStaleSessionsModal] = useState(false);
@@ -245,26 +191,6 @@ export const App: React.FC = () => {
             unsubscribe();
         };
     }, []);
-
-    // Autoscroll to bottom when new events arrive (only if near bottom)
-    useEffect(() => {
-        if (activeTab === 'terminal' && terminalBottomRef.current && isNearBottom) {
-            const timer = setTimeout(() => {
-                terminalBottomRef.current?.scrollIntoView({ behavior: 'auto', block: 'end' });
-            }, 50);
-            return () => clearTimeout(timer);
-        }
-    }, [events, isNearBottom]);
-
-    // Track scroll position to detect if user is near bottom
-    const handleTerminalScroll = () => {
-        if (terminalRef.current) {
-            const { scrollTop, scrollHeight, clientHeight } = terminalRef.current;
-            const threshold = 100; // pixels from bottom
-            const nearBottom = scrollHeight - scrollTop - clientHeight <= threshold;
-            setIsNearBottom(nearBottom);
-        }
-    };
 
     const sessionCount = Object.keys(sessions).length;
     const eventCount = events.filter(e => e.type !== 'HEARTBEAT').length;
@@ -557,10 +483,6 @@ export const App: React.FC = () => {
                     quickStartName={quickStartName}
                     setQuickStartName={setQuickStartName}
                     quickStartLoading={quickStartLoading}
-                    pathSuggestions={pathSuggestions}
-                    setPathSuggestions={setPathSuggestions}
-                    isJuliaProject={isJuliaProject}
-                    setIsJuliaProject={setIsJuliaProject}
                     onClose={() => setShowQuickStartModal(false)}
                     onStart={handleQuickStart}
                 />
@@ -726,11 +648,6 @@ export const App: React.FC = () => {
                             <TerminalView
                                 events={events}
                                 selectedSession={selectedSession}
-                                terminalSearch={terminalSearch}
-                                setTerminalSearch={setTerminalSearch}
-                                terminalRef={terminalRef}
-                                terminalBottomRef={terminalBottomRef}
-                                handleTerminalScroll={handleTerminalScroll}
                             />
                         )}
 
@@ -745,7 +662,6 @@ export const App: React.FC = () => {
                                 setAutoRefreshLogs={setAutoRefreshLogs}
                                 logsViewerRef={logsViewerRef}
                                 fetchLogs={fetchLogs}
-                                convertAnsiToHtml={convertAnsiToHtml}
                             />
                         )}
 
