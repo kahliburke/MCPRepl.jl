@@ -169,7 +169,6 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initi
             <div className="session-history empty">
                 <div className="history-intro">
                     <h3>📋 Select a Session</h3>
-                    <p className="hint">Use the tabs above to navigate to Overview, Events, Terminal, Tools, Logs, or Analytics</p>
                 </div>
                 {loadingSessions ? (
                     <div className="loading-sessions">
@@ -180,7 +179,6 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initi
                     <p className="no-sessions">No sessions found. Start a REPL session to see history.</p>
                 ) : (
                     <div className="session-list">
-                        <p className="session-list-help">Select a session to view its detailed history:</p>
                         <div className="session-cards">
                             {availableSessions.slice(0, 20).map(session => (
                                 <div
