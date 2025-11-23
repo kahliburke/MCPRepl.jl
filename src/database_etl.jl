@@ -16,7 +16,6 @@ export run_etl_pipeline,
     start_etl_scheduler,
     extract_tool_executions,
     extract_errors,
-    extract_client_sessions,
     calculate_performance_metrics
 
 """
@@ -96,7 +95,7 @@ function extract_tool_executions(db, last_id::Int)
         SELECT 
             req.id as req_id,
             resp.id as resp_id,
-            req.session_id,
+            req.mcp_session_id as session_id,
             req.request_id,
             req.timestamp as request_time,
             resp.timestamp as response_time,
@@ -186,7 +185,7 @@ function extract_tool_executions(db, last_id::Int)
                 db,
                 """
             INSERT INTO tool_executions (
-                session_id, request_id, tool_name, tool_method,
+                mcp_session_id, request_id, tool_name, tool_method,
                 request_time, response_time, duration_ms,
                 input_size, output_size, argument_count,
                 arguments, status, result_type, result_summary,
@@ -233,7 +232,7 @@ function extract_errors(db, last_interaction_id::Int, last_event_id::Int)
     query = """
         SELECT 
             i.id,
-            i.session_id,
+            i.mcp_session_id as session_id,
             i.timestamp,
             i.request_id,
             i.method,
@@ -285,7 +284,7 @@ function extract_errors(db, last_interaction_id::Int, last_event_id::Int)
                 db,
                 """
             INSERT INTO errors (
-                session_id, timestamp, error_type, error_code, error_category,
+                mcp_session_id, timestamp, error_type, error_code, error_category,
                 tool_name, method, request_id, message, stack_trace, interaction_id
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -324,7 +323,7 @@ function update_client_sessions(db, last_id::Int)
     query = """
         SELECT 
             i.id,
-            i.session_id,
+            i.mcp_session_id as session_id,
             i.timestamp,
             i.content
         FROM interactions i
@@ -413,7 +412,7 @@ function calculate_performance_metrics(db, last_id::Int)
     # Calculate hourly aggregates for tools executed since last_id
     query = """
         SELECT 
-            session_id,
+            mcp_session_id as session_id,
             tool_name,
             strftime('%Y-%m-%d %H:00:00', request_time) as hour,
             COUNT(*) as execution_count,
@@ -423,7 +422,7 @@ function calculate_performance_metrics(db, last_id::Int)
         FROM tool_executions
         WHERE interaction_request_id > ?
             AND duration_ms IS NOT NULL
-        GROUP BY session_id, tool_name, hour
+        GROUP BY mcp_session_id, tool_name, hour
         ORDER BY hour DESC
     """
 
@@ -449,7 +448,7 @@ function calculate_performance_metrics(db, last_id::Int)
                 db,
                 """
             INSERT INTO performance_metrics (
-                session_id, timestamp, metric_type, metric_name,
+                mcp_session_id, timestamp, metric_type, metric_name,
                 duration_ms, throughput, tool_name,
                 p50_ms, p95_ms, p99_ms
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

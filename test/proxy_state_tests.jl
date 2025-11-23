@@ -3,20 +3,26 @@ using Dates
 using HTTP
 using JSON
 
-# Load proxy module
+# Load proxy and database modules
+include("../src/database.jl")
 include("../src/proxy.jl")
+using .Database
 using .Proxy
 
 @testset "Proxy State Management" begin
+    # Initialize temp database for these tests
+    test_db = tempname() * ".db"
+    Database.init_db!(test_db)
+
     @testset "REPL Connection Structure" begin
         # Clear registry
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Register a REPL
-        Proxy.register_repl("test-repl", 3001; pid = 12345)
+        Proxy.register_julia_session("test-repl", 3001; pid = 12345)
 
         # Verify structure with new fields
-        repl = Proxy.get_repl("test-repl")
+        repl = Proxy.get_julia_session("test-repl")
         @test repl !== nothing
         @test repl.status == :ready
         @test repl.pending_requests isa Vector
@@ -26,174 +32,183 @@ using .Proxy
     end
 
     @testset "Status Transitions" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("status-test", 3002; pid = 12346)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("status-test", 3002; pid = 12346)
 
         # ready -> disconnected
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["status-test"].status = :disconnected
-            Proxy.REPL_REGISTRY["status-test"].disconnect_time = now()
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["status-test"].status = :disconnected
+            Proxy.JULIA_SESSION_REGISTRY["status-test"].disconnect_time = now()
         end
-        repl = Proxy.get_repl("status-test")
+        repl = Proxy.get_julia_session("status-test")
         @test repl.status == :disconnected
         @test repl.disconnect_time !== nothing
 
         # disconnected -> reconnecting
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["status-test"].status = :reconnecting
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["status-test"].status = :reconnecting
         end
-        repl = Proxy.get_repl("status-test")
+        repl = Proxy.get_julia_session("status-test")
         @test repl.status == :reconnecting
 
-        # reconnecting -> ready (via update_repl_status)
-        Proxy.update_repl_status("status-test", :ready)
-        repl = Proxy.get_repl("status-test")
+        # reconnecting -> ready (via update_julia_session_status)
+        Proxy.update_julia_session_status("status-test", :ready)
+        repl = Proxy.get_julia_session("status-test")
         @test repl.status == :ready
         @test repl.missed_heartbeats == 0
         @test repl.disconnect_time === nothing
 
         # ready -> stopped
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["status-test"].status = :stopped
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["status-test"].status = :stopped
         end
-        repl = Proxy.get_repl("status-test")
+        repl = Proxy.get_julia_session("status-test")
         @test repl.status == :stopped
     end
 
     @testset "Request Buffering" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("buffer-test", 3003; pid = 12347)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("buffer-test", 3003; pid = 12347)
 
         # Simulate adding pending requests
         mock_request = Dict("method" => "test", "id" => 1)
         # Note: We can't create a real HTTP.Stream easily, so we test the structure
 
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["buffer-test"].status = :disconnected
-            # Would normally add: push!(Proxy.REPL_REGISTRY["buffer-test"].pending_requests, (mock_request, mock_stream))
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["buffer-test"].status = :disconnected
+            # Would normally add: push!(Proxy.JULIA_SESSION_REGISTRY["buffer-test"].pending_requests, (mock_request, mock_stream))
         end
 
-        repl = Proxy.get_repl("buffer-test")
+        repl = Proxy.get_julia_session("buffer-test")
         @test repl.status == :disconnected
         @test isempty(repl.pending_requests)  # Empty because we didn't add mock stream
     end
 
     @testset "Heartbeat Timeout Detection" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("heartbeat-test", 3004; pid = 12348)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("heartbeat-test", 3004; pid = 12348)
 
         # Simulate old heartbeat
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["heartbeat-test"].last_heartbeat = now() - Second(20)
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["heartbeat-test"].last_heartbeat =
+                now() - Second(20)
         end
 
-        repl = Proxy.get_repl("heartbeat-test")
+        repl = Proxy.get_julia_session("heartbeat-test")
         time_since = now() - repl.last_heartbeat
         @test time_since > Second(15)
         @test repl.status == :ready  # Still ready until monitor runs
 
         # Manually trigger the timeout logic
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            if haskey(Proxy.REPL_REGISTRY, "heartbeat-test")
-                Proxy.REPL_REGISTRY["heartbeat-test"].status = :disconnected
-                Proxy.REPL_REGISTRY["heartbeat-test"].disconnect_time = now()
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            if haskey(Proxy.JULIA_SESSION_REGISTRY, "heartbeat-test")
+                Proxy.JULIA_SESSION_REGISTRY["heartbeat-test"].status = :disconnected
+                Proxy.JULIA_SESSION_REGISTRY["heartbeat-test"].disconnect_time = now()
             end
         end
 
-        repl = Proxy.get_repl("heartbeat-test")
+        repl = Proxy.get_julia_session("heartbeat-test")
         @test repl.status == :disconnected
         @test repl.disconnect_time !== nothing
     end
 
     @testset "Reconnection Recovery" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("recovery-test", 3005; pid = 12349)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("recovery-test", 3005; pid = 12349)
 
         # Simulate disconnection
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["recovery-test"].status = :disconnected
-            Proxy.REPL_REGISTRY["recovery-test"].disconnect_time = now()
-            Proxy.REPL_REGISTRY["recovery-test"].missed_heartbeats = 2
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["recovery-test"].status = :disconnected
+            Proxy.JULIA_SESSION_REGISTRY["recovery-test"].disconnect_time = now()
+            Proxy.JULIA_SESSION_REGISTRY["recovery-test"].missed_heartbeats = 2
         end
 
-        # Recover via update_repl_status(:ready)
-        Proxy.update_repl_status("recovery-test", :ready)
+        # Recover via update_julia_session_status(:ready)
+        Proxy.update_julia_session_status("recovery-test", :ready)
 
-        repl = Proxy.get_repl("recovery-test")
+        repl = Proxy.get_julia_session("recovery-test")
         @test repl.status == :ready
         @test repl.missed_heartbeats == 0
         @test repl.disconnect_time === nothing
     end
 
     @testset "Heartbeat Recovery from Disconnected State" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("heartbeat-recovery-test", 3008; pid = 12352)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("heartbeat-recovery-test", 3008; pid = 12352)
 
         # Simulate disconnection via timeout
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["heartbeat-recovery-test"].status = :disconnected
-            Proxy.REPL_REGISTRY["heartbeat-recovery-test"].disconnect_time = now()
-            Proxy.REPL_REGISTRY["heartbeat-recovery-test"].missed_heartbeats = 3
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].status = :disconnected
+            Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].disconnect_time = now()
+            Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].missed_heartbeats = 3
         end
 
-        repl = Proxy.get_repl("heartbeat-recovery-test")
+        repl = Proxy.get_julia_session("heartbeat-recovery-test")
         @test repl.status == :disconnected
         @test repl.missed_heartbeats == 3
 
         # Simulate heartbeat coming in (updates last_heartbeat and recovers status)
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            if haskey(Proxy.REPL_REGISTRY, "heartbeat-recovery-test")
-                Proxy.REPL_REGISTRY["heartbeat-recovery-test"].last_heartbeat = now()
-                Proxy.REPL_REGISTRY["heartbeat-recovery-test"].missed_heartbeats = 0
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            if haskey(Proxy.JULIA_SESSION_REGISTRY, "heartbeat-recovery-test")
+                Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].last_heartbeat =
+                    now()
+                Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].missed_heartbeats =
+                    0
                 # Automatically recover from disconnected state on heartbeat
-                if Proxy.REPL_REGISTRY["heartbeat-recovery-test"].status in
+                if Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].status in
                    (:stopped, :disconnected, :reconnecting)
-                    Proxy.REPL_REGISTRY["heartbeat-recovery-test"].status = :ready
-                    Proxy.REPL_REGISTRY["heartbeat-recovery-test"].last_error = nothing
-                    Proxy.REPL_REGISTRY["heartbeat-recovery-test"].disconnect_time = nothing
+                    Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].status = :ready
+                    Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].last_error =
+                        nothing
+                    Proxy.JULIA_SESSION_REGISTRY["heartbeat-recovery-test"].disconnect_time =
+                        nothing
                 end
             end
         end
 
-        repl = Proxy.get_repl("heartbeat-recovery-test")
+        repl = Proxy.get_julia_session("heartbeat-recovery-test")
         @test repl.status == :ready
         @test repl.missed_heartbeats == 0
         @test repl.disconnect_time === nothing
     end
 
     @testset "Permanent Stop After Timeout" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("timeout-test", 3006; pid = 12350)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("timeout-test", 3006; pid = 12350)
 
         # Simulate long disconnection (>5 minutes)
-        lock(Proxy.REPL_REGISTRY_LOCK) do
-            Proxy.REPL_REGISTRY["timeout-test"].status = :disconnected
-            Proxy.REPL_REGISTRY["timeout-test"].disconnect_time = now() - Minute(6)
+        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
+            Proxy.JULIA_SESSION_REGISTRY["timeout-test"].status = :disconnected
+            Proxy.JULIA_SESSION_REGISTRY["timeout-test"].disconnect_time = now() - Minute(6)
         end
 
-        repl = Proxy.get_repl("timeout-test")
+        repl = Proxy.get_julia_session("timeout-test")
         disconnect_duration = now() - repl.disconnect_time
         @test disconnect_duration > Minute(5)
 
         # Should be marked as stopped by error handler
-        # (we test the condition, actual marking happens in route_to_repl_streaming)
+        # (we test the condition, actual marking happens in route_to_session_streaming)
     end
 
     @testset "Missed Heartbeats Counter" begin
-        empty!(Proxy.REPL_REGISTRY)
-        Proxy.register_repl("counter-test", 3007; pid = 12351)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+        Proxy.register_julia_session("counter-test", 3007; pid = 12351)
 
-        repl = Proxy.get_repl("counter-test")
+        repl = Proxy.get_julia_session("counter-test")
         @test repl.missed_heartbeats == 0
 
-        # Increment counter via update_repl_status with error
-        Proxy.update_repl_status("counter-test", :ready; error = "Test error")
-        repl = Proxy.get_repl("counter-test")
+        # Increment counter via update_julia_session_status with error
+        Proxy.update_julia_session_status("counter-test", :ready; error = "Test error")
+        repl = Proxy.get_julia_session("counter-test")
         @test repl.missed_heartbeats == 1
 
         # Reset counter via successful ready status
-        Proxy.update_repl_status("counter-test", :ready)
-        repl = Proxy.get_repl("counter-test")
+        Proxy.update_julia_session_status("counter-test", :ready)
+        repl = Proxy.get_julia_session("counter-test")
         @test repl.missed_heartbeats == 0
     end
+
+    # Cleanup
+    Database.close_db!()
+    rm(test_db; force = true)
 end

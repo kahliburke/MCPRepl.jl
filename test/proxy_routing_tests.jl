@@ -8,7 +8,7 @@ using .Proxy
 
 @testset "Proxy MCP Tool Routing" begin
     @testset "Route tools/list through proxy" begin
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Start a mock MCP server that responds to tools/list
         mock_port = 19001
@@ -70,7 +70,7 @@ using .Proxy
     end
 
     @testset "Route tools/call through proxy" begin
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Start a mock MCP server that responds to tools/call
         mock_port = 19002

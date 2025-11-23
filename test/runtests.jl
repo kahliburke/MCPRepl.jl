@@ -12,6 +12,9 @@ include("ast_stripping_tests.jl")
 include("version_tests.jl")
 include("supervisor_tests.jl")
 include("proxy_state_tests.jl")
+include("proxy_registration_tests.jl")
+include("proxy_registration_validation_tests.jl")
+include("database_dual_session_tests.jl")
 
 # Run all tests with ReTest
 retest()

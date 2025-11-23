@@ -91,14 +91,14 @@ const PROXY_STATUS_TOOL =
         "type" => "object",
         "properties" => Dict(),
         "required" => [],
-    ) (args, repls) -> begin
-        num_repls = length(repls)
-        status_text = "MCP Proxy Status:\n- Port: 3000\n- Connected agents: $num_repls\n- Status: Running\n- Dashboard: http://localhost:3000/dashboard"
-        if num_repls == 0
+    ) (args, julia_sessions) -> begin
+        num_julia_sessions = length(julia_sessions)
+        status_text = "MCP Proxy Status:\n- Port: 3000\n- Connected agents: $num_julia_sessions\n- Status: Running\n- Dashboard: http://localhost:3000/dashboard"
+        if num_julia_sessions == 0
             status_text *= "\n\nNo backend REPL agents are currently connected. Start a backend REPL to enable Julia tools."
         else
             status_text *= "\n\nConnected agents:\n"
-            for repl in repls
+            for repl in julia_sessions
                 status_text *= "  - $(repl.id) (port $(repl.port), status: $(repl.status))\n"
             end
         end
@@ -113,8 +113,8 @@ const LIST_JULIA_SESSIONS_TOOL =
         "type" => "object",
         "properties" => Dict(),
         "required" => [],
-    ) (args, repls) -> begin
-        if isempty(repls)
+    ) (args, julia_sessions) -> begin
+        if isempty(julia_sessions)
             """
             No Julia sessions currently registered.
 
@@ -124,8 +124,8 @@ const LIST_JULIA_SESSIONS_TOOL =
             3. Julia tools will become available
             """
         else
-            agent_text = "Connected Julia sessions ($(length(repls))):\n\n"
-            for repl in repls
+            agent_text = "Connected Julia sessions ($(length(julia_sessions))):\n\n"
+            for repl in julia_sessions
                 pid_str = repl.pid === nothing ? "N/A" : string(repl.pid)
                 agent_text *= "**$(repl.id)**\n"
                 agent_text *= "  - Port: $(repl.port)\n"
@@ -178,7 +178,7 @@ const KILL_STALE_SESSIONS_TOOL =
             ),
         ),
         "required" => [],
-    ) (args, repls, list_repls_fn) -> begin
+    ) (args, julia_sessions, list_julia_sessions_fn) -> begin
         # This tool needs special handling in proxy.jl due to system process access
         :kill_stale_sessions_special
     end
@@ -200,7 +200,7 @@ const START_JULIA_SESSION_TOOL =
             ),
         ),
         "required" => ["project_path"],
-    ) (args, repls, list_repls_fn) -> begin
+    ) (args, julia_sessions, list_julia_sessions_fn) -> begin
         # This tool needs special handling in proxy.jl due to process spawning
         # Handler will be called from proxy request handler
         # Return value indicates this is a special tool

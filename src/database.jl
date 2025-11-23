@@ -23,6 +23,8 @@ export init_db!,
     get_session_summary,
     reconstruct_session,
     register_session!,
+    register_mcp_session!,
+    register_julia_session!,
     get_active_sessions,
     get_all_sessions,
     update_session_status!,
@@ -80,7 +82,7 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     CREATE TABLE IF NOT EXISTS julia_sessions (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        port INTEGER NOT NULL,
+        port INTEGER,
         pid INTEGER,
         start_time DATETIME NOT NULL,
         last_activity DATETIME NOT NULL,
@@ -968,6 +970,8 @@ function log_interaction_safe!(
     content_type::Union{String,Nothing} = nothing,
     content_encoding::Union{String,Nothing} = nothing,
     processing_time_ms::Union{Float64,Nothing} = nothing,
+    julia_session_port::Union{Int,Nothing} = nothing,
+    julia_session_pid::Union{Int,Nothing} = nothing,
 )
     try
         # Ensure sessions exist (auto-create with minimal info)
@@ -978,6 +982,8 @@ function log_interaction_safe!(
             register_julia_session!(
                 julia_session_id,
                 julia_session_id;  # Use ID as name for auto-created sessions
+                port = julia_session_port,
+                pid = julia_session_pid,
                 metadata = Dict("auto_created" => true),
             )
         end

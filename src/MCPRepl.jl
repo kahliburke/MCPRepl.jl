@@ -2680,7 +2680,31 @@ Terminates the active debug session and returns to normal execution.
                 # Don't start heartbeat if registration failed
                 return nothing
             else
-                @warn "Failed to register with proxy" status = response.status
+                # Try to parse error response for details
+                error_details = ""
+                try
+                    response_data = JSON.parse(String(response.body))
+                    if haskey(response_data, "error")
+                        error_details = get(response_data["error"], "message", "")
+                    end
+                catch
+                    # If parsing fails, show raw body (truncated)
+                    body_str = String(response.body)
+                    error_details =
+                        length(body_str) > 200 ? body_str[1:200] * "..." : body_str
+                end
+
+                # Show user-friendly error message
+                printstyled("❌ Registration failed: ", color = :red, bold = true)
+                if !isempty(error_details)
+                    println(error_details)
+                else
+                    println("HTTP $(response.status)")
+                end
+
+                # Also log as warning for debugging
+                @warn "Failed to register with proxy" status = response.status error =
+                    error_details
                 return nothing
             end
 

@@ -2,9 +2,12 @@ using ReTest
 using HTTP
 using JSON
 
-# Import the functions we need to test
+# Import the modules we need to test
 include("../src/proxy.jl")
 using .Proxy
+
+include("../src/database.jl")
+using .Database
 
 @testset "Proxy Header Parsing" begin
     @testset "HTTP.header returns SubString or String" begin
@@ -43,7 +46,7 @@ end
 @testset "REPL Registry" begin
     @testset "Register and retrieve REPL" begin
         # Clear any existing registrations
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Register a test REPL
         Proxy.register_repl(
@@ -63,20 +66,20 @@ end
         @test repl.metadata["test"] == "data"
     end
 
-    @testset "List REPLs" begin
-        empty!(Proxy.REPL_REGISTRY)
+    @testset "List julia_sessions" begin
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         Proxy.register_repl("repl-1", 3001)
         Proxy.register_repl("repl-2", 3002)
 
-        repls = Proxy.list_repls()
-        @test length(repls) == 2
-        @test any(r -> r.id == "repl-1", repls)
-        @test any(r -> r.id == "repl-2", repls)
+        julia_sessions = Proxy.list_julia_sessions()
+        @test length(julia_sessions) == 2
+        @test any(r -> r.id == "repl-1", julia_sessions)
+        @test any(r -> r.id == "repl-2", julia_sessions)
     end
 
     @testset "Unregister REPL" begin
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         Proxy.register_repl("temp-repl", 3003)
         @test Proxy.get_repl("temp-repl") !== nothing
@@ -86,7 +89,7 @@ end
     end
 
     @testset "Update REPL status" begin
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         Proxy.register_repl("status-repl", 3004)
         repl = Proxy.get_repl("status-repl")
@@ -99,7 +102,7 @@ end
     end
 
     @testset "Missed heartbeat counter" begin
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         Proxy.register_repl("heartbeat-test", 3005)
         repl = Proxy.get_repl("heartbeat-test")
@@ -133,7 +136,7 @@ end
 @testset "HTTP Request Construction" begin
     @testset "HTTP.post with headers and body" begin
         # Test that our HTTP.post syntax is correct
-        # This is the exact pattern used in route_to_repl
+        # This is the exact pattern used in route_to_session_streaming
         backend_url = "http://127.0.0.1:3006/"
         headers = ["Content-Type" => "application/json"]
         body_str = JSON.json(
@@ -197,7 +200,7 @@ end
         json_str = """{"jsonrpc":"2.0","id":1,"method":"test","params":{}}"""
         parsed = JSON.parse(json_str)
 
-        # Test the conversion logic used in route_to_repl
+        # Test the conversion logic used in route_to_session_streaming
         request_dict =
             parsed isa Dict ? parsed : Dict(String(k) => v for (k, v) in pairs(parsed))
 
@@ -205,9 +208,9 @@ end
         @test request_dict["method"] == "test"
     end
 
-    @testset "Full route_to_repl simulation" begin
+    @testset "Full route_to_session_streaming simulation" begin
         # This tests the exact flow that happens in the proxy
-        empty!(Proxy.REPL_REGISTRY)
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Register a test REPL
         Proxy.register_repl("route-test", 3006; pid = Int(getpid()))
@@ -225,7 +228,7 @@ end
             parsed isa Dict ? parsed : Dict(String(k) => v for (k, v) in pairs(parsed))
         println("  Dict type: $(typeof(request_dict))")
 
-        # Simulate what route_to_repl does
+        # Simulate what route_to_session_streaming does
         backend_url = "http://127.0.0.1:3006/"
         headers = ["Content-Type" => "application/json"]
         body_str = JSON.json(request_dict)
@@ -240,7 +243,7 @@ end
         # Test that these arguments won't cause an error when constructing Response
         @test_nowarn HTTP.Response(200, body_str)
 
-        # Test the exact argument pattern used in route_to_repl
+        # Test the exact argument pattern used in route_to_session_streaming
         println("\nTesting HTTP.post argument pattern:")
         println("  Arg 1 (url): $(typeof(backend_url)) = $backend_url")
         println("  Arg 2 (headers): $(typeof(headers)) = $headers")
@@ -262,7 +265,7 @@ end
         end
 
         try
-            # Test the exact pattern used in route_to_repl
+            # Test the exact pattern used in route_to_session_streaming
             backend_url = "http://127.0.0.1:$echo_port/"
             headers = ["Content-Type" => "application/json"]
             request_dict = Dict("jsonrpc" => "2.0", "id" => 1, "method" => "test")
@@ -271,7 +274,7 @@ end
             println("\nActual HTTP.post test:")
             println("  Making real HTTP.post call...")
 
-            # This is the EXACT call from route_to_repl
+            # This is the EXACT call from route_to_session_streaming
             response = HTTP.post(
                 backend_url,
                 headers,
@@ -304,7 +307,7 @@ end
 
         try
             # Register a REPL pointing to our echo server
-            empty!(Proxy.REPL_REGISTRY)
+            empty!(Proxy.JULIA_SESSION_REGISTRY)
             Proxy.register_repl("integration-test", echo_port; pid = Int(getpid()))
 
             # Create HTTP request exactly as it would come from a client
@@ -340,4 +343,53 @@ end
             close(echo_server)
         end
     end
+end
+
+@testset "REPL Registration" begin
+    # Initialize temp database for registration tests
+    test_db = tempname() * ".db"
+    Database.init_db!(test_db)
+
+    @testset "Successful registration with database logging" begin
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+
+        # Register a REPL
+        Proxy.register_repl("test-registration-1", 5001; pid = 99999)
+
+        # Verify it's in the registry
+        @test haskey(Proxy.JULIA_SESSION_REGISTRY, "test-registration-1")
+        repl_info = Proxy.JULIA_SESSION_REGISTRY["test-registration-1"]
+        @test repl_info.port == 5001
+        @test repl_info.pid == 99999
+        @test repl_info.id == "test-registration-1"
+    end
+
+    @testset "Duplicate registration throws error" begin
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+
+        # Register once
+        Proxy.register_repl("test-duplicate", 5002; pid = 88888)
+
+        # Try to register again - should throw
+        @test_throws Exception Proxy.register_repl("test-duplicate", 5003; pid = 77777)
+
+        # Verify original registration still intact
+        @test Proxy.JULIA_SESSION_REGISTRY["test-duplicate"].port == 5002
+    end
+
+    @testset "Unregister REPL" begin
+        empty!(Proxy.JULIA_SESSION_REGISTRY)
+
+        # Register and verify
+        Proxy.register_repl("test-unregister", 5004; pid = 66666)
+        @test haskey(Proxy.JULIA_SESSION_REGISTRY, "test-unregister")
+
+        # Unregister and verify removal
+        Proxy.unregister_repl("test-unregister")
+        @test !haskey(Proxy.JULIA_SESSION_REGISTRY, "test-unregister")
+    end
+
+    # Cleanup
+    Database.close_db!()
+    rm(test_db; force = true)
 end

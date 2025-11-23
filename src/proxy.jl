@@ -1,8 +1,8 @@
 """
 Persistent MCP Proxy Server
 
-Provides a stable MCP interface that routes requests to backend REPL processes.
-The proxy server runs independently and stays up even when backend REPLs restart.
+Provides a stable MCP interface that routes requests to backend Julia session processes.
+The proxy server runs independently and stays up even when backend julia_sessions restart.
 """
 module Proxy
 
@@ -26,436 +26,26 @@ using .Session
 
 include("proxy_tools.jl")
 
-# ============================================================================
-# HTTP Response Helpers (reduce duplication)
-# ============================================================================
-
-"""
-    send_json_response(http::HTTP.Stream, data; status::Int=200, session_id::String="proxy", request_id=nothing)
-
-Send a JSON response with proper headers and log to database.
-"""
-function send_json_response(
-    http::HTTP.Stream,
-    data;
-    status::Int = 200,
-    mcp_session_id::Union{String,Nothing} = nothing,
-    julia_session_id::Union{String,Nothing} = nothing,
-    request_id = nothing,
-)
-    json_str = JSON.json(data)
-
-    # Log outbound response
-    log_db_interaction(
-        "outbound",
-        "response",
-        json_str;
-        mcp_session_id = mcp_session_id,
-        julia_session_id = julia_session_id,
-        request_id = request_id,
-        method = nothing,
-        http_status_code = status,
-    )
-
-    HTTP.setstatus(http, status)
-    HTTP.setheader(http, "Content-Type" => "application/json")
-    HTTP.startwrite(http)
-    write(http, json_str)
-    return nothing
-end
-
-"""
-    send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int=200, session_id::String="proxy")
-
-Send a JSON-RPC success response and log to database.
-"""
-function send_jsonrpc_result(
-    http::HTTP.Stream,
-    id,
-    result;
-    status::Int = 200,
-    session_id::String = "proxy",
-)
-    send_json_response(
-        http,
-        Dict("jsonrpc" => "2.0", "id" => id, "result" => result);
-        status = status,
-        session_id = session_id,
-        request_id = id,
-    )
-end
-
-"""
-    send_jsonrpc_error(http::HTTP.Stream, id, code::Int, message::String; status::Int=200, data=nothing, session_id::String="proxy")
-
-Send a JSON-RPC error response and log to database.
-"""
-function send_jsonrpc_error(
-    http::HTTP.Stream,
-    id,
-    code::Int,
-    message::String;
-    status::Int = 200,
-    data = nothing,
-    session_id::String = "proxy",
-)
-    error_dict = Dict("code" => code, "message" => message)
-    if data !== nothing
-        error_dict["data"] = data
-    end
-    send_json_response(
-        http,
-        Dict("jsonrpc" => "2.0", "id" => id, "error" => error_dict);
-        status = status,
-        session_id = session_id,
-        request_id = id,
-    )
-end
-
-"""
-    send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int=200, session_id::String="proxy")
-
-Send an MCP tool call result with text content and log to database.
-"""
-function send_mcp_tool_result(
-    http::HTTP.Stream,
-    id,
-    text::String;
-    status::Int = 200,
-    session_id::String = "proxy",
-)
-    send_jsonrpc_result(
-        http,
-        id,
-        Dict("content" => [Dict("type" => "text", "text" => text)]);
-        status = status,
-        session_id = session_id,
-    )
-end
-
-"""
-    send_empty_response(http::HTTP.Stream; status::Int=200)
-
-Send an empty response with just status code.
-"""
-function send_empty_response(http::HTTP.Stream; status::Int = 200)
-    HTTP.setstatus(http, status)
-    HTTP.setheader(http, "Content-Length" => "0")
-    HTTP.startwrite(http)
-    return nothing
-end
-
-function setup_proxy_logging(port::Int)
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-    mkpath(cache_dir)
-
-    log_file = joinpath(cache_dir, "proxy-$port.log")
-
-    # Use FileLogger with automatic flushing and timestamp formatting
-    logger = LoggingExtras.TransformerLogger(
-        LoggingExtras.FileLogger(log_file; append = true, always_flush = true),
-    ) do log
-        merge(log, (; message = "$(Dates.format(now(), "HH:MM:SS.sss")) $(log.message)"))
-    end
-    global_logger(logger)
-
-    @info "Proxy logging initialized" log_file = log_file
-    return log_file
-end
-
-# Helper function to log events to database with dual-session tracking
-function log_db_event(
-    event_type::String,
-    data::Dict;
-    mcp_session_id::Union{String,Nothing} = nothing,
-    julia_session_id::Union{String,Nothing} = nothing,
-    duration_ms::Union{Float64,Nothing} = nothing,
-)
-    try
-        Database.log_event_safe!(
-            event_type,
-            data;
-            mcp_session_id = mcp_session_id,
-            julia_session_id = julia_session_id,
-            duration_ms = duration_ms,
-        )
-    catch e
-        # Silent failure
-        @debug "Failed to log to database" exception = e
-    end
-end
-
-# Helper function to log complete interactions (request/response messages) with dual-session tracking
-function log_db_interaction(
-    direction::String,
-    message_type::String,
-    content::Union{String,Dict};
-    mcp_session_id::Union{String,Nothing} = nothing,
-    julia_session_id::Union{String,Nothing} = nothing,
-    request_id = nothing,
-    method = nothing,
-    http_method::Union{String,Nothing} = nothing,
-    http_path::Union{String,Nothing} = nothing,
-    http_headers::Union{String,Nothing} = nothing,
-    http_status_code::Union{Int,Nothing} = nothing,
-    remote_addr::Union{String,Nothing} = nothing,
-    user_agent::Union{String,Nothing} = nothing,
-    content_type::Union{String,Nothing} = nothing,
-    content_encoding::Union{String,Nothing} = nothing,
-    processing_time_ms::Union{Float64,Nothing} = nothing,
-)
-    try
-        Database.log_interaction_safe!(
-            direction,
-            message_type,
-            content;
-            mcp_session_id = mcp_session_id,
-            julia_session_id = julia_session_id,
-            request_id = request_id,
-            method = method,
-            http_method = http_method,
-            http_path = http_path,
-            http_headers = http_headers,
-            http_status_code = http_status_code,
-            remote_addr = remote_addr,
-            user_agent = user_agent,
-            content_type = content_type,
-            content_encoding = content_encoding,
-            processing_time_ms = processing_time_ms,
-        )
-    catch e
-        # Silent failure
-        @debug "Failed to log interaction to database" exception = e
-    end
-end
-
-# REPL Connection tracking
-mutable struct REPLConnection
-    id::String                          # Unique identifier (project name, agent name)
-    port::Int                           # REPL's MCP server port
-    pid::Union{Int,Nothing}            # REPL process ID
-    status::Symbol                      # :ready, :disconnected, :reconnecting, :stopped
-    last_heartbeat::DateTime            # Last time we heard from this REPL
-    metadata::Dict{String,Any}         # Additional info (project path, etc.)
-    last_error::Union{String,Nothing}  # Last error message if any
-    missed_heartbeats::Int             # Counter for consecutive missed heartbeats
-    pending_requests::Vector{Tuple{Dict,HTTP.Stream}}  # Buffered requests during reconnection
-    disconnect_time::Union{DateTime,Nothing}  # When REPL disconnected
-end
+# Include proxy sub-modules
+include("proxy/validation.jl")
+include("proxy/http_helpers.jl")
+include("proxy/session_registry.jl")
+include("proxy/process_management.jl")
+include("proxy/logging.jl")
+include("proxy/vite.jl")
 
 # Global state
 const SERVER = Ref{Union{HTTP.Server,Nothing}}(nothing)
 const SERVER_PORT = Ref{Int}(3000)
 const SERVER_PID_FILE = Ref{String}("")
-const REPL_REGISTRY = Dict{String,REPLConnection}()
-const REPL_REGISTRY_LOCK = ReentrantLock()
-const SESSION_REGISTRY = Dict{String,MCPSession}()  # Track MCP client sessions
-const SESSION_LOCK = ReentrantLock()
+const JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
+const JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
+const MCP_SESSION_REGISTRY = Dict{String,MCPSession}()  # Track MCP client sessions
+const MCP_SESSION_LOCK = ReentrantLock()
 const CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()  # Track active client notification channels
 const CLIENT_CONNECTIONS_LOCK = ReentrantLock()
 const VITE_DEV_PROCESS = Ref{Union{Base.Process,Nothing}}(nothing)
 const VITE_DEV_PORT = 3001
-
-"""
-    is_server_running(port::Int=3000) -> Bool
-
-Check if a proxy server is already running on the specified port.
-"""
-function is_server_running(port::Int = 3000)
-    try
-        # Try to connect to the port
-        sock = connect(ip"127.0.0.1", port)
-        close(sock)
-        return true
-    catch
-        return false
-    end
-end
-
-"""
-    get_server_pid(port::Int=3000) -> Union{Int, Nothing}
-
-Get the PID of the running proxy server from the PID file.
-Returns nothing if no PID file exists or process is not running.
-"""
-function get_server_pid(port::Int = 3000)
-    pid_file = get_pid_file_path(port)
-
-    if !isfile(pid_file)
-        return nothing
-    end
-
-    try
-        pid_str = strip(read(pid_file, String))
-        pid = parse(Int, pid_str)
-
-        # Verify process is actually running using parent module's Utils
-        if isdefined(Main, :MCPRepl) && isdefined(Main.MCPRepl, :Utils)
-            if Main.MCPRepl.Utils.process_running(pid)
-                return pid
-            else
-                # Stale PID file, remove it
-                rm(pid_file, force = true)
-                return nothing
-            end
-        else
-            # Can't verify, assume running
-            return pid
-        end
-    catch
-        return nothing
-    end
-end
-
-"""
-    get_pid_file_path(port::Int=3000) -> String
-
-Get the path to the PID file for a proxy server on the given port.
-"""
-function get_pid_file_path(port::Int = 3000)
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-
-    mkpath(cache_dir)
-    return joinpath(cache_dir, "proxy-$port.pid")
-end
-
-"""
-    write_pid_file(port::Int=3000)
-
-Write the current process PID to the PID file.
-"""
-function write_pid_file(port::Int = 3000)
-    pid_file = get_pid_file_path(port)
-    write(pid_file, string(getpid()))
-    SERVER_PID_FILE[] = pid_file
-end
-
-"""
-    remove_pid_file(port::Int=3000)
-
-Remove the PID file for the proxy server.
-"""
-function remove_pid_file(port::Int = 3000)
-    pid_file = get_pid_file_path(port)
-    rm(pid_file, force = true)
-end
-
-# ============================================================================
-# Vite Dev Server Management
-# ============================================================================
-
-"""
-    is_dev_environment() -> Bool
-
-Check if we're in a development environment (dashboard-ui source exists).
-"""
-function is_dev_environment()
-    dashboard_src = joinpath(dirname(dirname(@__FILE__)), "dashboard-ui", "src")
-    return isdir(dashboard_src)
-end
-
-"""
-    is_vite_running() -> Bool
-
-Check if Vite dev server is running on port 3001.
-"""
-function is_vite_running()
-    try
-        sock = connect("localhost", VITE_DEV_PORT)
-        close(sock)
-        return true
-    catch
-        return false
-    end
-end
-
-"""
-    start_vite_dev_server()
-
-Start the Vite dev server if in development mode and not already running.
-"""
-function start_vite_dev_server()
-    # Only start in dev environment
-    if !is_dev_environment()
-        @debug "Not in dev environment, skipping Vite dev server"
-        return nothing
-    end
-
-    # Check if already running
-    if is_vite_running()
-        @info "Vite dev server already running on port $VITE_DEV_PORT"
-        return nothing
-    end
-
-    # Check if process reference exists and is still running
-    if VITE_DEV_PROCESS[] !== nothing && process_running(VITE_DEV_PROCESS[])
-        @info "Vite dev server process already started"
-        return VITE_DEV_PROCESS[]
-    end
-
-    dashboard_dir = joinpath(dirname(dirname(@__FILE__)), "dashboard-ui")
-
-    # Check if node_modules exists
-    if !isdir(joinpath(dashboard_dir, "node_modules"))
-        @warn "dashboard-ui/node_modules not found. Run 'npm install' first."
-        return nothing
-    end
-
-    @info "Starting Vite dev server..." dashboard_dir = dashboard_dir port = VITE_DEV_PORT
-
-    try
-        # Start npm run dev in the background
-        # Need to change directory before running
-        proc = cd(dashboard_dir) do
-            run(pipeline(`npm run dev`, stdout = devnull, stderr = devnull), wait = false)
-        end
-
-        VITE_DEV_PROCESS[] = proc
-
-        # Give it a moment to start
-        sleep(2)
-
-        if is_vite_running()
-            @info "✅ Vite dev server started on port $VITE_DEV_PORT"
-            return proc
-        else
-            @warn "Vite dev server may not have started successfully"
-            return proc
-        end
-    catch e
-        @error "Failed to start Vite dev server" exception = (e, catch_backtrace())
-        return nothing
-    end
-end
-
-"""
-    stop_vite_dev_server()
-
-Stop the Vite dev server if it's running.
-"""
-function stop_vite_dev_server()
-    if VITE_DEV_PROCESS[] !== nothing
-        try
-            kill(VITE_DEV_PROCESS[])
-            @info "Vite dev server stopped"
-        catch e
-            @debug "Error stopping Vite dev server" exception = (e, catch_backtrace())
-        end
-        VITE_DEV_PROCESS[] = nothing
-    end
-end
 
 # ============================================================================
 # MCP Notification Support
@@ -525,548 +115,11 @@ function unregister_client_connection(session_id::String)
     end
 end
 
-# ============================================================================
-# REPL Registry Management
-# ============================================================================
-
-"""
-    register_repl(id::String, port::Int; pid::Union{Int,Nothing}=nothing, metadata::Dict=Dict())
-
-Register a REPL with the proxy server so it can route requests to it.
-
-# Arguments
-- `id::String`: Unique identifier for this REPL (e.g., "project-a", "agent-1")
-- `port::Int`: Port where the REPL's MCP server is listening
-- `pid::Union{Int,Nothing}=nothing`: Process ID of the REPL (optional)
-- `metadata::Dict=Dict()`: Additional metadata (project path, etc.)
-"""
-function register_repl(
-    id::String,
-    port::Int;
-    pid::Union{Int,Nothing} = nothing,
-    metadata::Dict = Dict(),
-)
-    # Check for pending requests and copy them outside the lock
-    pending = lock(REPL_REGISTRY_LOCK) do
-        # Check if this is a re-registration (reconnection)
-        existing = get(REPL_REGISTRY, id, nothing)
-        pending_requests =
-            existing !== nothing ? existing.pending_requests : Tuple{Dict,HTTP.Stream}[]
-
-        if existing !== nothing && !isempty(pending_requests)
-            @info "REPL re-registering with buffered requests" id = id port = port pid = pid buffer_size = length(pending_requests)
-        end
-
-        REPL_REGISTRY[id] = REPLConnection(
-            id,
-            port,
-            pid,
-            :ready,
-            now(),
-            metadata,
-            nothing,
-            0,
-            Tuple{Dict,HTTP.Stream}[],  # Start with empty buffer - we'll flush old requests separately
-            nothing,
-        )
-        @info "REPL registered with proxy" id = id port = port pid = pid
-
-        # Register Julia session in database
-        try
-            Database.register_julia_session!(
-                id,
-                id,  # Use ID as name (logical name)
-                "ready";
-                port = port,
-                pid = pid,
-                metadata = metadata,
-            )
-            log_db_event(
-                "repl.registered",
-                Dict("port" => port, "pid" => pid, "metadata" => metadata);
-                julia_session_id = id,
-            )
-        catch e
-            @warn "Failed to register session in database" id = id exception = e
-        end
-
-        # Log registration event to dashboard
-        Dashboard.log_event(
-            id,
-            Dashboard.AGENT_START,
-            Dict("port" => port, "pid" => pid, "metadata" => metadata),
-        )
-
-        # Return pending requests to process outside the lock
-        pending_requests
-    end
-
-    # If there were pending requests, flush them to the newly connected REPL
-    # Do this outside the lock to avoid holding it during HTTP requests
-    if !isempty(pending)
-        @async flush_pending_requests(id, pending)
-    end
-
-    # Notify all connected MCP clients that tools list has changed
-    notify_tools_list_changed()
-end
-
-"""
-    unregister_repl(id::String)
-
-Remove a REPL from the proxy registry.
-"""
-function unregister_repl(id::String)
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, id)
-            repl = REPL_REGISTRY[id]
-            delete!(REPL_REGISTRY, id)
-
-            # Log stop event to dashboard
-            Dashboard.log_event(id, Dashboard.AGENT_STOP, Dict())
-
-            # Log unregistration to database
-            log_db_event(
-                id,
-                "repl.unregistered",
-                Dict(
-                    "port" => repl.port,
-                    "pid" => repl.pid,
-                    "status" => string(repl.status),
-                ),
-            )
-
-            @info "REPL unregistered from proxy" id = id
-        end
-    end
-end
-
-"""
-    get_repl(id::String) -> Union{REPLConnection, Nothing}
-
-Get a REPL connection by ID.
-"""
-function get_repl(id::String)
-    lock(REPL_REGISTRY_LOCK) do
-        get(REPL_REGISTRY, id, nothing)
-    end
-end
-
-"""
-    create_mcp_session(target_repl_id::Union{String,Nothing}) -> MCPSession
-
-Create a new MCP session for a client connection.
-"""
-function create_mcp_session(target_repl_id::Union{String,Nothing})
-    session = MCPSession(target_repl_id = target_repl_id)
-
-    lock(SESSION_LOCK) do
-        SESSION_REGISTRY[session.id] = session
-    end
-
-    @info "Created MCP session" session_id = session.id target_repl_id = target_repl_id
-    return session
-end
-
-"""
-    get_mcp_session(session_id::String) -> Union{MCPSession, Nothing}
-
-Get an MCP session by its ID.
-"""
-function get_mcp_session(session_id::String)
-    lock(SESSION_LOCK) do
-        return get(SESSION_REGISTRY, session_id, nothing)
-    end
-end
-
-"""
-    delete_mcp_session!(session_id::String)
-
-Delete an MCP session.
-"""
-function delete_mcp_session!(session_id::String)
-    lock(SESSION_LOCK) do
-        if haskey(SESSION_REGISTRY, session_id)
-            session = SESSION_REGISTRY[session_id]
-            close_session!(session)
-            delete!(SESSION_REGISTRY, session_id)
-            @info "Deleted MCP session" session_id = session_id
-        end
-    end
-end
-
-"""
-    cleanup_inactive_sessions!(max_age::Dates.Period=Dates.Hour(1))
-
-Remove sessions that haven't been active for longer than max_age.
-"""
-function cleanup_inactive_sessions!(max_age::Dates.Period = Dates.Hour(1))
-    cutoff = now() - max_age
-    lock(SESSION_LOCK) do
-        inactive =
-            [id for (id, session) in SESSION_REGISTRY if session.last_activity < cutoff]
-        for id in inactive
-            session = SESSION_REGISTRY[id]
-            close_session!(session)
-            delete!(SESSION_REGISTRY, id)
-            @info "Cleaned up inactive session" session_id = id
-        end
-    end
-end
-
-"""
-    list_repls() -> Vector{REPLConnection}
-
-List all registered REPLs.
-"""
-function list_repls()
-    lock(REPL_REGISTRY_LOCK) do
-        collect(values(REPL_REGISTRY))
-    end
-end
-
-"""  
-    update_repl_status(id::String, status::Symbol; error::Union{String,Nothing}=nothing)
-
-Update the status of a registered REPL, optionally storing error information.
-"""
-function update_repl_status(
-    id::String,
-    status::Symbol;
-    error::Union{String,Nothing} = nothing,
-)
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, id)
-            REPL_REGISTRY[id].status = status
-            REPL_REGISTRY[id].last_heartbeat = now()
-            if error !== nothing
-                REPL_REGISTRY[id].last_error = error
-                # Increment missed heartbeats counter on errors
-                REPL_REGISTRY[id].missed_heartbeats += 1
-            elseif status == :ready
-                # Clear error and reset counter when back to ready
-                REPL_REGISTRY[id].last_error = nothing
-                REPL_REGISTRY[id].missed_heartbeats = 0
-                REPL_REGISTRY[id].disconnect_time = nothing
-
-                # Process any pending requests if we just reconnected
-                if !isempty(REPL_REGISTRY[id].pending_requests)
-                    @info "REPL reconnected, processing buffered requests" id = id buffer_size =
-                        length(REPL_REGISTRY[id].pending_requests)
-                    @async process_pending_requests(id)
-                end
-            end
-        end
-    end
-end
-
-"""
-    try_reconnect(repl_id::String)
-
-Attempt to reconnect to a disconnected REPL by sending test requests.
-"""
-function try_reconnect(repl_id::String)
-    max_attempts = 30  # Try for ~30 seconds
-    attempt = 0
-
-    while attempt < max_attempts
-        attempt += 1
-        sleep(1)  # Wait 1 second between attempts
-
-        repl = get_repl(repl_id)
-        if repl === nothing || repl.status == :stopped
-            break
-        end
-
-        # Try a simple ping request
-        try
-            response = HTTP.request(
-                "POST",
-                "http://127.0.0.1:$(repl.port)/",
-                ["Content-Type" => "application/json"],
-                JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => 999999,
-                        "method" => "ping",
-                        "params" => Dict(),
-                    ),
-                );
-                readtimeout = 2,
-                connect_timeout = 2,
-                status_exception = false,
-            )
-
-            if response.status == 200
-                # Success! Mark as ready
-                @info "REPL reconnection successful" id = repl_id attempt = attempt
-                update_repl_status(repl_id, :ready)
-                return
-            end
-        catch e
-            @debug "Reconnection attempt failed" id = repl_id attempt = attempt exception =
-                e
-        end
-    end
-
-    # Failed to reconnect after all attempts
-    @warn "Failed to reconnect to REPL after $max_attempts attempts" id = repl_id
-
-    # Reset status back to disconnected
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, repl_id)
-            REPL_REGISTRY[repl_id].status = :disconnected
-        end
-    end
-
-    flush_pending_requests_with_error(
-        repl_id,
-        "Reconnection timeout after $max_attempts seconds",
-    )
-end
-
-"""
-    process_pending_requests(repl_id::String)
-
-Process all buffered requests for a reconnected REPL.
-"""
-function process_pending_requests(repl_id::String)
-    pending = Tuple{Dict,HTTP.Stream}[]
-
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, repl_id)
-            pending = copy(REPL_REGISTRY[repl_id].pending_requests)
-            empty!(REPL_REGISTRY[repl_id].pending_requests)
-        end
-    end
-
-    for (request, http) in pending
-        try
-            # Re-route the request
-            route_to_repl_streaming(request, http.message, http)
-        catch e
-            @error "Error processing pending request" repl_id = repl_id exception = e
-        end
-    end
-end
-
-"""
-    flush_pending_requests_with_error(repl_id::String, error_message::String)
-
-Send error responses to all buffered requests when REPL cannot be recovered.
-"""
-function flush_pending_requests_with_error(repl_id::String, error_message::String)
-    pending = Tuple{Dict,HTTP.Stream}[]
-
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, repl_id)
-            pending = copy(REPL_REGISTRY[repl_id].pending_requests)
-            empty!(REPL_REGISTRY[repl_id].pending_requests)
-        end
-    end
-
-    for (request, http) in pending
-        try
-            send_jsonrpc_error(
-                http,
-                get(request, "id", nothing),
-                -32005,
-                "REPL unavailable: $error_message";
-                status = 503,
-            )
-        catch e
-            @error "Error flushing pending request" repl_id = repl_id exception = e
-        end
-    end
-
-    @info "Flushed pending requests with error" repl_id = repl_id count = length(pending)
-end
-
-"""
-    flush_pending_requests(repl_id::String, pending::Vector{Tuple{Dict,HTTP.Stream}})
-
-Process all buffered requests for a REPL that has reconnected.
-Forwards each buffered request to the REPL and returns responses to waiting clients.
-"""
-function flush_pending_requests(repl_id::String, pending::Vector{Tuple{Dict,HTTP.Stream}})
-    @info "Flushing buffered requests to reconnected REPL" repl_id = repl_id count =
-        length(pending)
-
-    repl = get_repl(repl_id)
-    if repl === nothing
-        @warn "REPL not found when flushing buffered requests" repl_id = repl_id
-        return
-    end
-
-    # Execute buffered requests and forward responses to clients
-    for (request, http) in pending
-        try
-            backend_url = "http://127.0.0.1:$(repl.port)/"
-            body_str = JSON.json(request)
-
-            @debug "Executing buffered request" repl_id = repl_id request_id =
-                get(request, "id", nothing)
-
-            # Execute the request
-            backend_response = HTTP.request(
-                "POST",
-                backend_url,
-                ["Content-Type" => "application/json"],
-                body_str;
-                readtimeout = 30,
-                connect_timeout = 5,
-                status_exception = false,
-            )
-
-            # Try to send response back to client if stream is still open
-            if isopen(http)
-                try
-                    send_json_response(
-                        http,
-                        String(backend_response.body),
-                        backend_response.status,
-                    )
-                    @info "Buffered request executed and response sent to client" repl_id =
-                        repl_id request_id = get(request, "id", nothing)
-                catch stream_err
-                    # Only log if it's not a normal disconnect
-                    if stream_err isa Base.IOError && (
-                        occursin("connection reset", stream_err.msg) ||
-                        occursin("broken pipe", stream_err.msg)
-                    )
-                        @debug "Client disconnected before reading response" repl_id =
-                            repl_id
-                    else
-                        @debug "Client stream closed, response discarded" repl_id = repl_id exception =
-                            stream_err
-                    end
-                end
-            else
-                @debug "Client stream already closed" repl_id = repl_id request_id =
-                    get(request, "id", nothing)
-            end
-        catch e
-            @error "Error executing buffered request" repl_id = repl_id exception = e
-            # Try to send error to client
-            if isopen(http)
-                try
-                    send_jsonrpc_error(
-                        http,
-                        get(request, "id", nothing),
-                        -32603,
-                        "Error executing buffered request: $(sprint(showerror, e))";
-                        status = 500,
-                    )
-                catch
-                end
-            end
-        end
-    end
-end
-
-"""
-    send_reconnection_updates(repl_id::String, request::Dict, http::HTTP.Stream)
-
-Send periodic status updates to client while waiting for REPL reconnection.
-Returns when REPL reconnects or timeout is reached.
-
-For the `ex` tool, sends Julia comments every 5 seconds.
-For other tools, sends a space character every 15 seconds to keep TCP connection alive.
-"""
-function send_reconnection_updates(repl_id::String, request::Dict, http::HTTP.Stream)
-    max_wait = 60  # Wait up to 60 seconds for reconnection
-    start_time = time()
-    update_interval = 5  # Send visible update every 5 seconds for ex tool
-    keepalive_interval = 15  # Send keepalive every 15 seconds for other tools
-    last_update = 0.0
-    last_keepalive = 0.0
-
-    # Get the tool being called to customize the message
-    params = get(request, "params", Dict())
-    tool_name = get(params, "name", "unknown")
-
-    while time() - start_time < max_wait
-        # Check if REPL has reconnected
-        repl = get_repl(repl_id)
-        if repl !== nothing && repl.status == :ready
-            @debug "REPL reconnected, request will be processed" repl_id = repl_id
-            return  # Request will be processed by flush_pending_requests
-        end
-
-        # Check if stream is still open
-        if !isopen(http)
-            @debug "Client disconnected while waiting for REPL" repl_id = repl_id
-            return
-        end
-
-        elapsed = time() - start_time
-
-        # Send periodic update based on tool type
-        if tool_name == "ex"
-            # For code execution, send informative comments
-            if elapsed - last_update >= update_interval
-                try
-                    status_msg = "# REPL reconnecting... ($(round(Int, elapsed))s elapsed, waiting up to $(max_wait)s)\n"
-                    write(http, status_msg)
-                    flush(http)
-                    last_update = elapsed
-                    @debug "Sent reconnection update" repl_id = repl_id elapsed = elapsed
-                catch e
-                    @debug "Error sending update, client may have disconnected" exception =
-                        e
-                    return
-                end
-            end
-        else
-            # For other tools, just send periodic keepalives (spaces are ignored in JSON)
-            if elapsed - last_keepalive >= keepalive_interval
-                try
-                    write(http, " ")  # Single space to keep connection alive
-                    flush(http)
-                    last_keepalive = elapsed
-                    @debug "Sent keepalive" repl_id = repl_id elapsed = elapsed
-                catch e
-                    @debug "Error sending keepalive, client may have disconnected" exception =
-                        e
-                    return
-                end
-            end
-        end
-
-        sleep(1)
-    end
-
-    # Timeout reached - send error response
-    @warn "REPL reconnection timeout" repl_id = repl_id elapsed = time() - start_time
-
-    # Remove from pending requests buffer
-    lock(REPL_REGISTRY_LOCK) do
-        if haskey(REPL_REGISTRY, repl_id)
-            filter!(item -> item[2] !== http, REPL_REGISTRY[repl_id].pending_requests)
-        end
-    end
-
-    # Send timeout error to client if stream still open
-    try
-        if isopen(http)
-            send_jsonrpc_error(
-                http,
-                get(request, "id", nothing),
-                -32005,
-                "REPL reconnection timeout after $(max_wait) seconds";
-                status = 503,
-            )
-        end
-    catch e
-        @debug "Error sending timeout response" exception = e
-    end
-end
-
 """
     monitor_heartbeats()
 
-Background task that monitors REPL heartbeats and marks REPLs as disconnected if they stop responding.
-Runs every 1 second and checks for REPLs that haven't sent a heartbeat in 30 seconds.
+Background task that monitors Julia session heartbeats and marks Julia sessions as disconnected if they stop responding.
+Runs every 1 second and checks for Julia sessions that haven't sent a heartbeat in 30 seconds.
 """
 function monitor_heartbeats()
     while SERVER[] !== nothing
@@ -1077,39 +130,37 @@ function monitor_heartbeats()
                 break
             end
 
-            repl_ids_to_check = String[]
-            lock(REPL_REGISTRY_LOCK) do
-                repl_ids_to_check = collect(keys(REPL_REGISTRY))
+            julia_session_ids_to_check = String[]
+            lock(JULIA_SESSION_REGISTRY_LOCK) do
+                julia_session_ids_to_check = collect(keys(JULIA_SESSION_REGISTRY))
             end
 
-            for repl_id in repl_ids_to_check
+            for julia_session_id in julia_session_ids_to_check
                 # Do all checks inside lock to avoid race conditions
-                lock(REPL_REGISTRY_LOCK) do
-                    if !haskey(REPL_REGISTRY, repl_id)
+                lock(JULIA_SESSION_REGISTRY_LOCK) do
+                    if !haskey(JULIA_SESSION_REGISTRY, julia_session_id)
                         return
                     end
 
-                    repl = REPL_REGISTRY[repl_id]
-
+                    session = JULIA_SESSION_REGISTRY[julia_session_id]
                     # Skip if already disconnected/reconnecting/stopped
-                    if repl.status != :ready
+                    if session.status != :ready
                         return
                     end
 
                     # Check if heartbeat is stale (>30 seconds old)
-                    time_since_heartbeat = now() - repl.last_heartbeat
+                    time_since_heartbeat = now() - session.last_heartbeat
                     if time_since_heartbeat > Second(30)
-                        @warn "REPL heartbeat timeout, marking as disconnected" id = repl_id last_heartbeat =
-                            repl.last_heartbeat time_since = time_since_heartbeat status_before =
-                            repl.status
-
-                        REPL_REGISTRY[repl_id].status = :disconnected
-                        REPL_REGISTRY[repl_id].disconnect_time = now()
-                        REPL_REGISTRY[repl_id].missed_heartbeats += 1
+                        @warn "Julia session heartbeat timeout, marking as disconnected" id =
+                            julia_session_id last_heartbeat = session.last_heartbeat time_since =
+                            time_since_heartbeat status_before = session.status
+                        JULIA_SESSION_REGISTRY[julia_session_id].status = :disconnected
+                        JULIA_SESSION_REGISTRY[julia_session_id].disconnect_time = now()
+                        JULIA_SESSION_REGISTRY[julia_session_id].missed_heartbeats += 1
 
                         # Log disconnection event
                         Dashboard.log_event(
-                            repl_id,
+                            julia_session_id,
                             Dashboard.ERROR,
                             Dict(
                                 "message" => "Heartbeat timeout after $time_since_heartbeat",
@@ -1127,16 +178,16 @@ function monitor_heartbeats()
 end
 
 """
-    route_to_repl_streaming(request::Dict, original_req::HTTP.Request, http::HTTP.Stream) -> Nothing
+    route_to_session_streaming(request::Dict, original_req::HTTP.Request, http::HTTP.Stream) -> Nothing
 
-Route a request to the appropriate backend REPL with streaming support.
+Route a request to the appropriate backend Julia session with streaming support.
 
 Routing priority:
 1. Mcp-Session-Id header (standard MCP session)
 2. X-MCPRepl-Target header (explicit target specification)
 3. Smart routing (prefer MCPRepl agent, or first available)
 """
-function route_to_repl_streaming(
+function route_to_session_streaming(
     request::Dict,
     original_req::HTTP.Request,
     http::HTTP.Stream,
@@ -1152,7 +203,7 @@ function route_to_repl_streaming(
         if session !== nothing
             # Update session activity
             update_activity!(session)
-            target_id = session.target_repl_id
+            target_id = session.target_julia_session_id
             @debug "Routing via session" session_id = session_id target_id = target_id
         else
             # Session not found - client needs to re-initialize
@@ -1173,10 +224,10 @@ function route_to_repl_streaming(
         target_id = isempty(header_value) ? nothing : String(header_value)
     end
 
-    # If still no target, this request requires a backend REPL but none is available
+    # If still no target, this request requires a backend Julia session but none is available
     if target_id === nothing
-        repls = list_repls()
-        if isempty(repls)
+        sessions = list_julia_sessions()
+        if isempty(sessions)
             send_jsonrpc_error(
                 http,
                 get(request, "id", nothing),
@@ -1186,47 +237,47 @@ function route_to_repl_streaming(
             )
             return nothing
         else
-            # REPLs exist but session doesn't have a target
-            available_agents = join([r.id for r in repls], ", ")
+            # julia_sessions exist but session doesn't have a target
+            julia_session_ids = join([s.id for s in julia_sessions], ", ")
             send_jsonrpc_error(
                 http,
                 get(request, "id", nothing),
                 -32001,
-                "No target REPL specified for this session. Available agents: $available_agents. Re-initialize with X-MCPRepl-Target header to specify a target.";
+                "No target Julia session specified. Available ids: $julia_session_ids. Re-initialize with X-MCPRepl-Target header to specify a target.";
                 status = 400,
             )
             return nothing
         end
     end
 
-    # Get the REPL connection
-    repl = get_repl(target_id)
+    # Get the Julia session connection
+    session = get_julia_session(target_id)
 
-    if repl === nothing
+    if session === nothing
         send_jsonrpc_error(
             http,
             get(request, "id", nothing),
             -32002,
-            "REPL not found: $target_id";
+            "Julia session not found: $target_id";
             status = 404,
         )
         return nothing
     end
 
-    # Handle REPL status
-    if repl.status == :disconnected || repl.status == :reconnecting
+    # Handle Julia session status
+    if session.status == :disconnected || session.status == :reconnecting
         # Buffer the request and keep stream open with status updates
-        lock(REPL_REGISTRY_LOCK) do
-            if haskey(REPL_REGISTRY, target_id)
+        lock(JULIA_SESSION_REGISTRY_LOCK) do
+            if haskey(JULIA_SESSION_REGISTRY, target_id)
                 # Add request to buffer
-                push!(REPL_REGISTRY[target_id].pending_requests, (request, http))
+                push!(JULIA_SESSION_REGISTRY[target_id].pending_requests, (request, http))
 
                 # Mark as reconnecting if not already
-                if REPL_REGISTRY[target_id].status == :disconnected
-                    REPL_REGISTRY[target_id].status = :reconnecting
-                    @info "REPL disconnected, buffering requests and attempting reconnection" id =
+                if JULIA_SESSION_REGISTRY[target_id].status == :disconnected
+                    JULIA_SESSION_REGISTRY[target_id].status = :reconnecting
+                    @info "Julia session disconnected, buffering requests and attempting reconnection" id =
                         target_id buffer_size =
-                        length(REPL_REGISTRY[target_id].pending_requests)
+                        length(JULIA_SESSION_REGISTRY[target_id].pending_requests)
 
                     # Start async reconnection task
                     @async try_reconnect(target_id)
@@ -1238,31 +289,31 @@ function route_to_repl_streaming(
         @async send_reconnection_updates(target_id, request, http)
         return nothing
 
-    elseif repl.status == :stopped
-        # REPL is permanently stopped, return error
+    elseif session.status == :stopped
+        # Julia session is permanently stopped, return error
         send_jsonrpc_error(
             http,
             get(request, "id", nothing),
             -32003,
-            "REPL permanently stopped: $target_id. Restart required.";
+            "Julia session permanently stopped: $target_id. Restart required.";
             status = 503,
         )
         return nothing
 
-    elseif repl.status != :ready
+    elseif session.status != :ready
         send_jsonrpc_error(
             http,
             get(request, "id", nothing),
             -32003,
-            "REPL not ready: $(repl.status)";
+            "Julia session not ready: $(session.status)";
             status = 503,
         )
         return nothing
     end
 
-    # Forward request to backend REPL with streaming support
+    # Forward request to backend Julia session with streaming support
     try
-        backend_url = "http://127.0.0.1:$(repl.port)/"
+        backend_url = "http://127.0.0.1:$(session.port)/"
         body_str = JSON.json(request)
 
         @debug "Forwarding to backend" url = backend_url body_length = length(body_str)
@@ -1355,7 +406,7 @@ function route_to_repl_streaming(
         )
 
         # Update last heartbeat
-        update_repl_status(target_id, :ready)
+        update_julia_session_status(target_id, :ready)
 
         # Forward response to client with proper headers
         HTTP.setstatus(http, response_status)
@@ -1372,10 +423,10 @@ function route_to_repl_streaming(
         # Log the backend response before sending to client
         request_id_val = get(request, "id", nothing)
         log_db_interaction(
-            target_id,
             "outbound",
             "response",
             response_body;
+            julia_session_id = target_id,
             request_id = request_id_val,
             method = method,
         )
@@ -1388,55 +439,61 @@ function route_to_repl_streaming(
         io = IOBuffer()
         showerror(io, e, catch_backtrace())
         error_msg = String(take!(io))
-        @error "Error forwarding request to REPL" target = target_id exception = e
+        @error "Error forwarding request to Julia session" target = target_id exception = e
 
         # Log error to database
         log_db_event(
-            target_id,
             "request.error",
             Dict(
                 "error_type" => string(typeof(e)),
                 "error_message" => error_msg,
                 "method" => get(request, "method", "unknown"),
-            ),
+            );
+            julia_session_id = target_id,
         )
 
         # Store the error and mark as disconnected
         error_summary = length(error_msg) > 500 ? error_msg[1:500] * "..." : error_msg
 
         # Mark as disconnected and buffer this request
-        lock(REPL_REGISTRY_LOCK) do
-            if haskey(REPL_REGISTRY, target_id)
-                REPL_REGISTRY[target_id].last_error = error_summary
-                REPL_REGISTRY[target_id].missed_heartbeats += 1
+        lock(JULIA_SESSION_REGISTRY_LOCK) do
+            if haskey(JULIA_SESSION_REGISTRY, target_id)
+                JULIA_SESSION_REGISTRY[target_id].last_error = error_summary
+                JULIA_SESSION_REGISTRY[target_id].missed_heartbeats += 1
 
                 # Only permanently stop after extended disconnect (2 minutes)
-                if REPL_REGISTRY[target_id].status == :disconnected &&
-                   REPL_REGISTRY[target_id].disconnect_time !== nothing &&
-                   (now() - REPL_REGISTRY[target_id].disconnect_time) > Minute(2)
-                    REPL_REGISTRY[target_id].status = :stopped
-                    @warn "REPL permanently stopped after 2 minutes disconnected" id =
+                if JULIA_SESSION_REGISTRY[target_id].status == :disconnected &&
+                   JULIA_SESSION_REGISTRY[target_id].disconnect_time !== nothing &&
+                   (now() - JULIA_SESSION_REGISTRY[target_id].disconnect_time) > Minute(2)
+                    JULIA_SESSION_REGISTRY[target_id].status = :stopped
+                    @warn "Julia session permanently stopped after 2 minutes disconnected" id =
                         target_id
 
                     # Fail all pending requests
-                    flush_pending_requests_with_error(target_id, "REPL permanently stopped")
+                    flush_pending_requests_with_error(
+                        target_id,
+                        "Julia session permanently stopped",
+                    )
                 else
                     # First failure - mark as disconnected
-                    if REPL_REGISTRY[target_id].status == :ready
-                        REPL_REGISTRY[target_id].status = :disconnected
-                        REPL_REGISTRY[target_id].disconnect_time = now()
-                        @info "REPL disconnected, will buffer requests and retry" id =
+                    if JULIA_SESSION_REGISTRY[target_id].status == :ready
+                        JULIA_SESSION_REGISTRY[target_id].status = :disconnected
+                        JULIA_SESSION_REGISTRY[target_id].disconnect_time = now()
+                        @info "Julia session disconnected, will buffer requests and retry" id =
                             target_id
                     end
 
                     # Buffer this request
-                    push!(REPL_REGISTRY[target_id].pending_requests, (request, http))
+                    push!(
+                        JULIA_SESSION_REGISTRY[target_id].pending_requests,
+                        (request, http),
+                    )
                     @info "Request buffered" id = target_id buffer_size =
-                        length(REPL_REGISTRY[target_id].pending_requests)
+                        length(JULIA_SESSION_REGISTRY[target_id].pending_requests)
 
                     # Start reconnection attempts
-                    if REPL_REGISTRY[target_id].status == :disconnected
-                        REPL_REGISTRY[target_id].status = :reconnecting
+                    if JULIA_SESSION_REGISTRY[target_id].status == :disconnected
+                        JULIA_SESSION_REGISTRY[target_id].status = :reconnecting
                         @async try_reconnect(target_id)
                     end
                 end
@@ -1458,7 +515,7 @@ end
 """
     handle_request(http::HTTP.Stream) -> Nothing
 
-Handle incoming MCP requests with streaming support. Routes to appropriate backend REPL or handles proxy commands.
+Handle incoming MCP requests with streaming support. Routes to appropriate backend Julia session or handles proxy commands.
 """
 function handle_request(http::HTTP.Stream)
     req = http.message
@@ -1477,13 +534,17 @@ function handle_request(http::HTTP.Stream)
         request_id = nothing
         request_method = nothing
         mcp_session_id = nothing  # MCP client session ID
-        julia_session_id = nothing  # Target Julia REPL session ID
+        julia_session_id = nothing  # Target Julia session ID
 
         # Extract HTTP metadata
         remote_addr = string(get(req.context, :client_host, ""))
-        user_agent = HTTP.header(req, "User-Agent")
-        content_type = HTTP.header(req, "Content-Type")
-        content_encoding = HTTP.header(req, "Content-Encoding")
+        user_agent_raw = HTTP.header(req, "User-Agent")
+        user_agent = isempty(user_agent_raw) ? nothing : String(user_agent_raw)
+        content_type_raw = HTTP.header(req, "Content-Type")
+        content_type = isempty(content_type_raw) ? nothing : String(content_type_raw)
+        content_encoding_raw = HTTP.header(req, "Content-Encoding")
+        content_encoding =
+            isempty(content_encoding_raw) ? nothing : String(content_encoding_raw)
         http_headers = JSON.json(Dict(req.headers))
 
         try
@@ -1602,9 +663,9 @@ function handle_request(http::HTTP.Stream)
         # Dashboard API: Get all sessions
         if path == "/dashboard/api/sessions"
             start_time = time()
-            sessions = lock(REPL_REGISTRY_LOCK) do
+            sessions = lock(JULIA_SESSION_REGISTRY_LOCK) do
                 result = Dict{String,Any}()
-                for (id, conn) in REPL_REGISTRY
+                for (id, conn) in JULIA_SESSION_REGISTRY
                     result[id] = Dict(
                         "id" => id,
                         "port" => conn.port,
@@ -1633,9 +694,9 @@ function handle_request(http::HTTP.Stream)
             session_id =
                 replace(path, r"^/dashboard/api/session/" => "", r"/restart$" => "")
 
-            success = lock(REPL_REGISTRY_LOCK) do
-                if haskey(REPL_REGISTRY, session_id)
-                    conn = REPL_REGISTRY[session_id]
+            success = lock(JULIA_SESSION_REGISTRY_LOCK) do
+                if haskey(JULIA_SESSION_REGISTRY, session_id)
+                    conn = JULIA_SESSION_REGISTRY[session_id]
 
                     # Send restart request via exit tool
                     try
@@ -1676,13 +737,13 @@ function handle_request(http::HTTP.Stream)
             session_id =
                 replace(path, r"^/dashboard/api/session/" => "", r"/shutdown$" => "")
 
-            success = lock(REPL_REGISTRY_LOCK) do
-                if haskey(REPL_REGISTRY, session_id)
-                    conn = REPL_REGISTRY[session_id]
+            success = lock(JULIA_SESSION_REGISTRY_LOCK) do
+                if haskey(JULIA_SESSION_REGISTRY, session_id)
+                    conn = JULIA_SESSION_REGISTRY[session_id]
 
                     # If disconnected, just unregister it
                     if conn.status == :disconnected
-                        delete!(REPL_REGISTRY, session_id)
+                        delete!(JULIA_SESSION_REGISTRY, session_id)
                         @info "Unregistered disconnected session" session_id
                         return true
                     end
@@ -1698,12 +759,12 @@ function handle_request(http::HTTP.Stream)
                         write(conn.socket, JSON.json(shutdown_req) * "\n")
 
                         # Remove from registry
-                        delete!(REPL_REGISTRY, session_id)
+                        delete!(JULIA_SESSION_REGISTRY, session_id)
                         @info "Session shutdown requested" session_id
                         return true
                     catch e
                         # If write fails, just unregister anyway
-                        delete!(REPL_REGISTRY, session_id)
+                        delete!(JULIA_SESSION_REGISTRY, session_id)
                         @warn "Failed to send shutdown request, unregistered anyway" session_id error =
                             e
                         return true
@@ -1738,8 +799,8 @@ function handle_request(http::HTTP.Stream)
             )
 
             # If agent_id specified, fetch tools from that agent
-            if agent_id !== nothing && haskey(REPL_REGISTRY, agent_id)
-                conn = REPL_REGISTRY[agent_id]
+            if agent_id !== nothing && haskey(JULIA_SESSION_REGISTRY, agent_id)
+                conn = JULIA_SESSION_REGISTRY[agent_id]
                 if conn.status == :ready
                     try
                         # Make tools/list request to agent
@@ -2330,7 +1391,9 @@ function handle_request(http::HTTP.Stream)
         # Dashboard API: Generate test events
         if path == "/dashboard/api/test-events"
             # Use first available session, or "test-agent" if none
-            test_agent = isempty(REPL_REGISTRY) ? "test-agent" : first(keys(REPL_REGISTRY))
+            test_agent =
+                isempty(JULIA_SESSION_REGISTRY) ? "test-agent" :
+                first(keys(JULIA_SESSION_REGISTRY))
 
             # Generate sample events of all types
             Dashboard.log_event(test_agent, Dashboard.HEARTBEAT, Dict("status" => "ok"))
@@ -2849,14 +1912,14 @@ function handle_request(http::HTTP.Stream)
 
         # Log request to database
         log_db_event(
-            log_session_id,
             "request.received",
             Dict(
                 "method" => method,
                 "request_id" => request_id,
                 "has_params" => !isnothing(params),
                 "path" => req.target,
-            ),
+            );
+            mcp_session_id = log_session_id,
         )
 
         # Handle notifications (methods that start with "notifications/")
@@ -2868,7 +1931,7 @@ function handle_request(http::HTTP.Stream)
         end
 
         if method == "proxy/status"
-            repls = list_repls()
+            sessions = list_julia_sessions()
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
@@ -2876,22 +1939,22 @@ function handle_request(http::HTTP.Stream)
                     "status" => "running",
                     "pid" => getpid(),
                     "port" => SERVER_PORT[],
-                    "connected_repls" => length(repls),
-                    "repls" => [
+                    "connected_sessions" => length(sessions),
+                    "sessions" => [
                         Dict(
-                            "id" => r.id,
-                            "port" => r.port,
-                            "status" => string(r.status),
-                            "pid" => r.pid,
-                            "last_error" => r.last_error,
-                        ) for r in repls
+                            "id" => s.id,
+                            "port" => s.port,
+                            "status" => string(s.status),
+                            "pid" => s.pid,
+                            "last_error" => s.last_error,
+                        ) for s in sessions
                     ],
                     "uptime" => time(),
                 ),
             )
             return nothing
         elseif method == "proxy/register"
-            # Register a new REPL
+            # Register a new julia session
             params = get(request, "params", Dict())
             id = get(params, "id", nothing)
             port = get(params, "port", nothing)
@@ -2915,8 +1978,8 @@ function handle_request(http::HTTP.Stream)
             end
 
             # Check if a session with this ID already exists
-            existing_session = lock(REPL_REGISTRY_LOCK) do
-                get(REPL_REGISTRY, id, nothing)
+            existing_session = lock(JULIA_SESSION_REGISTRY_LOCK) do
+                get(JULIA_SESSION_REGISTRY, id, nothing)
             end
 
             if existing_session !== nothing
@@ -2946,7 +2009,7 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            register_repl(id, port; pid = pid, metadata = metadata)
+            register_julia_session(id, port; pid = pid, metadata = metadata)
 
             send_jsonrpc_result(
                 http,
@@ -2955,7 +2018,7 @@ function handle_request(http::HTTP.Stream)
             )
             return nothing
         elseif method == "proxy/unregister"
-            # Unregister a REPL
+            # Unregister a Julia session
             params = get(request, "params", Dict())
             id = get(params, "id", nothing)
 
@@ -2970,7 +2033,7 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
 
-            unregister_repl(id)
+            unregister_julia_session(id)
 
             send_jsonrpc_result(
                 http,
@@ -2979,7 +2042,7 @@ function handle_request(http::HTTP.Stream)
             )
             return nothing
         elseif method == "proxy/heartbeat"
-            # REPL sends heartbeat to indicate it's alive
+            # Julia session sends heartbeat to indicate it's alive
             params = get(request, "params", Dict())
             id = get(params, "id", nothing)
 
@@ -2995,9 +2058,9 @@ function handle_request(http::HTTP.Stream)
             end
 
             # Update heartbeat and recover from disconnected/stopped state
-            lock(REPL_REGISTRY_LOCK) do
-                if haskey(REPL_REGISTRY, id)
-                    existing_session = REPL_REGISTRY[id]
+            lock(JULIA_SESSION_REGISTRY_LOCK) do
+                if haskey(JULIA_SESSION_REGISTRY, id)
+                    existing_session = JULIA_SESSION_REGISTRY[id]
                     heartbeat_pid = get(params, "pid", nothing)
 
                     # Check if this heartbeat is from the registered process
@@ -3010,15 +2073,17 @@ function handle_request(http::HTTP.Stream)
                         return nothing
                     end
 
-                    REPL_REGISTRY[id].last_heartbeat = now()
-                    REPL_REGISTRY[id].missed_heartbeats = 0  # Reset counter on successful heartbeat
+                    JULIA_SESSION_REGISTRY[id].last_heartbeat = now()
+                    JULIA_SESSION_REGISTRY[id].missed_heartbeats = 0  # Reset counter on successful heartbeat
                     # Automatically recover from disconnected or stopped state on heartbeat
-                    if REPL_REGISTRY[id].status in (:stopped, :disconnected, :reconnecting)
-                        old_status = REPL_REGISTRY[id].status
-                        REPL_REGISTRY[id].status = :ready
-                        REPL_REGISTRY[id].last_error = nothing
-                        REPL_REGISTRY[id].disconnect_time = nothing
-                        @info "REPL recovered via heartbeat" id = id old_status = old_status
+                    if JULIA_SESSION_REGISTRY[id].status in
+                       (:stopped, :disconnected, :reconnecting)
+                        old_status = JULIA_SESSION_REGISTRY[id].status
+                        JULIA_SESSION_REGISTRY[id].status = :ready
+                        JULIA_SESSION_REGISTRY[id].last_error = nothing
+                        JULIA_SESSION_REGISTRY[id].disconnect_time = nothing
+                        @info "Julia session recovered via heartbeat" id = id old_status =
+                            old_status
                     end
 
                     # Log heartbeat event (don't spam - could be rate limited in Dashboard module)
@@ -3038,7 +2103,7 @@ function handle_request(http::HTTP.Stream)
                             Dict(String(k) => v for (k, v) in pairs(metadata_raw))
 
                         # Register the session
-                        REPL_REGISTRY[id] = REPLConnection(
+                        JULIA_SESSION_REGISTRY[id] = JuliaSession(
                             id,
                             port,
                             pid,
@@ -3075,23 +2140,23 @@ function handle_request(http::HTTP.Stream)
             # Handle MCP initialize request according to spec
             # Check for X-MCPRepl-Target header to determine routing
             header_value = HTTP.header(req, "X-MCPRepl-Target")
-            target_repl_id = isempty(header_value) ? nothing : String(header_value)
+            target_julia_session_id = isempty(header_value) ? nothing : String(header_value)
 
             # Get initialization parameters
             params = get(request, "params", Dict())
             client_info = get(params, "clientInfo", Dict())
             client_name = get(client_info, "name", "unknown")
 
-            @info "MCP initialize request" target_repl_id = target_repl_id client_name =
+            @info "MCP initialize request" target_julia_session_id = target_julia_session_id client_name =
                 client_name
 
             # X-MCPRepl-Target header is optional
-            # If specified, session will route to that REPL
-            # If not specified, session can use proxy tools to list/select/start REPLs
+            # If specified, MCP session will route to that Julia session
+            # If not specified, session can use proxy tools to list/select/start julia_sessions
             # Session is always created as per MCP spec
 
-            # Create MCP session with optional target REPL mapping
-            session = create_mcp_session(target_repl_id)
+            # Create MCP session with optional target Julia session mapping
+            session = create_mcp_session(target_julia_session_id)
 
             # Initialize the session using the Session module for proper capability negotiation
             # Convert JSON.Object to Dict if necessary
@@ -3101,13 +2166,13 @@ function handle_request(http::HTTP.Stream)
 
             # Log session initialization
             log_db_event(
-                session.id,
                 "session.initialized",
                 Dict(
                     "client_name" => client_name,
-                    "target_repl_id" => target_repl_id,
+                    "target_julia_session_id" => target_julia_session_id,
                     "capabilities" => get(params_dict, "capabilities", Dict()),
-                ),
+                );
+                mcp_session_id = session.id,
             )
 
             # Register client connection for notifications
@@ -3192,25 +2257,25 @@ function handle_request(http::HTTP.Stream)
             # Get proxy tools (always available)
             proxy_tools = get_proxy_tool_schemas()
 
-            # Check if this request is from a session with a specific target REPL
+            # Check if this request is from an MCP session with a specific target Julia session
             session_id_header = HTTP.header(req, "Mcp-Session-Id")
-            target_repl_id = nothing
+            target_julia_session_id = nothing
 
             if !isempty(session_id_header)
                 session_id = String(session_id_header)
                 session = get_mcp_session(session_id)
                 if session !== nothing
                     update_activity!(session)
-                    target_repl_id = session.target_repl_id
-                    @debug "tools/list for session" session_id = session_id target_repl_id =
-                        target_repl_id
+                    target_julia_session_id = session.target_julia_session_id
+                    @debug "tools/list for session" session_id = session_id target_julia_session_id =
+                        target_julia_session_id
                 end
             end
 
-            # If no session or no target REPL, return only proxy tools
-            if target_repl_id === nothing
-                repls = list_repls()
-                @debug "tools/list - no target REPL" num_repls = length(repls) returning = "proxy tools only"
+            # If no session or no target Julia session, return only proxy tools
+            if target_julia_session_id === nothing
+                sessions = list_julia_sessions()
+                @debug "tools/list - no target session" num_sessions = length(sessions) returning = "proxy tools only"
 
                 send_jsonrpc_result(
                     http,
@@ -3220,17 +2285,17 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
 
-            # Fetch tools from the target REPL and combine with proxy tools
-            repl = get_repl(target_repl_id)
+            # Fetch tools from the target Julia session and combine with proxy tools
+            session = get_julia_session(target_julia_session_id)
             all_tools = copy(proxy_tools)
 
-            if repl !== nothing && repl.status == :ready
+            if session !== nothing && session.status == :ready
                 try
                     request_dict =
                         request isa Dict ? request :
                         Dict(String(k) => v for (k, v) in pairs(request))
 
-                    backend_url = "http://127.0.0.1:$(repl.port)/"
+                    backend_url = "http://127.0.0.1:$(session.port)/"
                     body_str = JSON.json(request_dict)
                     backend_response = HTTP.request(
                         "POST",
@@ -3248,21 +2313,22 @@ function handle_request(http::HTTP.Stream)
                            haskey(backend_data["result"], "tools")
                             backend_tools = backend_data["result"]["tools"]
                             append!(all_tools, backend_tools)
-                            @debug "tools/list - combined tools" target_repl_id =
-                                target_repl_id proxy_tools = length(proxy_tools) backend_tools =
+                            @debug "tools/list - combined tools" target_julia_session_id =
+                                target_julia_session_id proxy_tools = length(proxy_tools) backend_tools =
                                 length(backend_tools) total = length(all_tools)
                         end
                     end
                 catch e
-                    @warn "Failed to fetch tools from target REPL, returning proxy tools only" repl_id =
-                        target_repl_id exception = e
+                    @warn "Failed to fetch tools from target Julia session, returning proxy tools only" julia_session_id =
+                        target_julia_session_id exception = e
                 end
             else
-                @debug "Target REPL not ready, returning proxy tools only" target_repl_id =
-                    target_repl_id status = repl !== nothing ? repl.status : :not_found
+                @debug "Target Julia session not ready, returning proxy tools only" target_julia_session_id =
+                    target_julia_session_id status =
+                    session !== nothing ? session.status : :not_found
             end
 
-            # Return combined tools from proxy + target REPL
+            # Return combined tools from proxy + target Julia session
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
@@ -3281,18 +2347,18 @@ function handle_request(http::HTTP.Stream)
             # Handle proxy-level tools (always available)
             params = get(request, "params", Dict())
             tool_name = get(params, "name", "")
-            repls = list_repls()
+            julia_sessions = list_julia_sessions()
 
             # Log tool call start
             start_time = time()
             log_db_event(
-                log_session_id,
                 "tool.call.start",
                 Dict(
                     "tool_name" => tool_name,
                     "is_proxy_tool" => haskey(PROXY_TOOLS, tool_name),
                     "arguments" => get(params, "arguments", Dict()),
-                ),
+                );
+                mcp_session_id = log_session_id,
             )
 
             # Check if this is a proxy tool
@@ -3304,7 +2370,7 @@ function handle_request(http::HTTP.Stream)
                 result_text = if tool_name == "help"
                     tool.handler(args)
                 elseif tool_name in ["proxy_status", "list_julia_sessions"]
-                    tool.handler(args, repls)
+                    tool.handler(args, julia_sessions)
                 elseif tool_name == "dashboard_url"
                     tool.handler(args)
                 elseif tool_name == "start_julia_session"
@@ -3321,13 +2387,13 @@ function handle_request(http::HTTP.Stream)
                     # Log successful tool completion
                     duration_ms = (time() - start_time) * 1000
                     log_db_event(
-                        log_session_id,
                         "tool.call.complete",
                         Dict(
                             "tool_name" => tool_name,
                             "success" => true,
                             "result_length" => length(result_text),
                         );
+                        mcp_session_id = log_session_id,
                         duration_ms = duration_ms,
                     )
                     # Return result for other tools
@@ -3352,8 +2418,8 @@ function handle_request(http::HTTP.Stream)
                         # Avoid any process scanning which is slow
                         stale_processes = []
 
-                        lock(REPL_REGISTRY_LOCK) do
-                            for (session_name, conn) in REPL_REGISTRY
+                        lock(JULIA_SESSION_REGISTRY_LOCK) do
+                            for (session_name, conn) in JULIA_SESSION_REGISTRY
                                 pid = conn.pid
 
                                 # Check proxy port filter if specified
@@ -3400,8 +2466,8 @@ function handle_request(http::HTTP.Stream)
                                         run(`kill -9 $pid`)
                                         result_text *= "  ✅ Killed PID $pid ($session_name)\n"
                                         # Remove from registry if it was there
-                                        lock(REPL_REGISTRY_LOCK) do
-                                            delete!(REPL_REGISTRY, session_name)
+                                        lock(JULIA_SESSION_REGISTRY_LOCK) do
+                                            delete!(JULIA_SESSION_REGISTRY, session_name)
                                         end
                                     catch e
                                         result_text *= "  ❌ Failed to kill PID $pid: $e\n"
@@ -3436,12 +2502,12 @@ function handle_request(http::HTTP.Stream)
                 end
 
                 # Check if Julia session already exists
-                existing = findfirst(r -> r.id == session_name, repls)
+                existing = findfirst(s -> s.id == session_name, julia_sessions)
                 if existing !== nothing
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
-                        "Julia session '$session_name' is already running on port $(repls[existing].port)",
+                        "Julia session '$session_name' is already running on port $(julia_sessions[existing].port)",
                     )
                     return nothing
                 end
@@ -3497,16 +2563,16 @@ function handle_request(http::HTTP.Stream)
                     expected_id = session_name
                     for i = 1:300  # 30 seconds with 0.1s sleep
                         sleep(0.1)
-                        current_repls = list_repls()
+                        current_sessions = list_julia_sessions()
                         # Check for the expected registration ID
-                        idx = findfirst(r -> r.id == expected_id, current_repls)
+                        idx = findfirst(s -> s.id == expected_id, current_sessions)
                         if idx !== nothing
                             registered = true
-                            new_repl = current_repls[idx]
+                            new_session = current_sessions[idx]
                             send_mcp_tool_result(
                                 http,
                                 get(request, "id", nothing),
-                                "✅ Successfully started Julia session '$(new_repl.id)' on port $(new_repl.port)\n\nProject: $project_path\nPID: $(new_repl.pid)\nStatus: $(new_repl.status)\nLog: $log_file",
+                                "✅ Successfully started Julia session '$(new_session.id)' on port $(new_session.port)\n\nProject: $project_path\nPID: $(new_session.pid)\nStatus: $(new_session.status)\nLog: $log_file",
                             )
                             return nothing
                         end
@@ -3540,13 +2606,13 @@ function handle_request(http::HTTP.Stream)
                         http,
                         get(request, "id", nothing),
                         -32603,
-                        "Failed to start REPL backend: $(sprint(showerror, e))",
+                        "Failed to start Julia session backend: $(sprint(showerror, e))",
                     )
                     return nothing
                 end
             else
-                # Tool requires backend REPL - check if any are available
-                if isempty(repls)
+                # Tool requires backend Julia session - check if any are available
+                if isempty(julia_sessions)
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
@@ -3558,14 +2624,14 @@ function handle_request(http::HTTP.Stream)
                     request_dict =
                         request isa Dict ? request :
                         Dict(String(k) => v for (k, v) in pairs(request))
-                    route_to_repl_streaming(request_dict, req, http)
+                    route_to_session_streaming(request_dict, req, http)
                     return nothing
                 end
             end
         else
             # Unknown method - route to backend if available
-            repls = list_repls()
-            if isempty(repls)
+            julia_sessions = list_julia_sessions()
+            if isempty(julia_sessions)
                 # No backends available - return a friendly message
                 @debug "No backends available for method" method = method
                 send_jsonrpc_result(
@@ -3575,11 +2641,11 @@ function handle_request(http::HTTP.Stream)
                 )
                 return nothing
             else
-                # Route to backend REPL
+                # Route to backend Julia session
                 request_dict =
                     request isa Dict ? request :
                     Dict(String(k) => v for (k, v) in pairs(request))
-                route_to_repl_streaming(request_dict, req, http)
+                route_to_session_streaming(request_dict, req, http)
                 return nothing
             end
         end
@@ -3673,8 +2739,8 @@ function start_foreground_server(port::Int = 3000)
 
     # Set up dashboard to use database for event persistence
     Dashboard.set_db_callback!() do session_id, event_type, timestamp, data, duration_ms
-        # Dashboard events are primarily Julia REPL session events
-        # The session_id here is the Julia REPL ID
+        # Dashboard events are primarily Julia session events
+        # The session_id here is the Julia session ID
         # Note: timestamp parameter is ignored since log_event! generates its own
         try
             Database.log_event!(
