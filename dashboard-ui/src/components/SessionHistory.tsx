@@ -20,6 +20,7 @@ interface CombinedSession {
 
 export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initialSessionId }) => {
     const [internalSessionId, setInternalSessionId] = useState<string | null>(initialSessionId);
+    const [hasUserNavigated, setHasUserNavigated] = useState(false);
     const [timeline, setTimeline] = useState<TimelineItem[]>([]);
     const [summary, setSummary] = useState<SessionSummary | null>(null);
     const [loading, setLoading] = useState(false);
@@ -31,15 +32,15 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initi
     const [availableSessions, setAvailableSessions] = useState<CombinedSession[]>([]);
     const [loadingSessions, setLoadingSessions] = useState(false);
 
-    // Use internal session ID or the one passed from parent
-    const activeSessionId = internalSessionId || initialSessionId;
+    // Use internal session ID if user has navigated, otherwise use parent's session
+    const activeSessionId = hasUserNavigated ? internalSessionId : (internalSessionId || initialSessionId);
 
     // Update internal state when parent changes (e.g., when switching tabs)
     useEffect(() => {
-        if (initialSessionId) {
+        if (initialSessionId && !hasUserNavigated) {
             setInternalSessionId(initialSessionId);
         }
-    }, [initialSessionId]);
+    }, [initialSessionId, hasUserNavigated]);
 
     // Load available sessions when no session is selected
     useEffect(() => {
@@ -184,7 +185,10 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initi
                                 <div
                                     key={session.session_id}
                                     className={`session-card clickable ${session.isLive ? 'live' : 'archived'}`}
-                                    onClick={() => setInternalSessionId(session.session_id)}
+                                    onClick={() => {
+                                        setInternalSessionId(session.session_id);
+                                        setHasUserNavigated(true);
+                                    }}
                                 >
                                     <div className="session-card-header">
                                         <strong>{session.session_id}</strong>
@@ -244,7 +248,10 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initi
             <div className="history-header">
                 <button
                     className="back-button"
-                    onClick={() => setInternalSessionId(null)}
+                    onClick={() => {
+                        setInternalSessionId(null);
+                        setHasUserNavigated(true);
+                    }}
                     title="Back to session list"
                 >
                     ← Back to Sessions
