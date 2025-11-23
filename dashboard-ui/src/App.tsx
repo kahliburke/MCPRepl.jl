@@ -2,8 +2,13 @@ import React, { useEffect, useState, useRef } from 'react';
 import { fetchSessions, fetchEvents, subscribeToEvents, fetchTools, callTool, fetchLogs, fetchDirectories, shutdownSession, restartSession, listStaleSessions, killStaleSessions, ToolSchema, ToolsResponse } from './api';
 import { Session, SessionEvent } from './types';
 import { SessionCard } from './components/SessionCard';
-import { MetricCard } from './components/MetricCard';
+
 import { SessionHistory } from './components/SessionHistory';
+import { OverviewView } from './components/OverviewView';
+import { EventsView } from './components/EventsView';
+import { TerminalView } from './components/TerminalView';
+import { LogsView } from './components/LogsView';
+import { ToolsView } from './components/ToolsView';
 import { JsonViewer } from '@textea/json-viewer';
 import './App.css';
 import './quick-start.css';
@@ -854,385 +859,65 @@ export const App: React.FC = () => {
 
                     <div className="view-container">
                         {activeTab === 'overview' && (
-                            <div className="view active" id="overview-view">
-                                <h2>System Overview</h2>
-                                <div className="metrics-grid">
-                                    <MetricCard
-                                        icon="👥"
-                                        label="Total Sessions"
-                                        value={sessionCount}
-                                    />
-                                    <MetricCard
-                                        icon="⚡"
-                                        label="Active Agents"
-                                        value={Object.values(sessions).filter(a => a.status === 'ready').length}
-                                    />
-                                    <MetricCard
-                                        icon="📊"
-                                        label="Total Events"
-                                        value={eventCount}
-                                        onClick={() => {
-                                            setActiveTab('events');
-                                            setEventFilter('interesting');
-                                        }}
-                                    />
-                                    <MetricCard
-                                        icon="🔥"
-                                        label="Events/min"
-                                        value={events.filter(e => {
-                                            const eventTime = new Date(e.timestamp);
-                                            const now = new Date();
-                                            return (now.getTime() - eventTime.getTime()) < 60000;
-                                        }).length}
-                                    />
-                                    <MetricCard
-                                        icon="⚠️"
-                                        label="Errors"
-                                        value={events.filter(e => e.type === 'ERROR').length}
-                                        valueColor="#ef4444"
-                                        onClick={() => setShowErrorsModal(true)}
-                                    />
-                                    <MetricCard
-                                        icon="🔧"
-                                        label="Tool Calls"
-                                        value={events.filter(e => e.type === 'TOOL_CALL').length}
-                                        valueColor="#7dd3fc"
-                                        onClick={() => {
-                                            setActiveTab('events');
-                                            setEventFilter('TOOL_CALL');
-                                        }}
-                                    />
-                                    <MetricCard
-                                        icon="🧹"
-                                        label="Stale Sessions"
-                                        value={staleSessionCount}
-                                        valueColor={staleSessionCount > 0 ? "#f59e0b" : "#10b981"}
-                                        onClick={() => setShowStaleSessionsModal(true)}
-                                    />
-                                </div>
-                            </div>
+                            <OverviewView
+                                sessionCount={sessionCount}
+                                sessions={sessions}
+                                eventCount={eventCount}
+                                events={events}
+                                staleSessionCount={staleSessionCount}
+                                setActiveTab={setActiveTab}
+                                setEventFilter={setEventFilter}
+                                setShowErrorsModal={setShowErrorsModal}
+                                setShowStaleSessionsModal={setShowStaleSessionsModal}
+                            />
                         )}
 
                         {activeTab === 'events' && (
-                            <div className="view active" id="events-view">
-                                <div className="events-header">
-                                    <h2>Recent Events</h2>
-                                    <div className="event-filters">
-                                        {['interesting', 'TOOL_CALL', 'CODE_EXECUTION', 'OUTPUT', 'ERROR', 'all'].map(filter => (
-                                            <button
-                                                key={filter}
-                                                className={`filter-btn ${eventFilter === filter ? 'active' : ''}`}
-                                                onClick={() => setEventFilter(filter)}
-                                            >
-                                                {filter === 'interesting' ? 'Interesting' : filter === 'all' ? 'All' : filter.replace('_', ' ')}
-                                            </button>
-                                        ))}
-                                    </div>
-                                </div>
-                                <div id="event-list" className="event-list">
-                                    {events
-                                        .filter(e => {
-                                            if (eventFilter === 'interesting') return e.type !== 'HEARTBEAT';
-                                            if (eventFilter === 'all') return true;
-                                            return e.type === eventFilter;
-                                        })
-                                        .slice(0, 100)
-                                        .reverse()
-                                        .map((event, idx) => (
-                                            <div key={idx} className={`event event-${event.type.toLowerCase()}`} onClick={() => setSelectedEvent(event)}>
-                                                <div className="event-type">{event.type}</div>
-                                                <div className="event-header">
-                                                    <span className="event-session">{event.id}</span>
-                                                    <span className="event-time">{event.timestamp}</span>
-                                                    {event.duration_ms && (
-                                                        <span className="event-duration">{event.duration_ms.toFixed(2)}ms</span>
-                                                    )}
-                                                </div>
-                                                <div className="event-body">
-                                                    {event.data.description || event.data.tool || event.data.method || JSON.stringify(event.data)}
-                                                </div>
-                                            </div>
-                                        ))}
-                                </div>
-                            </div>
+                            <EventsView
+                                events={events}
+                                eventFilter={eventFilter}
+                                setEventFilter={setEventFilter}
+                                setSelectedEvent={setSelectedEvent}
+                            />
                         )}
 
                         {activeTab === 'terminal' && (
-                            <div className="view active terminal-view" id="terminal-view">
-                                <div className="terminal-controls">
-                                    <input
-                                        type="text"
-                                        placeholder="Search terminal..."
-                                        className="terminal-search"
-                                        onChange={(e) => setTerminalSearch(e.target.value)}
-                                    />
-                                    <button onClick={() => terminalRef.current?.scrollTo({ top: 0, behavior: 'smooth' })} className="terminal-control-btn">↑ Top</button>
-                                    <button onClick={() => terminalBottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })} className="terminal-control-btn">↓ Bottom</button>
-                                </div>
-                                <div className="terminal">
-                                    <div className="terminal-output" ref={terminalRef} onScroll={handleTerminalScroll}>
-                                        {selectedSession ? (
-                                            events
-                                                .filter(e => e.id === selectedSession && e.type !== 'HEARTBEAT')
-                                                .slice(-1000)
-                                                .filter(event => {
-                                                    if (!terminalSearch) return true;
-                                                    const searchLower = terminalSearch.toLowerCase();
-                                                    const eventStr = JSON.stringify(event.data).toLowerCase();
-                                                    return eventStr.includes(searchLower);
-                                                })
-                                                .map((event, idx) => {
-                                                    const renderEvent = () => {
-                                                        switch (event.type) {
-                                                            case 'TOOL_CALL':
-                                                                // For ex tool, show the actual Julia expression
-                                                                if (event.data.tool === 'ex') {
-                                                                    const expr = event.data.arguments?.e || '';
-                                                                    return (
-                                                                        <>
-                                                                            <span className="terminal-prompt">julia&gt;</span>
-                                                                            <span className="terminal-code">{expr}</span>
-                                                                        </>
-                                                                    );
-                                                                }
-                                                                // For other tools, show tool name and args
-                                                                return (
-                                                                    <>
-                                                                        <span className="terminal-prompt">julia&gt;</span>
-                                                                        <span className="terminal-tool">{event.data.tool}</span>
-                                                                        <span className="terminal-args">({JSON.stringify(event.data.arguments).slice(0, 60)}...)</span>
-                                                                    </>
-                                                                );
-                                                            case 'CODE_EXECUTION':
-                                                                return (
-                                                                    <>
-                                                                        <span className="terminal-prompt">julia&gt;</span>
-                                                                        <span className="terminal-method">{event.data.method}</span>
-                                                                    </>
-                                                                );
-                                                            case 'OUTPUT':
-                                                                // Extract the actual content from the result
-                                                                let output = '';
-                                                                if (event.data.result?.content) {
-                                                                    // MCP result format with content array
-                                                                    const contents = event.data.result.content;
-                                                                    if (Array.isArray(contents)) {
-                                                                        output = contents.map((c: any) => c.text || '').join('\n');
-                                                                    }
-                                                                } else if (event.data.result) {
-                                                                    output = typeof event.data.result === 'string'
-                                                                        ? event.data.result
-                                                                        : JSON.stringify(event.data.result, null, 2);
-                                                                }
-
-                                                                return (
-                                                                    <>
-                                                                        <span className="terminal-output-text">{output || '(no output)'}</span>
-                                                                        {event.duration_ms && <span className="terminal-duration"> [{event.duration_ms.toFixed(1)}ms]</span>}
-                                                                    </>
-                                                                );
-                                                            case 'ERROR':
-                                                                return (
-                                                                    <>
-                                                                        <span className="terminal-error">ERROR: {event.data.message || JSON.stringify(event.data)}</span>
-                                                                    </>
-                                                                );
-                                                            case 'SESSION_START':
-                                                                return <span className="terminal-info">→ Session started on port {event.data.port}</span>;
-                                                            case 'SESSION_STOP':
-                                                                return <span className="terminal-info">→ Session stopped</span>;
-                                                            case 'PROGRESS':
-                                                                const progressData = event.data.notification?.params;
-                                                                if (progressData) {
-                                                                    const { progress, total, message } = progressData;
-                                                                    const progressText = total !== undefined
-                                                                        ? `${Math.round((progress / total) * 100)}%`
-                                                                        : `step ${progress}`;
-                                                                    return (
-                                                                        <span className="terminal-info">
-                                                                            🔄 {message || 'Processing'} ({progressText})
-                                                                        </span>
-                                                                    );
-                                                                }
-                                                                return <span className="terminal-default">{JSON.stringify(event.data)}</span>;
-                                                            default:
-                                                                return <span className="terminal-default">{JSON.stringify(event.data)}</span>;
-                                                        }
-                                                    };
-
-                                                    return (
-                                                        <div key={idx} className={`terminal-line terminal-${event.type.toLowerCase()}`}>
-                                                            <span className="terminal-time">{event.timestamp.split(' ')[1]}</span>
-                                                            {renderEvent()}
-                                                        </div>
-                                                    );
-                                                })
-                                        ) : (
-                                            <div className="log-placeholder">← Select a session from the sidebar to view its REPL activity</div>
-                                        )}
-                                        <div ref={terminalBottomRef} />
-                                    </div>
-                                </div>
-                            </div>
+                            <TerminalView
+                                events={events}
+                                selectedSession={selectedSession}
+                                terminalSearch={terminalSearch}
+                                setTerminalSearch={setTerminalSearch}
+                                terminalRef={terminalRef}
+                                terminalBottomRef={terminalBottomRef}
+                                handleTerminalScroll={handleTerminalScroll}
+                            />
                         )}
 
                         {activeTab === 'logs' && (
-                            <div className="view active" id="logs-view">
-                                <h2>📋 Session Logs</h2>
-                                <p className="view-description">
-                                    View startup and runtime logs for Julia sessions. Click any session card to view its logs,
-                                    or use the dropdown below to access logs from previously ended sessions.
-                                </p>
-
-                                <div className="logs-controls">
-                                    <select
-                                        value={logSessionId || ''}
-                                        onChange={(e) => {
-                                            const sessionId = e.target.value;
-                                            setLogSessionId(sessionId);
-                                            if (sessionId) {
-                                                fetchLogs(sessionId).then(data => {
-                                                    if (data.content) setLogContent(data.content);
-                                                    else if (data.error) setLogContent(`Error: ${data.error}`);
-                                                });
-                                            }
-                                        }}
-                                        className="log-session-select"
-                                    >
-                                        <option value="">Select a session...</option>
-                                        {Object.keys(sessions).map(sessionId => (
-                                            <option key={sessionId} value={sessionId}>{sessionId}</option>
-                                        ))}
-                                    </select>                                    <label className="auto-refresh-label">
-                                        <input
-                                            type="checkbox"
-                                            checked={autoRefreshLogs}
-                                            onChange={(e) => setAutoRefreshLogs(e.target.checked)}
-                                        />
-                                        Auto-refresh (2s)
-                                    </label>
-
-                                    <button
-                                        onClick={() => {
-                                            if (logSessionId) {
-                                                fetchLogs(logSessionId).then(data => {
-                                                    if (data.content) {
-                                                        setLogContent(data.content);
-                                                        // Scroll to bottom after refresh
-                                                        setTimeout(() => {
-                                                            if (logsViewerRef.current) {
-                                                                logsViewerRef.current.scrollTop = logsViewerRef.current.scrollHeight;
-                                                            }
-                                                        }, 0);
-                                                    }
-                                                    else if (data.error) setLogContent(`Error: ${data.error}`);
-                                                });
-                                            }
-                                        }}
-                                        className="refresh-logs-btn"
-                                        disabled={!logSessionId}
-                                    >
-                                        🔄 Refresh
-                                    </button>
-                                </div>
-
-                                <div className="logs-viewer" ref={logsViewerRef}>
-                                    <pre className="log-content" dangerouslySetInnerHTML={{
-                                        __html: logContent ? convertAnsiToHtml(logContent) : 'Select a session to view logs'
-                                    }} />
-                                </div>
-                            </div>
+                            <LogsView
+                                sessions={sessions}
+                                logSessionId={logSessionId}
+                                setLogSessionId={setLogSessionId}
+                                logContent={logContent}
+                                setLogContent={setLogContent}
+                                autoRefreshLogs={autoRefreshLogs}
+                                setAutoRefreshLogs={setAutoRefreshLogs}
+                                logsViewerRef={logsViewerRef}
+                                fetchLogs={fetchLogs}
+                                convertAnsiToHtml={convertAnsiToHtml}
+                            />
                         )}
 
                         {activeTab === 'tools' && (
-                            <div className="view active" id="tools-view">
-                                <h2>🛠️ Tools Explorer</h2>
-                                <p className="view-description">Browse and learn about available MCP tools</p>
-
-                                <div className="tools-selector">
-                                    <button
-                                        className={`tools-tab ${selectedToolSession === null ? 'active' : ''}`}
-                                        onClick={() => {
-                                            setSelectedToolSession(null);
-                                            fetchTools().then(setTools);
-                                        }}
-                                    >
-                                        Proxy Tools
-                                    </button>
-                                    {Object.keys(sessions).map(sessionId => (
-                                        <button
-                                            key={sessionId}
-                                            className={`tools-tab ${selectedToolSession === sessionId ? 'active' : ''}`}
-                                            onClick={() => {
-                                                setSelectedToolSession(sessionId);
-                                                fetchTools(sessionId).then(setTools);
-                                            }}
-                                        >
-                                            {sessionId} Tools
-                                        </button>
-                                    ))}
-                                </div>
-
-                                {tools && (
-                                    <div className="tools-grid">
-                                        {selectedToolSession === null ? (
-                                            // Show proxy tools
-                                            tools.proxy_tools.map((tool: ToolSchema) => (
-                                                <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
-                                                    <div className="tool-header">
-                                                        <h3 className="tool-name">🔧 {tool.name}</h3>
-                                                        <span className="tool-badge proxy-badge">Proxy</span>
-                                                    </div>
-                                                    <p className="tool-description">{tool.description}</p>
-
-                                                    {tool.inputSchema?.properties && Object.keys(tool.inputSchema.properties).length > 0 && (
-                                                        <div className="tool-params">
-                                                            <h4>Parameters:</h4>
-                                                            <ul>
-                                                                {Object.entries(tool.inputSchema.properties).map(([name, schema]: [string, any]) => (
-                                                                    <li key={name}>
-                                                                        <code className="param-name">{name}</code>
-                                                                        {tool.inputSchema.required?.includes(name) && <span className="required">*</span>}
-                                                                        {schema.type && <span className="param-type">({schema.type})</span>}
-                                                                        {schema.description && <p className="param-desc">{schema.description}</p>}
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            ))
-                                        ) : (
-                                            // Show agent tools
-                                            tools.session_tools[selectedToolSession]?.map((tool: ToolSchema) => (
-                                                <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
-                                                    <div className="tool-header">
-                                                        <h3 className="tool-name">⚡ {tool.name}</h3>
-                                                        <span className="tool-badge agent-badge">Julia</span>
-                                                    </div>
-                                                    <p className="tool-description">{tool.description}</p>
-
-                                                    {tool.inputSchema?.properties && Object.keys(tool.inputSchema.properties).length > 0 && (
-                                                        <div className="tool-params">
-                                                            <h4>Parameters:</h4>
-                                                            <ul>
-                                                                {Object.entries(tool.inputSchema.properties).map(([name, schema]: [string, any]) => (
-                                                                    <li key={name}>
-                                                                        <code className="param-name">{name}</code>
-                                                                        {tool.inputSchema.required?.includes(name) && <span className="required">*</span>}
-                                                                        {schema.type && <span className="param-type">({schema.type})</span>}
-                                                                        {schema.description && <p className="param-desc">{schema.description}</p>}
-                                                                    </li>
-                                                                ))}
-                                                            </ul>
-                                                        </div>
-                                                    )}
-                                                </div>
-                                            ))
-                                        )}
-                                    </div>
-                                )}
-                            </div>
+                            <ToolsView
+                                sessions={sessions}
+                                tools={tools}
+                                selectedToolSession={selectedToolSession}
+                                setSelectedToolSession={setSelectedToolSession}
+                                setTools={setTools}
+                                setSelectedTool={setSelectedTool}
+                                fetchTools={fetchTools}
+                            />
                         )}
                     </div>
                 </main>

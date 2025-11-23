@@ -4,7 +4,6 @@
     overflow-y: auto;
 }
 
-.session-history.empty,
 .session-history.loading,
 .session-history.error {
     display: flex;
@@ -46,10 +45,12 @@
     margin-bottom: 20px;
 }
 
-.history-summary h3 {
+.history-summary h3,
+.history-summary h4 {
     margin: 0 0 15px 0;
-    font-size: 18px;
+    font-size: 16px;
     color: #fff;
+    font-weight: 600;
 }
 
 .summary-stats {
@@ -230,4 +231,160 @@
 .empty-state p {
     margin: 0;
     font-size: 16px;
+}
+
+/* History header with back button */
+.history-header {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-bottom: 20px;
+    padding-bottom: 15px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.history-header h3 {
+    margin: 0;
+    font-size: 16px;
+    color: #fff;
+}
+
+.back-button {
+    padding: 8px 16px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 6px;
+    color: #2196F3;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+
+.back-button:hover {
+    background: rgba(33, 150, 243, 0.1);
+    border-color: rgba(33, 150, 243, 0.3);
+    transform: translateX(-2px);
+}
+
+/* Session selector styles */
+.session-history.empty {
+    display: block;
+    padding: 30px;
+}
+
+.history-intro {
+    text-align: center;
+    margin-bottom: 30px;
+}
+
+.history-intro h3 {
+    margin-bottom: 10px;
+    color: #fff;
+}
+
+.history-intro .hint {
+    color: #888;
+    font-size: 13px;
+    margin: 0;
+}
+
+.loading-sessions {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+}
+
+.no-sessions {
+    text-align: center;
+    color: #888;
+    font-size: 14px;
+}
+
+.session-list {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+.session-list-help {
+    text-align: center;
+    color: #888;
+    margin-bottom: 20px;
+    font-size: 14px;
+}
+
+.session-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 15px;
+}
+
+.session-card.clickable {
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.session-card.clickable:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    border-color: #2196F3;
+}
+
+.session-card.live {
+    border-left: 3px solid #4CAF50;
+}
+
+.session-card.archived {
+    opacity: 0.8;
+}
+
+.session-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.session-card-header strong {
+    font-size: 14px;
+    color: #fff;
+}
+
+.status-badge {
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.status-badge.active {
+    background: rgba(76, 175, 80, 0.2);
+    color: #4CAF50;
+}
+
+.status-badge.ended {
+    background: rgba(158, 158, 158, 0.2);
+    color: #9E9E9E;
+}
+
+.session-card-details {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.detail-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.detail-row .label {
+    color: #888;
+}
+
+.detail-row .value {
+    color: #fff;
 }

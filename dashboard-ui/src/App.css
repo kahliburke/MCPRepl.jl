@@ -926,69 +926,61 @@ h1 {
     border-radius: 4px;
 }
 
-/* Modal */
-.modal-overlay {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.85);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 1000;
-    backdrop-filter: blur(4px);
-}
-
+/* Event Details Modal */
 .modal {
     background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 8px;
-    max-width: 700px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    max-width: 800px;
     width: 90%;
-    max-height: 80vh;
-    overflow: auto;
-    box-shadow: 0 0 40px rgba(125, 211, 252, 0.15);
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    animation: modalSlideIn 0.2s ease-out;
 }
 
-.modal-header {
+.modal .modal-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
     padding: 1.5rem;
-    border-bottom: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
 }
 
-.modal-header h2 {
+.modal .modal-header h2 {
     margin: 0;
     color: var(--accent-primary);
     font-size: 1.5rem;
+    font-weight: 600;
 }
 
-.modal-close {
-    background: none;
+.modal .modal-close {
+    background: transparent;
     border: none;
-    color: var(--text-secondary);
-    font-size: 2rem;
+    color: var(--text-tertiary);
+    font-size: 1.5rem;
     cursor: pointer;
     padding: 0;
-    width: 32px;
-    height: 32px;
+    width: 36px;
+    height: 36px;
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 4px;
+    border-radius: 6px;
     transition: all 0.2s;
 }
 
-.modal-close:hover {
-    background: var(--bg-tertiary);
-    color: var(--accent-primary);
+.modal .modal-close:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
 }
 
-.modal-content {
+.modal .modal-content {
     padding: 1.5rem;
+    overflow-y: auto;
+    flex: 1;
 }
 
 .detail-row {

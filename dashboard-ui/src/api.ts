@@ -364,3 +364,133 @@ export async function fetchDBSessions(limit: number = 100): Promise<DBSession[]>
     if (!response.ok) throw new Error('Failed to fetch database sessions');
     return response.json();
 }
+
+// ============================================================================
+// Analytics API - Structured analytics from ETL
+// ============================================================================
+
+export interface ToolExecution {
+    id: number;
+    session_id: string;
+    request_id: string;
+    tool_name: string;
+    tool_method: string | null;
+    request_time: string;
+    response_time: string | null;
+    duration_ms: number | null;
+    input_size: number;
+    output_size: number;
+    argument_count: number;
+    status: 'success' | 'error' | 'pending';
+    result_type: string | null;
+    result_summary: string | null;
+}
+
+export interface AnalyticsError {
+    id: number;
+    session_id: string;
+    timestamp: string;
+    error_type: string;
+    error_code: number | null;
+    error_category: string | null;
+    tool_name: string | null;
+    method: string | null;
+    request_id: string | null;
+    message: string;
+    stack_trace: string | null;
+    resolved: boolean;
+}
+
+export interface ToolSummary {
+    tool_name: string;
+    total_executions: number;
+    avg_duration_ms: number | null;
+    min_duration_ms: number | null;
+    max_duration_ms: number | null;
+    total_errors: number;
+    avg_error_rate_pct: number | null;
+}
+
+export interface ErrorHotspot {
+    tool_name: string | null;
+    error_type: string;
+    error_category: string;
+    error_count: number;
+    affected_sessions: number;
+    last_occurrence: string;
+}
+
+export interface ETLStatus {
+    last_processed_interaction_id: number;
+    last_processed_event_id: number;
+    last_run_time: string | null;
+    last_run_status: string | null;
+    last_error: string | null;
+}
+
+export async function fetchToolExecutions(filters?: {
+    session_id?: string;
+    tool_name?: string;
+    status?: string;
+    limit?: number;
+}): Promise<ToolExecution[]> {
+    const params = new URLSearchParams();
+    if (filters?.session_id) params.set('session_id', filters.session_id);
+    if (filters?.tool_name) params.set('tool_name', filters.tool_name);
+    if (filters?.status) params.set('status', filters.status);
+    params.set('limit', (filters?.limit || 100).toString());
+
+    const response = await fetch(`${API_BASE}/analytics/tool-executions?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch tool executions');
+    return response.json();
+}
+
+export async function fetchAnalyticsErrors(filters?: {
+    session_id?: string;
+    tool_name?: string;
+    error_type?: string;
+    resolved?: boolean;
+    limit?: number;
+}): Promise<AnalyticsError[]> {
+    const params = new URLSearchParams();
+    if (filters?.session_id) params.set('session_id', filters.session_id);
+    if (filters?.tool_name) params.set('tool_name', filters.tool_name);
+    if (filters?.error_type) params.set('error_type', filters.error_type);
+    if (filters?.resolved !== undefined) params.set('resolved', filters.resolved.toString());
+    params.set('limit', (filters?.limit || 100).toString());
+
+    const response = await fetch(`${API_BASE}/analytics/errors?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch analytics errors');
+    return response.json();
+}
+
+export async function fetchToolSummary(filters?: {
+    session_id?: string;
+    days?: number;
+}): Promise<ToolSummary[]> {
+    const params = new URLSearchParams();
+    if (filters?.session_id) params.set('session_id', filters.session_id);
+    if (filters?.days) params.set('days', filters.days.toString());
+
+    const response = await fetch(`${API_BASE}/analytics/tool-summary?${params}`);
+    if (!response.ok) throw new Error('Failed to fetch tool summary');
+    return response.json();
+}
+
+export async function fetchErrorHotspots(): Promise<ErrorHotspot[]> {
+    const response = await fetch(`${API_BASE}/analytics/error-hotspots`);
+    if (!response.ok) throw new Error('Failed to fetch error hotspots');
+    return response.json();
+}
+
+export async function runETL(): Promise<any> {
+    const response = await fetch(`${API_BASE}/analytics/run-etl`);
+    if (!response.ok) throw new Error('Failed to run ETL');
+    return response.json();
+}
+
+export async function fetchETLStatus(): Promise<ETLStatus> {
+    const response = await fetch(`${API_BASE}/analytics/etl-status`);
+    if (!response.ok) throw new Error('Failed to fetch ETL status');
+    return response.json();
+}

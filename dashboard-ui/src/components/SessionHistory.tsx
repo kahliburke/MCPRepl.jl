@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { fetchSessionTimeline, fetchSessionSummary, TimelineItem, SessionSummary } from '../api';
+import { fetchSessionTimeline, fetchSessionSummary, fetchDBSessions, fetchSessions, TimelineItem, SessionSummary } from '../api';
+import { Session } from '../types';
 import { JsonViewer } from '@textea/json-viewer';
 import './SessionHistory.css';
 
@@ -7,7 +8,18 @@ interface SessionHistoryProps {
     sessionId: string | null;
 }
 
-export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => {
+interface CombinedSession {
+    session_id: string;
+    start_time?: string;
+    last_activity?: string;
+    status: string;
+    metadata?: string;
+    isLive: boolean;
+    liveSession?: Session;
+}
+
+export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId: initialSessionId }) => {
+    const [internalSessionId, setInternalSessionId] = useState<string | null>(initialSessionId);
     const [timeline, setTimeline] = useState<TimelineItem[]>([]);
     const [summary, setSummary] = useState<SessionSummary | null>(null);
     const [loading, setLoading] = useState(false);
@@ -16,11 +28,69 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
     const [directionFilter, setDirectionFilter] = useState<'all' | 'inbound' | 'outbound'>('all');
     const [selectedItem, setSelectedItem] = useState<TimelineItem | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
+    const [availableSessions, setAvailableSessions] = useState<CombinedSession[]>([]);
+    const [loadingSessions, setLoadingSessions] = useState(false);
 
+    // Use internal session ID or the one passed from parent
+    const activeSessionId = internalSessionId || initialSessionId;
+
+    // Update internal state when parent changes (e.g., when switching tabs)
     useEffect(() => {
-        if (!sessionId) {
+        if (initialSessionId) {
+            setInternalSessionId(initialSessionId);
+        }
+    }, [initialSessionId]);
+
+    // Load available sessions when no session is selected
+    useEffect(() => {
+        if (!activeSessionId) {
             setTimeline([]);
             setSummary(null);
+
+            const loadSessions = async () => {
+                setLoadingSessions(true);
+                try {
+                    // Fetch both live sessions and database sessions
+                    const [liveSessions, dbSessions] = await Promise.all([
+                        fetchSessions(),
+                        fetchDBSessions(50)
+                    ]);
+
+                    // Combine them, prioritizing live sessions
+                    const combined: CombinedSession[] = [];
+                    const seen = new Set<string>();
+
+                    // Add live sessions first
+                    for (const [id, session] of Object.entries(liveSessions)) {
+                        seen.add(id);
+                        combined.push({
+                            session_id: id,
+                            status: 'connected',
+                            isLive: true,
+                            liveSession: session
+                        });
+                    }
+
+                    // Add database sessions that aren't currently live
+                    for (const dbSession of dbSessions) {
+                        if (!seen.has(dbSession.session_id)) {
+                            combined.push({
+                                ...dbSession,
+                                isLive: false
+                            });
+                        }
+                    }
+
+                    setAvailableSessions(combined);
+                } catch (err) {
+                    console.error('Failed to load sessions:', err);
+                    setAvailableSessions([]);
+                } finally {
+                    setLoadingSessions(false);
+                }
+            };
+
+            loadSessions();
             return;
         }
 
@@ -29,8 +99,8 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
             setError(null);
             try {
                 const [timelineData, summaryData] = await Promise.all([
-                    fetchSessionTimeline(sessionId),
-                    fetchSessionSummary(sessionId)
+                    fetchSessionTimeline(activeSessionId),
+                    fetchSessionSummary(activeSessionId)
                 ]);
                 setTimeline(timelineData);
                 setSummary(summaryData);
@@ -43,7 +113,7 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
         };
 
         loadData();
-    }, [sessionId]);
+    }, [activeSessionId]);
 
     const filteredTimeline = timeline.filter(item => {
         // Apply type filter
@@ -94,10 +164,61 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
         }
     };
 
-    if (!sessionId) {
+    if (!activeSessionId) {
         return (
             <div className="session-history empty">
-                <p>Select a session to view its history</p>
+                <div className="history-intro">
+                    <h3>📋 Select a Session</h3>
+                    <p className="hint">Use the tabs above to navigate to Overview, Events, Terminal, Tools, Logs, or Analytics</p>
+                </div>
+                {loadingSessions ? (
+                    <div className="loading-sessions">
+                        <div className="spinner"></div>
+                        <p>Loading sessions...</p>
+                    </div>
+                ) : availableSessions.length === 0 ? (
+                    <p className="no-sessions">No sessions found. Start a REPL session to see history.</p>
+                ) : (
+                    <div className="session-list">
+                        <p className="session-list-help">Select a session to view its detailed history:</p>
+                        <div className="session-cards">
+                            {availableSessions.slice(0, 20).map(session => (
+                                <div
+                                    key={session.session_id}
+                                    className={`session-card clickable ${session.isLive ? 'live' : 'archived'}`}
+                                    onClick={() => setInternalSessionId(session.session_id)}
+                                >
+                                    <div className="session-card-header">
+                                        <strong>{session.session_id}</strong>
+                                        <span className={`status-badge ${session.status}`}>
+                                            {session.isLive ? '🟢 Live' : session.status}
+                                        </span>
+                                    </div>
+                                    <div className="session-card-details">
+                                        {session.start_time && (
+                                            <div className="detail-row">
+                                                <span className="label">Started:</span>
+                                                <span className="value">{new Date(session.start_time).toLocaleString()}</span>
+                                            </div>
+                                        )}
+                                        {session.last_activity && (
+                                            <div className="detail-row">
+                                                <span className="label">Last Activity:</span>
+                                                <span className="value">{new Date(session.last_activity).toLocaleString()}</span>
+                                            </div>
+                                        )}
+                                        {session.isLive && session.liveSession && (
+                                            <div className="detail-row">
+                                                <span className="label">Connection:</span>
+                                                <span className="value">Active</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                )}
             </div>
         );
     }
@@ -121,10 +242,22 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
 
     return (
         <div className="session-history">
+            {/* Back Button */}
+            <div className="history-header">
+                <button
+                    className="back-button"
+                    onClick={() => setInternalSessionId(null)}
+                    title="Back to session list"
+                >
+                    ← Back to Sessions
+                </button>
+                <h3>Session: {activeSessionId}</h3>
+            </div>
+
             {/* Summary Section */}
             {summary && (
                 <div className="history-summary">
-                    <h3>Session Summary</h3>
+                    <h4>Summary</h4>
                     <div className="summary-stats">
                         <div className="stat">
                             <span className="stat-label">Total Interactions:</span>
@@ -205,7 +338,7 @@ export const SessionHistory: React.FC<SessionHistoryProps> = ({ sessionId }) => 
                                     <h4>Content:</h4>
                                     <JsonViewer
                                         value={parseContent(item.content)}
-                                        collapsed={2}
+                                        defaultInspectDepth={2}
                                         theme="dark"
                                     />
                                 </div>
