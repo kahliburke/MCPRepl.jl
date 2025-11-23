@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { fetchSessions, fetchEvents, subscribeToEvents, fetchTools, callTool, fetchLogs, shutdownSession, restartSession, listStaleSessions, killStaleSessions, ToolSchema, ToolsResponse } from './api';
+import { fetchSessions, fetchEvents, subscribeToEvents, fetchTools, callTool, fetchLogs, fetchDirectories, shutdownSession, restartSession, listStaleSessions, killStaleSessions, ToolSchema, ToolsResponse } from './api';
 import { Session, SessionEvent } from './types';
 import { SessionCard } from './components/SessionCard';
 
@@ -14,8 +14,7 @@ import { ErrorsModal } from './components/ErrorsModal';
 import { StaleSessionsModal } from './components/StaleSessionsModal';
 import { QuickStartModal } from './components/QuickStartModal';
 import { EventDetailsModal } from './components/EventDetailsModal';
-import { ToolDetailsModal } from './components/ToolDetailsModal';
-
+import { JsonViewer } from '@textea/json-viewer';
 import './App.css';
 import './quick-start.css';
 
@@ -87,6 +86,9 @@ export const App: React.FC = () => {
     const [tools, setTools] = useState<ToolsResponse | null>(null);
     const [selectedToolSession, setSelectedToolSession] = useState<string | null>(null);
     const [selectedTool, setSelectedTool] = useState<ToolSchema | null>(null);
+    const [toolParams, setToolParams] = useState<Record<string, any>>({});
+    const [toolResult, setToolResult] = useState<any>(null);
+    const [toolExecuting, setToolExecuting] = useState(false);
     const [logContent, setLogContent] = useState<string>('');
     const [logSessionId, setLogSessionId] = useState<string | null>(null);
     const [autoRefreshLogs, setAutoRefreshLogs] = useState(false);
@@ -775,11 +777,290 @@ export const App: React.FC = () => {
             </div>
 
             {selectedTool && (
-                <ToolDetailsModal
-                    tool={selectedTool}
-                    selectedToolSession={selectedToolSession}
-                    onClose={() => setSelectedTool(null)}
-                />
+                <div className="modal-overlay" onClick={() => { setSelectedTool(null); setToolParams({}); setToolResult(null); }}>
+                    <div className="modal" onClick={(e) => e.stopPropagation()}>
+                        <div className="modal-header">
+                            <h2>Tool Details: {selectedTool.name}</h2>
+                            <button className="modal-close" onClick={() => { setSelectedTool(null); setToolParams({}); setToolResult(null); }}>×</button>
+                        </div>
+                        <div className="modal-content">
+                            <div className="detail-row">
+                                <span className="detail-label">Name:</span>
+                                <span className="detail-value"><code>{selectedTool.name}</code></span>
+                            </div>
+                            <div className="detail-row">
+                                <span className="detail-label">Description:</span>
+                                <span className="detail-value">{selectedTool.description}</span>
+                            </div>
+
+                            {selectedTool.inputSchema?.properties && Object.keys(selectedTool.inputSchema.properties).length > 0 && (
+                                <div className="tool-test-section">
+                                    <h3>Test Tool</h3>
+                                    <div className="tool-params-form">
+                                        {Object.entries(selectedTool.inputSchema.properties).map(([name, schema]: [string, any]) => (
+                                            <div key={name} className="param-input-group">
+                                                <label>
+                                                    {name}
+                                                    {selectedTool.inputSchema.required?.includes(name) && <span className="required">*</span>}
+                                                    <span className="param-type">({schema.type})</span>
+                                                </label>
+                                                {schema.description && <p className="param-help">{schema.description}</p>}
+                                                {schema.type === 'boolean' ? (
+                                                    <select
+                                                        value={toolParams[name] ?? ''}
+                                                        onChange={(e) => setToolParams({ ...toolParams, [name]: e.target.value === 'true' })}
+                                                        className="param-input"
+                                                    >
+                                                        <option value="">Select...</option>
+                                                        <option value="true">true</option>
+                                                        <option value="false">false</option>
+                                                    </select>
+                                                ) : schema.type === 'number' || schema.type === 'integer' ? (
+                                                    <input
+                                                        type="number"
+                                                        value={toolParams[name] ?? ''}
+                                                        onChange={(e) => setToolParams({ ...toolParams, [name]: e.target.valueAsNumber })}
+                                                        className="param-input"
+                                                        placeholder={`Enter ${name}...`}
+                                                    />
+                                                ) : name === 'project_path' || name.includes('path') || name.includes('directory') || name.includes('dir') ? (
+                                                    <>
+                                                        <input
+                                                            type="text"
+                                                            value={toolParams[name] ?? ''}
+                                                            onChange={async (e) => {
+                                                                const value = e.target.value;
+                                                                setToolParams({ ...toolParams, [name]: value });
+
+                                                                // Fetch directory suggestions and check if Julia project
+                                                                if (value.length > 0) {
+                                                                    try {
+                                                                        const result = await fetchDirectories(value);
+                                                                        setPathSuggestions(result.directories || []);
+                                                                        setIsJuliaProject(result.is_julia_project || false);
+                                                                    } catch (err) {
+                                                                        console.error('Failed to fetch directories:', err);
+                                                                    }
+                                                                } else {
+                                                                    setIsJuliaProject(false);
+                                                                }
+                                                            }}
+                                                            onBlur={async (e) => {
+                                                                // Auto-populate session_name when project_path loses focus
+                                                                // Only if it's a valid Julia project (has Project.toml)
+                                                                if (name === 'project_path' && selectedTool?.name === 'start_julia_session') {
+                                                                    const value = e.target.value;
+                                                                    if (value && !toolParams['session_name']) {
+                                                                        // Re-check if this is actually a Julia project before populating
+                                                                        try {
+                                                                            const result = await fetchDirectories(value);
+                                                                            if (result.is_julia_project) {
+                                                                                let projectName = value.split('/').filter(p => p.length > 0).pop() || '';
+                                                                                // Strip .jl extension if present
+                                                                                if (projectName.endsWith('.jl')) {
+                                                                                    projectName = projectName.slice(0, -3);
+                                                                                }
+                                                                                if (projectName) {
+                                                                                    setToolParams({ ...toolParams, [name]: value, 'session_name': projectName });
+                                                                                }
+                                                                            }
+                                                                        } catch (err) {
+                                                                            console.error('Failed to verify Julia project:', err);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }}
+                                                            onKeyDown={async (e) => {
+                                                                if (e.key === 'Tab') {
+                                                                    e.preventDefault();
+
+                                                                    // If we have suggestions, complete to first suggestion
+                                                                    if (pathSuggestions.length > 0) {
+                                                                        const firstSuggestion = pathSuggestions[0];
+                                                                        const newParams = { ...toolParams, [name]: firstSuggestion + '/' };
+
+                                                                        setToolParams(newParams);
+
+                                                                        // Fetch next level of suggestions
+                                                                        try {
+                                                                            const result = await fetchDirectories(firstSuggestion + '/');
+                                                                            setPathSuggestions(result.directories || []);
+                                                                            setIsJuliaProject(result.is_julia_project || false);
+
+                                                                            // Only auto-populate session_name if this completed path is a Julia project
+                                                                            if (name === 'project_path' && selectedTool?.name === 'start_julia_session' && result.is_julia_project && !toolParams['session_name']) {
+                                                                                let projectName = firstSuggestion.split('/').filter(p => p.length > 0).pop() || '';
+                                                                                // Strip .jl extension if present
+                                                                                if (projectName.endsWith('.jl')) {
+                                                                                    projectName = projectName.slice(0, -3);
+                                                                                }
+                                                                                if (projectName) {
+                                                                                    setToolParams({ ...newParams, 'session_name': projectName });
+                                                                                }
+                                                                            }
+                                                                        } catch (err) {
+                                                                            console.error('Failed to fetch directories:', err);
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }}
+                                                            className={`param-input ${isJuliaProject ? 'julia-project-valid' : ''}`}
+                                                            placeholder={`Enter ${name}...`}
+                                                            list={`${name}-suggestions`}
+                                                        />
+                                                        <datalist id={`${name}-suggestions`}>
+                                                            {pathSuggestions.map((dir, idx) => (
+                                                                <option key={idx} value={dir} />
+                                                            ))}
+                                                        </datalist>
+                                                        {pathSuggestions.length > 0 && (
+                                                            <div className="path-suggestions-hint">
+                                                                Press Tab to complete • {pathSuggestions.length} matches
+                                                            </div>
+                                                        )}
+                                                    </>
+                                                ) : (
+                                                    <input
+                                                        type="text"
+                                                        value={toolParams[name] ?? ''}
+                                                        onChange={(e) => setToolParams({ ...toolParams, [name]: e.target.value })}
+                                                        className="param-input"
+                                                        placeholder={`Enter ${name}...`}
+                                                    />
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <button
+                                        className="tool-execute-btn"
+                                        disabled={toolExecuting}
+                                        onClick={async () => {
+                                            setToolExecuting(true);
+                                            setToolResult(null);
+                                            try {
+                                                const result = await callTool({
+                                                    tool: selectedTool.name,
+                                                    arguments: toolParams,
+                                                    sessionId: selectedToolSession ?? undefined
+                                                });
+                                                setToolResult(result);
+                                            } catch (error) {
+                                                setToolResult({ error: String(error) });
+                                            } finally {
+                                                setToolExecuting(false);
+                                            }
+                                        }}
+                                    >
+                                        {toolExecuting ? 'Executing...' : '▶ Try it'}
+                                    </button>
+                                </div>
+                            )}
+
+                            {!selectedTool.inputSchema?.properties || Object.keys(selectedTool.inputSchema.properties).length === 0 && (
+                                <div className="tool-test-section">
+                                    <h3>Test Tool</h3>
+                                    <p className="param-help">This tool takes no parameters.</p>
+                                    <button
+                                        className="tool-execute-btn"
+                                        disabled={toolExecuting}
+                                        onClick={async () => {
+                                            setToolExecuting(true);
+                                            setToolResult(null);
+                                            try {
+                                                const result = await callTool({
+                                                    tool: selectedTool.name,
+                                                    arguments: {},
+                                                    sessionId: selectedToolSession ?? undefined
+                                                });
+                                                setToolResult(result);
+                                            } catch (error) {
+                                                setToolResult({ error: String(error) });
+                                            } finally {
+                                                setToolExecuting(false);
+                                            }
+                                        }}
+                                    >
+                                        {toolExecuting ? 'Executing...' : '▶ Try it'}
+                                    </button>
+                                </div>
+                            )}
+
+                            {toolResult && (
+                                <div className="tool-result-section">
+                                    <h3>{toolResult.error ? '❌ Error' : '✓ Result'}</h3>
+                                    {toolResult.error ? (
+                                        <div className="json-tree">
+                                            <JsonViewer
+                                                value={toolResult.error}
+                                                theme="dark"
+                                                defaultInspectDepth={3}
+                                                displayDataTypes={false}
+                                                rootName="error"
+                                            />
+                                        </div>
+                                    ) : toolResult.result?.content ? (
+                                        <>
+                                            {toolResult.result.content.map((item: any, idx: number) => (
+                                                <div key={idx} className="result-content">
+                                                    {item.type === 'text' ? (
+                                                        <pre className="result-text">{item.text}</pre>
+                                                    ) : (
+                                                        <div className="json-tree">
+                                                            <JsonViewer
+                                                                value={item}
+                                                                theme="dark"
+                                                                defaultInspectDepth={3}
+                                                                displayDataTypes={false}
+                                                                rootName={`content[${idx}]`}
+                                                            />
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ))}
+                                            <details className="raw-response">
+                                                <summary>Show raw response</summary>
+                                                <div className="json-tree">
+                                                    <JsonViewer
+                                                        value={toolResult}
+                                                        theme="dark"
+                                                        defaultInspectDepth={3}
+                                                        displayDataTypes={false}
+                                                        rootName="response"
+                                                    />
+                                                </div>
+                                            </details>
+                                        </>
+                                    ) : (
+                                        <div className="json-tree">
+                                            <JsonViewer
+                                                value={toolResult}
+                                                theme="dark"
+                                                defaultInspectDepth={3}
+                                                displayDataTypes={false}
+                                                rootName="response"
+                                            />
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {selectedTool.inputSchema && (
+                                <div className="detail-row detail-data">
+                                    <span className="detail-label">Input Schema:</span>
+                                    <div className="detail-value json-tree">
+                                        <JsonViewer
+                                            value={selectedTool.inputSchema}
+                                            theme="dark"
+                                            defaultInspectDepth={2}
+                                            displayDataTypes={true}
+                                            rootName="inputSchema"
+                                        />
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                </div>
             )}
 
             {selectedEvent && (

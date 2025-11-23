@@ -57,7 +57,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                 <div className="tools-grid">
                     {selectedToolSession === null ? (
                         // Show proxy tools
-                        tools.proxy_tools.map((tool: ToolSchema) => (
+                        tools.proxy_tools?.length > 0 ? tools.proxy_tools.map((tool: ToolSchema) => (
                             <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
                                 <div className="tool-header">
                                     <h3 className="tool-name">🔧 {tool.name}</h3>
@@ -81,10 +81,10 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                                     </div>
                                 )}
                             </div>
-                        ))
+                        )) : <p>No proxy tools available</p>
                     ) : (
                         // Show agent tools
-                        tools.session_tools[selectedToolSession]?.map((tool: ToolSchema) => (
+                        tools.session_tools[selectedToolSession]?.length > 0 ? tools.session_tools[selectedToolSession].map((tool: ToolSchema) => (
                             <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
                                 <div className="tool-header">
                                     <h3 className="tool-name">⚡ {tool.name}</h3>
@@ -108,7 +108,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                                     </div>
                                 )}
                             </div>
-                        ))
+                        )) : <p>No tools available for {selectedToolSession}</p>
                     )}
                 </div>
             )}
