@@ -10,6 +10,9 @@ import { TerminalView } from './components/TerminalView';
 import { LogsView } from './components/LogsView';
 import { ToolsView } from './components/ToolsView';
 import { Analytics } from './components/Analytics';
+import { ErrorsModal } from './components/ErrorsModal';
+import { StaleSessionsModal } from './components/StaleSessionsModal';
+import { QuickStartModal } from './components/QuickStartModal';
 import { JsonViewer } from '@textea/json-viewer';
 import './App.css';
 import './quick-start.css';
@@ -533,203 +536,35 @@ export const App: React.FC = () => {
             )}
 
             {showErrorsModal && (
-                <div className="modal-overlay" onClick={() => setShowErrorsModal(false)}>
-                    <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-                        <div className="modal-header">
-                            <h2>⚠️ Errors ({events.filter(e => e.type === 'ERROR').length})</h2>
-                            <button className="modal-close" onClick={() => setShowErrorsModal(false)}>✕</button>
-                        </div>
-                        <div className="modal-body" style={{ maxHeight: '500px', overflow: 'auto' }}>
-                            {events.filter(e => e.type === 'ERROR').length === 0 ? (
-                                <p>No errors found! 🎉</p>
-                            ) : (
-                                <div className="error-list">
-                                    {events.filter(e => e.type === 'ERROR').map((event, idx) => (
-                                        <div key={idx} className="error-item">
-                                            <div className="error-time">{new Date(event.timestamp).toLocaleTimeString()}</div>
-                                            <div className="error-message">{event.data.message || JSON.stringify(event.data)}</div>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                        <div className="modal-footer">
-                            <button className="modal-button secondary" onClick={() => setShowErrorsModal(false)}>Close</button>
-                        </div>
-                    </div>
-                </div>
+                <ErrorsModal
+                    events={events}
+                    onClose={() => setShowErrorsModal(false)}
+                />
             )}
 
             {showStaleSessionsModal && (
-                <div className="modal-overlay" onClick={() => setShowStaleSessionsModal(false)}>
-                    <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-                        <div className="modal-header">
-                            <h2>🧹 Stale Sessions ({staleSessionCount})</h2>
-                            <button className="modal-close" onClick={() => setShowStaleSessionsModal(false)}>✕</button>
-                        </div>
-                        <div className="modal-body">
-                            {staleSessions.length === 0 ? (
-                                <p>No stale sessions found! ✅</p>
-                            ) : (
-                                <div className="stale-sessions-list">
-                                    {staleSessions.map((session: any, idx: number) => (
-                                        <div key={idx} className={`stale-session-item ${session.is_stale ? 'stale' : 'active'}`}>
-                                            <div className="stale-session-icon">{session.is_stale ? '❌' : '✅'}</div>
-                                            <div className="stale-session-info">
-                                                <div className="stale-session-name">{session.session_name}</div>
-                                                <div className="stale-session-pid">PID: {session.pid}</div>
-                                            </div>
-                                            <div className="stale-session-status">
-                                                {session.is_stale ? 'Stale' : 'Active'}
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-                        <div className="modal-footer">
-                            <button className="modal-button secondary" onClick={() => setShowStaleSessionsModal(false)}>Close</button>
-                            {staleSessionCount > 0 && (
-                                <button className="modal-button warning" onClick={() => handleKillStaleSessions(false)}>
-                                    Kill Stale Sessions
-                                </button>
-                            )}
-                            {staleSessions.length > 0 && (
-                                <button className="modal-button danger" onClick={() => handleKillStaleSessions(true)}>
-                                    Kill All Sessions
-                                </button>
-                            )}
-                        </div>
-                    </div>
-                </div>
+                <StaleSessionsModal
+                    staleSessions={staleSessions}
+                    onClose={() => setShowStaleSessionsModal(false)}
+                    onKillStale={() => handleKillStaleSessions(false)}
+                    onKillAll={() => handleKillStaleSessions(true)}
+                />
             )}
 
             {showQuickStartModal && (
-                <div className="modal-overlay" onClick={() => setShowQuickStartModal(false)}>
-                    <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-                        <div className="modal-header">
-                            <h2>🚀 Quick Start Session</h2>
-                            <button className="modal-close" onClick={() => setShowQuickStartModal(false)}>✕</button>
-                        </div>
-                        <div className="modal-body">
-                            <div className="form-group">
-                                <label>Project Path *</label>
-                                <input
-                                    type="text"
-                                    value={quickStartPath}
-                                    onChange={async (e) => {
-                                        const value = e.target.value;
-                                        setQuickStartPath(value);
-
-                                        // Fetch directory suggestions
-                                        if (value.length > 0) {
-                                            try {
-                                                const result = await fetchDirectories(value);
-                                                setPathSuggestions(result.directories || []);
-                                                setIsJuliaProject(result.is_julia_project || false);
-                                            } catch (err) {
-                                                console.error('Failed to fetch directories:', err);
-                                            }
-                                        } else {
-                                            setPathSuggestions([]);
-                                            setIsJuliaProject(false);
-                                        }
-                                    }}
-                                    onBlur={async (e) => {
-                                        // Auto-populate session name if this is a Julia project
-                                        const value = e.target.value;
-                                        if (value && !quickStartName) {
-                                            try {
-                                                const result = await fetchDirectories(value);
-                                                if (result.is_julia_project) {
-                                                    let projectName = value.split('/').filter(p => p.length > 0).pop() || '';
-                                                    if (projectName.endsWith('.jl')) {
-                                                        projectName = projectName.slice(0, -3);
-                                                    }
-                                                    if (projectName) {
-                                                        setQuickStartName(projectName);
-                                                    }
-                                                }
-                                            } catch (err) {
-                                                console.error('Failed to verify Julia project:', err);
-                                            }
-                                        }
-                                    }}
-                                    onKeyDown={async (e) => {
-                                        if (e.key === 'Tab') {
-                                            e.preventDefault();
-
-                                            // Complete to first suggestion
-                                            if (pathSuggestions.length > 0) {
-                                                const firstSuggestion = pathSuggestions[0];
-                                                setQuickStartPath(firstSuggestion + '/');
-
-                                                // Fetch next level
-                                                try {
-                                                    const result = await fetchDirectories(firstSuggestion + '/');
-                                                    setPathSuggestions(result.directories || []);
-                                                    setIsJuliaProject(result.is_julia_project || false);
-
-                                                    // Auto-populate session name if completed path is Julia project
-                                                    if (result.is_julia_project && !quickStartName) {
-                                                        let projectName = firstSuggestion.split('/').filter(p => p.length > 0).pop() || '';
-                                                        if (projectName.endsWith('.jl')) {
-                                                            projectName = projectName.slice(0, -3);
-                                                        }
-                                                        if (projectName) {
-                                                            setQuickStartName(projectName);
-                                                        }
-                                                    }
-                                                } catch (err) {
-                                                    console.error('Failed to fetch directories:', err);
-                                                }
-                                            }
-                                        }
-                                    }}
-                                    placeholder="/path/to/project"
-                                    className={`modal-input ${isJuliaProject ? 'julia-project-valid' : ''}`}
-                                    list="quickstart-path-suggestions"
-                                />
-                                <datalist id="quickstart-path-suggestions">
-                                    {pathSuggestions.map((dir, idx) => (
-                                        <option key={idx} value={dir} />
-                                    ))}
-                                </datalist>
-                                {pathSuggestions.length > 0 && (
-                                    <div className="path-suggestions-hint">
-                                        Press Tab to complete • {pathSuggestions.length} matches
-                                    </div>
-                                )}
-                            </div>
-                            <div className="form-group">
-                                <label>Session Name (optional)</label>
-                                <input
-                                    type="text"
-                                    value={quickStartName}
-                                    onChange={(e) => setQuickStartName(e.target.value)}
-                                    placeholder="my-session"
-                                    className="modal-input"
-                                />
-                            </div>
-                        </div>
-                        <div className="modal-footer">
-                            <button
-                                className="modal-button secondary"
-                                onClick={() => setShowQuickStartModal(false)}
-                                disabled={quickStartLoading}
-                            >
-                                Cancel
-                            </button>
-                            <button
-                                className="modal-button primary"
-                                onClick={handleQuickStart}
-                                disabled={quickStartLoading}
-                            >
-                                {quickStartLoading ? '🚀 Starting...' : 'Start Session'}
-                            </button>
-                        </div>
-                    </div>
-                </div>
+                <QuickStartModal
+                    quickStartPath={quickStartPath}
+                    setQuickStartPath={setQuickStartPath}
+                    quickStartName={quickStartName}
+                    setQuickStartName={setQuickStartName}
+                    quickStartLoading={quickStartLoading}
+                    pathSuggestions={pathSuggestions}
+                    setPathSuggestions={setPathSuggestions}
+                    isJuliaProject={isJuliaProject}
+                    setIsJuliaProject={setIsJuliaProject}
+                    onClose={() => setShowQuickStartModal(false)}
+                    onStart={handleQuickStart}
+                />
             )}
 
             <div className="main-container">
