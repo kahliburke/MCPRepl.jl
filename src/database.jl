@@ -626,11 +626,20 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 end
 
 """
-Register or update a session in the database.
+Register or update an MCP session (client connection) in the database.
+
+Arguments:
+- id: UUID string for the MCP session
+- status: Session status ("active", "disconnected", etc.)
+- name: Optional logical name for the session
+- session_type: Type of MCP client ("vscode", "cli", etc.)
+- metadata: Additional session metadata
 """
-function register_session!(
-    session_id::String,
+function register_mcp_session!(
+    id::String,
     status::String = "active";
+    name::Union{String,Nothing} = nothing,
+    session_type::String = "unknown",
     metadata::Dict = Dict(),
 )
     db = DB[]
@@ -641,28 +650,112 @@ function register_session!(
     metadata_json = JSON.json(metadata)
     now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
 
-    # Insert or update session
+    # Insert or update MCP session
     DBInterface.execute(
         db,
         """
-        INSERT INTO sessions (session_id, start_time, last_activity, status, metadata)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(session_id) DO UPDATE SET
+        INSERT INTO mcp_sessions (id, name, session_type, start_time, last_activity, status, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = COALESCE(excluded.name, name),
             last_activity = excluded.last_activity,
             status = excluded.status,
             metadata = excluded.metadata
         """,
-        (session_id, now_str, now_str, status, metadata_json),
+        (id, name, session_type, now_str, now_str, status, metadata_json),
     )
 end
 
 """
-Log an event to the database.
+Register or update a Julia session (backend REPL) in the database.
+
+Arguments:
+- id: UUID string or logical name for the Julia session
+- name: Logical name for the REPL
+- status: Session status ("ready", "disconnected", etc.)
+- port: HTTP port the REPL is listening on
+- pid: Process ID of the Julia REPL
+- metadata: Additional session metadata
+"""
+function register_julia_session!(
+    id::String,
+    name::String,
+    status::String = "active";
+    port::Union{Int,Nothing} = nothing,
+    pid::Union{Int,Nothing} = nothing,
+    metadata::Dict = Dict(),
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    metadata_json = JSON.json(metadata)
+    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+
+    # Insert or update Julia session
+    DBInterface.execute(
+        db,
+        """
+        INSERT INTO julia_sessions (id, name, port, pid, start_time, last_activity, status, metadata)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            port = COALESCE(excluded.port, port),
+            pid = COALESCE(excluded.pid, pid),
+            last_activity = excluded.last_activity,
+            status = excluded.status,
+            metadata = excluded.metadata
+        """,
+        (id, name, port, pid, now_str, now_str, status, metadata_json),
+    )
+end
+
+"""
+Legacy function for backward compatibility. Determines session type and routes to appropriate function.
+Will be deprecated once all callers are updated.
+"""
+function register_session!(
+    session_id::String,
+    status::String = "active";
+    metadata::Dict = Dict(),
+)
+    # Check if it looks like a Julia REPL session (has port/pid in metadata)
+    if haskey(metadata, "port") || haskey(metadata, "pid")
+        register_julia_session!(
+            session_id,
+            session_id,  # Use ID as name for legacy calls
+            status;
+            port = get(metadata, "port", nothing),
+            pid = get(metadata, "pid", nothing),
+            metadata = metadata,
+        )
+    else
+        # Treat as MCP session
+        register_mcp_session!(
+            session_id,
+            status;
+            name = session_id,  # Use ID as name for legacy calls
+            metadata = metadata,
+        )
+    end
+end
+
+"""
+Log an event to the database with dual-session tracking.
+
+Arguments:
+- event_type: Type of event (tool_call, error, heartbeat, etc.)
+- data: Event data as Dict
+- mcp_session_id: Optional MCP session ID (initiator)
+- julia_session_id: Optional Julia session ID (executor)
+- duration_ms: Optional duration in milliseconds
 """
 function log_event!(
-    session_id::String,
     event_type::String,
     data::Dict;
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     duration_ms::Union{Float64,Nothing} = nothing,
 )
     db = DB[]
@@ -676,22 +769,36 @@ function log_event!(
     DBInterface.execute(
         db,
         """
-    INSERT INTO events (session_id, event_type, timestamp, duration_ms, data)
-    VALUES (?, ?, ?, ?, ?)
-""",
-        (session_id, event_type, timestamp, duration_ms, data_json),
+        INSERT INTO events (mcp_session_id, julia_session_id, event_type, timestamp, duration_ms, data)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (mcp_session_id, julia_session_id, event_type, timestamp, duration_ms, data_json),
     )
 
-    # Update session last_activity
-    DBInterface.execute(
-        db,
-        """
-    UPDATE sessions 
-    SET last_activity = ?
-    WHERE session_id = ?
-""",
-        (timestamp, session_id),
-    )
+    # Update last_activity for both sessions if they exist
+    if mcp_session_id !== nothing
+        DBInterface.execute(
+            db,
+            """
+            UPDATE mcp_sessions 
+            SET last_activity = ?
+            WHERE id = ?
+            """,
+            (timestamp, mcp_session_id),
+        )
+    end
+
+    if julia_session_id !== nothing
+        DBInterface.execute(
+            db,
+            """
+            UPDATE julia_sessions 
+            SET last_activity = ?
+            WHERE id = ?
+            """,
+            (timestamp, julia_session_id),
+        )
+    end
 end
 
 """
@@ -699,41 +806,78 @@ Log an event to the database with automatic session creation if needed.
 Safe wrapper that won't error if database is not initialized.
 """
 function log_event_safe!(
-    session_id::String,
     event_type::String,
     data::Dict;
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     duration_ms::Union{Float64,Nothing} = nothing,
 )
     try
-        # Ensure session exists
-        register_session!(session_id; metadata = Dict("auto_created" => true))
-        log_event!(session_id, event_type, data; duration_ms = duration_ms)
+        # Ensure sessions exist (auto-create with minimal info)
+        if mcp_session_id !== nothing
+            register_mcp_session!(mcp_session_id; metadata = Dict("auto_created" => true))
+        end
+        if julia_session_id !== nothing
+            register_julia_session!(
+                julia_session_id,
+                julia_session_id;  # Use ID as name for auto-created sessions
+                metadata = Dict("auto_created" => true),
+            )
+        end
+
+        log_event!(
+            event_type,
+            data;
+            mcp_session_id = mcp_session_id,
+            julia_session_id = julia_session_id,
+            duration_ms = duration_ms,
+        )
     catch e
         # Silent failure - log to stderr but don't crash
-        @warn "Failed to log event to database" session_id = session_id event_type =
-            event_type exception = e
+        @warn "Failed to log event to database" mcp_session_id = mcp_session_id julia_session_id =
+            julia_session_id event_type = event_type exception = e
     end
 end
 
 """
-Log a complete interaction (request or response) to the database.
-This captures the full message content for session reconstruction.
+Log a complete interaction (request or response) to the database with dual-session tracking.
+This captures the full message content and HTTP protocol details for session reconstruction.
 
 Arguments:
-- session_id: Session identifier
 - direction: "inbound" (to proxy) or "outbound" (from proxy)
 - message_type: "request", "response", "error", "log", etc.
 - content: The complete message content (will be stored as JSON string)
+- mcp_session_id: Optional MCP session ID (client)
+- julia_session_id: Optional Julia session ID (backend REPL)
 - request_id: Optional request ID to link requests and responses
 - method: Optional method name for RPC calls
+- http_method: HTTP method (GET, POST, etc.)
+- http_path: HTTP request path
+- http_headers: HTTP headers as JSON string
+- http_status_code: HTTP response status code
+- remote_addr: Client IP address
+- user_agent: Client User-Agent header
+- content_type: Content-Type header
+- content_encoding: Content-Encoding header
+- processing_time_ms: Time to process request (milliseconds)
 """
 function log_interaction!(
-    session_id::String,
     direction::String,
     message_type::String,
     content::Union{String,Dict};
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     request_id::Union{String,Nothing} = nothing,
     method::Union{String,Nothing} = nothing,
+    http_method::Union{String,Nothing} = nothing,
+    http_path::Union{String,Nothing} = nothing,
+    http_headers::Union{String,Nothing} = nothing,
+    http_status_code::Union{Int,Nothing} = nothing,
+    remote_addr::Union{String,Nothing} = nothing,
+    user_agent::Union{String,Nothing} = nothing,
+    content_type::Union{String,Nothing} = nothing,
+    content_encoding::Union{String,Nothing} = nothing,
+    processing_time_ms::Union{Float64,Nothing} = nothing,
 )
     db = DB[]
     if db === nothing
@@ -747,12 +891,17 @@ function log_interaction!(
     DBInterface.execute(
         db,
         """
-    INSERT INTO interactions (session_id, timestamp, direction, message_type, 
-                             request_id, method, content, content_size)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-""",
+        INSERT INTO interactions (
+            mcp_session_id, julia_session_id, timestamp, direction, message_type,
+            request_id, method, content, content_size,
+            http_method, http_path, http_headers, http_status_code,
+            remote_addr, user_agent, content_type, content_encoding, processing_time_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
         (
-            session_id,
+            mcp_session_id,
+            julia_session_id,
             timestamp,
             direction,
             message_type,
@@ -760,19 +909,42 @@ function log_interaction!(
             method,
             content_str,
             content_size,
+            http_method,
+            http_path,
+            http_headers,
+            http_status_code,
+            remote_addr,
+            user_agent,
+            content_type,
+            content_encoding,
+            processing_time_ms,
         ),
     )
 
-    # Update session last_activity
-    DBInterface.execute(
-        db,
-        """
-    UPDATE sessions 
-    SET last_activity = ?
-    WHERE session_id = ?
-""",
-        (timestamp, session_id),
-    )
+    # Update last_activity for both sessions if they exist
+    if mcp_session_id !== nothing
+        DBInterface.execute(
+            db,
+            """
+            UPDATE mcp_sessions 
+            SET last_activity = ?
+            WHERE id = ?
+            """,
+            (timestamp, mcp_session_id),
+        )
+    end
+
+    if julia_session_id !== nothing
+        DBInterface.execute(
+            db,
+            """
+            UPDATE julia_sessions 
+            SET last_activity = ?
+            WHERE id = ?
+            """,
+            (timestamp, julia_session_id),
+        )
+    end
 end
 
 """
@@ -780,36 +952,74 @@ Log an interaction with automatic session creation.
 Safe wrapper that won't error if database is not initialized.
 """
 function log_interaction_safe!(
-    session_id::String,
     direction::String,
     message_type::String,
     content::Union{String,Dict};
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     request_id::Union{String,Nothing} = nothing,
     method::Union{String,Nothing} = nothing,
+    http_method::Union{String,Nothing} = nothing,
+    http_path::Union{String,Nothing} = nothing,
+    http_headers::Union{String,Nothing} = nothing,
+    http_status_code::Union{Int,Nothing} = nothing,
+    remote_addr::Union{String,Nothing} = nothing,
+    user_agent::Union{String,Nothing} = nothing,
+    content_type::Union{String,Nothing} = nothing,
+    content_encoding::Union{String,Nothing} = nothing,
+    processing_time_ms::Union{Float64,Nothing} = nothing,
 )
     try
-        # Ensure session exists
-        register_session!(session_id; metadata = Dict("auto_created" => true))
+        # Ensure sessions exist (auto-create with minimal info)
+        if mcp_session_id !== nothing
+            register_mcp_session!(mcp_session_id; metadata = Dict("auto_created" => true))
+        end
+        if julia_session_id !== nothing
+            register_julia_session!(
+                julia_session_id,
+                julia_session_id;  # Use ID as name for auto-created sessions
+                metadata = Dict("auto_created" => true),
+            )
+        end
+
         log_interaction!(
-            session_id,
             direction,
             message_type,
             content;
+            mcp_session_id = mcp_session_id,
+            julia_session_id = julia_session_id,
             request_id = request_id,
             method = method,
+            http_method = http_method,
+            http_path = http_path,
+            http_headers = http_headers,
+            http_status_code = http_status_code,
+            remote_addr = remote_addr,
+            user_agent = user_agent,
+            content_type = content_type,
+            content_encoding = content_encoding,
+            processing_time_ms = processing_time_ms,
         )
     catch e
         # Silent failure - log to stderr but don't crash
-        @warn "Failed to log interaction to database" session_id = session_id direction =
-            direction message_type = message_type exception = e
+        @warn "Failed to log interaction to database" mcp_session_id = mcp_session_id julia_session_id =
+            julia_session_id direction = direction message_type = message_type exception = e
     end
 end
 
 """
 Retrieve recent events from the database.
+
+Arguments:
+- mcp_session_id: Filter by MCP session ID
+- julia_session_id: Filter by Julia session ID
+- event_type: Filter by event type
+- limit: Maximum number of events to return
+- offset: Number of events to skip
 """
 function get_events(;
-    session_id::Union{String,Nothing} = nothing,
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     event_type::Union{String,Nothing} = nothing,
     limit::Int = 100,
     offset::Int = 0,
@@ -822,9 +1032,14 @@ function get_events(;
     query = "SELECT * FROM events WHERE 1=1"
     params = []
 
-    if session_id !== nothing
-        query *= " AND session_id = ?"
-        push!(params, session_id)
+    if mcp_session_id !== nothing
+        query *= " AND mcp_session_id = ?"
+        push!(params, mcp_session_id)
+    end
+
+    if julia_session_id !== nothing
+        query *= " AND julia_session_id = ?"
+        push!(params, julia_session_id)
     end
 
     if event_type !== nothing
@@ -840,10 +1055,20 @@ end
 
 """
 Retrieve interactions from the database.
-Interactions contain full message content for complete session reconstruction.
+Interactions contain full message content and HTTP details for complete session reconstruction.
+
+Arguments:
+- mcp_session_id: Filter by MCP session ID
+- julia_session_id: Filter by Julia session ID
+- request_id: Filter by request ID (to link request/response pairs)
+- direction: Filter by direction ("inbound" or "outbound")
+- message_type: Filter by message type ("request", "response", etc.)
+- limit: Maximum number of interactions to return
+- offset: Number of interactions to skip
 """
 function get_interactions(;
-    session_id::Union{String,Nothing} = nothing,
+    mcp_session_id::Union{String,Nothing} = nothing,
+    julia_session_id::Union{String,Nothing} = nothing,
     request_id::Union{String,Nothing} = nothing,
     direction::Union{String,Nothing} = nothing,
     message_type::Union{String,Nothing} = nothing,
@@ -858,9 +1083,14 @@ function get_interactions(;
     query = "SELECT * FROM interactions WHERE 1=1"
     params = []
 
-    if session_id !== nothing
-        query *= " AND session_id = ?"
-        push!(params, session_id)
+    if mcp_session_id !== nothing
+        query *= " AND mcp_session_id = ?"
+        push!(params, mcp_session_id)
+    end
+
+    if julia_session_id !== nothing
+        query *= " AND julia_session_id = ?"
+        push!(params, julia_session_id)
     end
 
     if request_id !== nothing
