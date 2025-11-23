@@ -3673,13 +3673,19 @@ function start_foreground_server(port::Int = 3000)
 
     # Set up dashboard to use database for event persistence
     Dashboard.set_db_callback!() do session_id, event_type, timestamp, data, duration_ms
-        Database.log_event!(
-            session_id,
-            event_type,
-            timestamp,
-            data;
-            duration_ms = duration_ms,
-        )
+        # Dashboard events are primarily Julia REPL session events
+        # The session_id here is the Julia REPL ID
+        # Note: timestamp parameter is ignored since log_event! generates its own
+        try
+            Database.log_event!(
+                event_type,
+                data;
+                julia_session_id = session_id,
+                duration_ms = duration_ms,
+            )
+        catch e
+            @warn "Failed to log dashboard event to database" exception = e
+        end
     end
     @info "Dashboard configured to persist events to database"
 
