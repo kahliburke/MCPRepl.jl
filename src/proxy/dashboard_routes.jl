@@ -68,7 +68,7 @@ function handle_dashboard_route(
         agent_id = nothing
         for (k, v) in req.headers
             if lowercase(k) == "x-agent-id"
-                agent_id = v
+                agent_id = String(v)
                 break
             end
         end
@@ -112,6 +112,11 @@ function handle_dashboard_route(
 
     if path == "/dashboard/api/db-sessions"
         return handle_db_sessions(http)
+    end
+
+    # Logs endpoint
+    if path == "/dashboard/api/logs"
+        return handle_logs(http, req)
     end
 
     # Analytics endpoints
@@ -201,8 +206,8 @@ end
 
 function handle_session_restart(http::HTTP.Stream, session_id::String)
     return handle_session_control(http, session_id, "restart") do conn, sid
-        # Send restart request via exit tool
-        params = Dict("name" => "exit", "arguments" => Dict("restart" => true))
+        # Send restart request via manage_repl tool
+        params = Dict("name" => "manage_repl", "arguments" => Dict("command" => "restart"))
         success = send_jsonrpc_to_session(conn, "tools/call", params)
 
         if success
@@ -223,8 +228,9 @@ function handle_session_shutdown(http::HTTP.Stream, session_id::String)
             return (true, true)  # success, delete from registry
         end
 
-        # Otherwise, try to send shutdown request
-        success = send_jsonrpc_to_session(conn, "shutdown", Dict())
+        # Send shutdown request via manage_repl tool
+        params = Dict("name" => "manage_repl", "arguments" => Dict("command" => "shutdown"))
+        success = send_jsonrpc_to_session(conn, "tools/call", params)
 
         if success
             @info "Session shutdown requested" session_id = sid
@@ -237,44 +243,52 @@ function handle_session_shutdown(http::HTTP.Stream, session_id::String)
 end
 
 function handle_tools_list(http::HTTP.Stream, agent_id::Union{String,Nothing})
-    result = Dict{String,Any}(
-        "proxy_tools" => get_proxy_tool_schemas(),
-        "agent_tools" => Dict{String,Any}(),
-    )
+    try
+        result = Dict{String,Any}(
+            "proxy_tools" => get_proxy_tool_schemas(),
+            "session_tools" => Dict{String,Any}(),
+        )
 
-    # If agent_id specified, fetch tools from that agent
-    if agent_id !== nothing && haskey(JULIA_SESSION_REGISTRY, agent_id)
-        conn = JULIA_SESSION_REGISTRY[agent_id]
-        if conn.status == :ready
-            try
-                # Make tools/list request to agent
-                agent_req = Dict(
-                    "jsonrpc" => "2.0",
-                    "id" => 1,
-                    "method" => "tools/list",
-                    "params" => Dict(),
-                )
+        # If agent_id specified, fetch tools from that agent
+        if agent_id !== nothing && haskey(JULIA_SESSION_REGISTRY, agent_id)
+            conn = JULIA_SESSION_REGISTRY[agent_id]
+            if conn.status == :ready
+                try
+                    # Make tools/list request to agent
+                    agent_req = Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => 1,
+                        "method" => "tools/list",
+                        "params" => Dict(),
+                    )
 
-                agent_resp = HTTP.post(
-                    "http://127.0.0.1:$(conn.port)/",
-                    ["Content-Type" => "application/json"],
-                    JSON.json(agent_req);
-                    readtimeout = 5,
-                )
+                    agent_resp = HTTP.post(
+                        "http://127.0.0.1:$(conn.port)/",
+                        ["Content-Type" => "application/json"],
+                        JSON.json(agent_req);
+                        readtimeout = 5,
+                    )
 
-                if agent_resp.status == 200
-                    agent_data = JSON.parse(String(agent_resp.body))
-                    if haskey(agent_data, "result") && haskey(agent_data["result"], "tools")
-                        result["agent_tools"][agent_id] = agent_data["result"]["tools"]
+                    if agent_resp.status == 200
+                        agent_data = JSON.parse(String(agent_resp.body))
+                        if haskey(agent_data, "result") &&
+                           haskey(agent_data["result"], "tools")
+                            result["session_tools"][agent_id] =
+                                agent_data["result"]["tools"]
+                        end
                     end
+                catch e
+                    @warn "Failed to fetch tools from agent" agent_id = agent_id exception =
+                        e
                 end
-            catch e
-                @warn "Failed to fetch tools from agent" agent_id = agent_id exception = e
             end
         end
-    end
 
-    send_json_response(http, result)
+        send_json_response(http, result)
+    catch e
+        @error "Error in handle_tools_list" exception = (e, catch_backtrace())
+        send_json_response(http, Dict("error" => string(e)); status = 500)
+    end
     return nothing
 end
 
@@ -286,7 +300,27 @@ function handle_events(http::HTTP.Stream, req::HTTP.Request)
 
     # get_events uses keyword arguments
     events = Database.get_events(; limit = limit, offset = offset)
-    send_json_response(http, events)
+
+    # Transform events to match frontend expectations
+    # Frontend expects: {type, id, timestamp, data, duration_ms}
+    # Database has: {event_type, julia_session_id, timestamp, data, duration_ms}
+    transformed_events = map(events) do event
+        Dict(
+            "type" => get(event, "event_type", ""),
+            "id" => get(event, "julia_session_id", ""),
+            "timestamp" => get(event, "timestamp", ""),
+            "data" => try
+                # Parse data if it's a JSON string
+                data_str = get(event, "data", "{}")
+                typeof(data_str) == String ? JSON.parse(data_str) : data_str
+            catch
+                get(event, "data", Dict())
+            end,
+            "duration_ms" => get(event, "duration_ms", nothing),
+        )
+    end
+
+    send_json_response(http, transformed_events)
     return nothing
 end
 
@@ -321,6 +355,71 @@ end
 
 function handle_db_sessions(http::HTTP.Stream)
     return handle_database_query(http, Database.get_all_sessions)
+end
+
+function handle_logs(http::HTTP.Stream, req::HTTP.Request)
+    query_params = parse_query_params(req)
+    session_id = get(query_params, "session_id", nothing)
+    lines = get_int_param(query_params, "lines", "500")
+
+    result = Dict{String,Any}()
+
+    if session_id !== nothing
+        # Get log file for specific session (matches original implementation)
+        log_dir = joinpath(dirname(dirname(@__DIR__)), "logs")
+
+        if isdir(log_dir)
+            # Find most recent log file for this session
+            log_files =
+                filter(f -> startswith(f, "session_$(session_id)_"), readdir(log_dir))
+
+            if !isempty(log_files)
+                # Sort by modification time and filter out crash dumps (small files)
+                log_files_with_info = [(f, stat(joinpath(log_dir, f))) for f in log_files]
+
+                # Filter out likely crash dumps (< 3KB) and very old files (> 24 hours old)
+                recent_logs = filter(log_files_with_info) do (f, s)
+                    s.size > 3000 && (time() - s.mtime) < 86400  # 24 hours
+                end
+
+                if isempty(recent_logs)
+                    result["error"] = "No active log files found for session: $session_id\n\nNote: This session may be logging to a parent process (VS Code, terminal, etc.) rather than to a file. Only background-started sessions write to log files."
+                    send_json_response(http, result)
+                    return nothing
+                end
+
+                # Get most recent non-crash log
+                latest_file = sort(recent_logs, by = x -> x[2].mtime, rev = true)[1][1]
+                latest_log = joinpath(log_dir, latest_file)
+
+                if isfile(latest_log)
+                    try
+                        content = read(latest_log, String)
+                        # Get last N lines
+                        all_lines = split(content, '\n')
+                        selected_lines =
+                            all_lines[max(1, length(all_lines) - lines + 1):end]
+                        result["content"] = join(selected_lines, '\n')
+                        result["file"] = latest_log
+                        result["total_lines"] = length(all_lines)
+                    catch e
+                        result["error"] = "Failed to read log file: $(sprint(showerror, e))"
+                    end
+                else
+                    result["error"] = "Log file not found"
+                end
+            else
+                result["error"] = "No log files found for session: $session_id"
+            end
+        else
+            result["error"] = "Logs directory does not exist"
+        end
+    else
+        result["error"] = "session_id parameter is required"
+    end
+
+    send_json_response(http, result)
+    return nothing
 end
 
 function handle_analytics_tool_executions(http::HTTP.Stream, req::HTTP.Request)

@@ -89,7 +89,7 @@ end
 """
     send_jsonrpc_to_session(conn, method::String, params::Dict) -> Bool
 
-Send a JSON-RPC request to a Julia session socket.
+Send a JSON-RPC request to a Julia session via HTTP.
 Returns true on success, false on failure.
 """
 function send_jsonrpc_to_session(conn, method::String, params::Dict)
@@ -100,40 +100,51 @@ function send_jsonrpc_to_session(conn, method::String, params::Dict)
             "method" => method,
             "params" => params,
         )
-        write(conn.socket, JSON.json(request) * "\n")
-        return true
+        backend_url = "http://127.0.0.1:$(conn.port)/"
+        response = HTTP.post(
+            backend_url,
+            ["Content-Type" => "application/json"],
+            JSON.json(request);
+            readtimeout = 5,
+            connect_timeout = 2,
+            status_exception = false,
+        )
+        return response.status == 200
     catch e
+        @warn "Failed to send JSON-RPC to session" session_id = conn.id error = e
         return false
     end
 end
 
 """
-    handle_session_control(http::HTTP.Stream, session_id::String, action_func::Function, action_name::String)
+    handle_session_control(action_func::Function, http::HTTP.Stream, session_id::String, action_name::String)
 
 Generic handler for session control operations (restart, shutdown, etc.).
 
 The action_func is called with (conn, session_id) and should return (success::Bool, should_delete::Bool).
+Note: action_func is first to support do-block syntax.
 """
 function handle_session_control(
+    action_func::Function,
     http::HTTP.Stream,
     session_id::String,
-    action_func::Function,
     action_name::String,
 )
-    success = lock(JULIA_SESSION_REGISTRY_LOCK) do
+    # Execute action and determine if we should unregister
+    success, should_delete = lock(JULIA_SESSION_REGISTRY_LOCK) do
         if haskey(JULIA_SESSION_REGISTRY, session_id)
             conn = JULIA_SESSION_REGISTRY[session_id]
             success, should_delete = action_func(conn, session_id)
-
-            if should_delete
-                delete!(JULIA_SESSION_REGISTRY, session_id)
-            end
-
-            return success
+            return (success, should_delete)
         else
             @warn "Session not found for $action_name" session_id
-            return false
+            return (false, false)
         end
+    end
+
+    # Properly unregister the session if requested (outside the lock to avoid issues)
+    if should_delete && success
+        unregister_julia_session(session_id)
     end
 
     send_json_response(
