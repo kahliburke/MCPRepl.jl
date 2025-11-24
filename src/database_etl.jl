@@ -125,6 +125,14 @@ function extract_tool_executions(db, last_id::Int)
         try
             # Parse request content
             req_data = JSON.parse(row.request_content)
+
+            # Ensure req_data is a Dict
+            if !isa(req_data, AbstractDict)
+                @debug "Skipping non-dict request content" req_id = row.req_id content_type =
+                    typeof(req_data)
+                continue
+            end
+
             params = get(req_data, "params", Dict())
             tool_name = get(params, "name", "unknown")
             arguments = get(params, "arguments", Dict())
@@ -137,6 +145,13 @@ function extract_tool_executions(db, last_id::Int)
 
             if !ismissing(row.response_content)
                 resp_data = JSON.parse(row.response_content)
+
+                # Ensure resp_data is a Dict
+                if !isa(resp_data, AbstractDict)
+                    @debug "Skipping non-dict response content" req_id = row.req_id content_type =
+                        typeof(resp_data)
+                    continue
+                end
 
                 if haskey(resp_data, "result")
                     status = "success"
@@ -214,7 +229,14 @@ function extract_tool_executions(db, last_id::Int)
 
             count += 1
         catch e
-            @warn "Failed to extract tool execution" req_id = row.req_id exception = e
+            # Use compact error representation to avoid massive log messages
+            error_summary = if isa(e, MethodError)
+                "MethodError: $(e.f) called with wrong argument types"
+            else
+                string(typeof(e))
+            end
+            @warn "Failed to extract tool execution" req_id = row.req_id error_type =
+                error_summary
         end
     end
 
@@ -250,6 +272,13 @@ function extract_errors(db, last_interaction_id::Int, last_event_id::Int)
     for row in eachrow(df)
         try
             content = JSON.parse(row.content)
+
+            # Ensure content is a Dict (not an Array or other type)
+            if !isa(content, AbstractDict)
+                @debug "Skipping non-dict content in interaction" interaction_id = row.id content_type =
+                    typeof(content)
+                continue
+            end
 
             # Check if this is an error response
             if !haskey(content, "error")
@@ -305,7 +334,14 @@ function extract_errors(db, last_interaction_id::Int, last_event_id::Int)
 
             count += 1
         catch e
-            @warn "Failed to extract error" interaction_id = row.id exception = e
+            # Use compact error representation to avoid massive log messages
+            error_summary = if isa(e, MethodError)
+                "MethodError: $(e.f) called with wrong argument types"
+            else
+                string(typeof(e))
+            end
+            @warn "Failed to extract error" interaction_id = row.id error_type =
+                error_summary
         end
     end
 
@@ -340,6 +376,14 @@ function update_client_sessions(db, last_id::Int)
     for row in eachrow(df)
         try
             content = JSON.parse(row.content)
+
+            # Ensure content is a Dict
+            if !isa(content, AbstractDict)
+                @debug "Skipping non-dict content in client session" interaction_id = row.id content_type =
+                    typeof(content)
+                continue
+            end
+
             params = get(content, "params", Dict())
             client_info = get(params, "clientInfo", Dict())
 
@@ -395,7 +439,14 @@ function update_client_sessions(db, last_id::Int)
                 )
             end
         catch e
-            @warn "Failed to extract client session" interaction_id = row.id exception = e
+            # Use compact error representation to avoid massive log messages
+            error_summary = if isa(e, MethodError)
+                "MethodError: $(e.f) called with wrong argument types"
+            else
+                string(typeof(e))
+            end
+            @warn "Failed to extract client session" interaction_id = row.id error_type =
+                error_summary
         end
     end
 
