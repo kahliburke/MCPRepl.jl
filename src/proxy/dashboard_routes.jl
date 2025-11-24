@@ -80,13 +80,18 @@ function handle_dashboard_route(
         return handle_events(http, req)
     end
 
-    # SSE streaming endpoints (not yet implemented - return 501 to prevent retries)
-    if path == "/dashboard/api/events/stream" || path == "/dashboard/api/sessions/stream"
+    # SSE streaming endpoint for events
+    if path == "/dashboard/api/events/stream"
+        return handle_events_stream(http, req)
+    end
+
+    # Sessions stream not yet implemented
+    if path == "/dashboard/api/sessions/stream"
         send_json_response(
             http,
             Dict(
-                "error" => "SSE streaming not yet implemented",
-                "message" => "Real-time streaming via Server-Sent Events is not yet available. Please use polling endpoints instead.",
+                "error" => "Sessions streaming not yet implemented",
+                "message" => "Real-time session streaming is not yet available.",
             );
             status = 501,
         )
@@ -396,5 +401,69 @@ end
 
 function handle_dashboard_websocket(http::HTTP.Stream)
     send_json_response(http, "WebSocket not yet implemented"; status = 501)
+    return nothing
+end
+
+function handle_events_stream(http::HTTP.Stream, req::HTTP.Request)
+    query_params = parse_query_params(req)
+    session_id = get(query_params, "id", nothing)
+
+    # Set SSE headers
+    HTTP.setstatus(http, 200)
+    HTTP.setheader(http, "Content-Type" => "text/event-stream")
+    HTTP.setheader(http, "Cache-Control" => "no-cache")
+    HTTP.setheader(http, "Connection" => "keep-alive")
+    HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
+    HTTP.startwrite(http)
+
+    # Send initial connection event
+    write(http, "event: connected\n")
+    write(http, "data: {\"status\":\"connected\"}\n\n")
+    flush(http)
+
+    # Track last seen event ID to only send new events
+    last_event_time = now()
+
+    try
+        while isopen(http)
+            # Get recent events from database
+            events = if session_id !== nothing
+                Database.get_events(; julia_session_id = session_id, limit = 50)
+            else
+                Database.get_events(; limit = 50)
+            end
+
+            # Filter to only new events (timestamp > last_event_time)
+            for event in events
+                # Parse timestamp from event
+                event_timestamp = try
+                    if haskey(event, "timestamp") && event["timestamp"] !== nothing
+                        DateTime(event["timestamp"], "yyyy-mm-dd HH:MM:SS")
+                    else
+                        continue
+                    end
+                catch
+                    continue
+                end
+
+                if event_timestamp > last_event_time
+                    # Send event in SSE format
+                    write(http, "event: update\n")
+                    write(http, "data: $(JSON.json(event))\n\n")
+                    flush(http)
+
+                    last_event_time = max(last_event_time, event_timestamp)
+                end
+            end
+
+            # Wait before next poll
+            sleep(0.5)
+        end
+    catch e
+        if !(e isa Base.IOError)
+            @debug "SSE stream error" exception = (e, catch_backtrace())
+        end
+    end
+
     return nothing
 end
