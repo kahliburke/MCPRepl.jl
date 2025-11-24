@@ -1,6 +1,7 @@
 using HTTP
 using JSON
 using Logging
+using UUIDs
 
 # Import Session module
 include("session.jl")
