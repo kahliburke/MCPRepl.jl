@@ -1559,9 +1559,16 @@ function start_foreground_server(port::Int = 3000)
     println("Proxy log file: $log_file")
 
     # Initialize database (lazy initialization on server start)
-    db_dir = joinpath(dirname(@__DIR__), ".mcprepl")
-    mkpath(db_dir)
-    db_path = joinpath(db_dir, "events-$(getpid()).db")
+    # Use XDG_CACHE_HOME for persistent storage across proxy restarts
+    cache_dir = get(ENV, "XDG_CACHE_HOME") do
+        if Sys.iswindows()
+            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
+        else
+            joinpath(homedir(), ".cache", "mcprepl")
+        end
+    end
+    mkpath(cache_dir)
+    db_path = joinpath(cache_dir, "mcprepl.db")
     init_database!(db_path)
 
     # Start ETL scheduler for analytics
