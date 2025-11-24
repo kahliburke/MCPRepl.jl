@@ -213,6 +213,14 @@ function route_to_session_streaming(
         target_id = isempty(header_value) ? nothing : String(header_value)
     end
 
+    # Check for per-request target override in params (highest priority)
+    params = get(request, "params", Dict())
+    target_override = get(params, "target", nothing)
+    if target_override !== nothing
+        target_id = String(target_override)
+        @debug "Target overridden by request params" target_id = target_id
+    end
+
     # If still no target, this request requires a backend Julia session but none is available
     if target_id === nothing
         sessions = list_julia_sessions()
@@ -240,8 +248,11 @@ function route_to_session_streaming(
         end
     end
 
-    # Get the Julia session connection
+    # Get the Julia session connection (try UUID first, then name)
     session = get_julia_session(target_id)
+    if session === nothing
+        session = get_julia_session_by_name(target_id)
+    end
 
     if session === nothing
         send_jsonrpc_error(
@@ -411,7 +422,8 @@ function route_to_session_streaming(
         end
 
         # Log the backend response before sending to client
-        request_id_val = get(request, "id", nothing)
+        request_id_raw = get(request, "id", nothing)
+        request_id_val = request_id_raw === nothing ? nothing : string(request_id_raw)
         log_db_interaction(
             "outbound",
             "response",
@@ -558,7 +570,8 @@ function handle_request(http::HTTP.Stream)
 
             if !isempty(body) && req.method == "POST"
                 request_parsed = JSON.parse(body)
-                request_id = get(request_parsed, "id", nothing)
+                request_id_raw = get(request_parsed, "id", nothing)
+                request_id = request_id_raw === nothing ? nothing : string(request_id_raw)
                 request_method = get(request_parsed, "method", nothing)
             end
 
@@ -1110,6 +1123,15 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
+            # Check for per-request target override in params (highest priority)
+            params = get(request, "params", Dict())
+            target_override = get(params, "target", nothing)
+            if target_override !== nothing
+                target_julia_session_id = String(target_override)
+                @debug "tools/list target overridden by request params" target_julia_session_id =
+                    target_julia_session_id
+            end
+
             # If no session or no target Julia session, return only proxy tools
             if target_julia_session_id === nothing
                 sessions = list_julia_sessions()
@@ -1124,7 +1146,11 @@ function handle_request(http::HTTP.Stream)
             end
 
             # Fetch tools from the target Julia session and combine with proxy tools
+            # Try UUID first, then name
             session = get_julia_session(target_julia_session_id)
+            if session === nothing
+                session = get_julia_session_by_name(target_julia_session_id)
+            end
             all_tools = copy(proxy_tools)
 
             if session !== nothing && session.status == :ready

@@ -583,6 +583,63 @@ function create_handler(
                     tool = tools[tool_id]
                     args = get(request["params"], "arguments", Dict())
 
+                    # Validate parameters - collect all errors first
+                    error_messages = String[]
+
+                    # Check for unknown parameters first
+                    if haskey(tool.parameters, "properties")
+                        allowed_params = keys(tool.parameters["properties"])
+                        unknown_params = String[]
+                        for param in keys(args)
+                            if !(param in allowed_params)
+                                push!(unknown_params, param)
+                            end
+                        end
+
+                        if !isempty(unknown_params)
+                            allowed_list = join(sort(collect(allowed_params)), ", ")
+                            push!(
+                                error_messages,
+                                "Unknown parameter(s): $(join(unknown_params, ", ")). Valid parameters are: $allowed_list",
+                            )
+                        end
+                    end
+
+                    # Check for missing required parameters
+                    if haskey(tool.parameters, "required")
+                        required_params = tool.parameters["required"]
+                        missing_params = String[]
+                        for param in required_params
+                            if !haskey(args, param)
+                                push!(missing_params, param)
+                            end
+                        end
+
+                        if !isempty(missing_params)
+                            push!(
+                                error_messages,
+                                "Missing required parameter(s): $(join(missing_params, ", "))",
+                            )
+                        end
+                    end
+
+                    # If there are any validation errors, return them all
+                    if !isempty(error_messages)
+                        error_response = Dict(
+                            "jsonrpc" => "2.0",
+                            "id" => request["id"],
+                            "error" => Dict(
+                                "code" => -32602,
+                                "message" => join(error_messages, ". "),
+                            ),
+                        )
+                        return HTTP.Response(
+                            400,
+                            ["Content-Type" => "application/json"],
+                            JSON.json(error_response),
+                        )
+                    end
+
                     # Non-streaming mode (streaming handled in hybrid_handler)
                     result_text = tool.handler(args)
 

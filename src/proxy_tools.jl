@@ -75,11 +75,30 @@ const HELP_TOOL =
         ## Session Management
         Each MCP client receives a unique session ID on initialization. Sessions can be associated with specific Julia backends using the X-MCPRepl-Target header, or remain at proxy-level for management operations.
 
+        ## Targeting Julia Sessions
+        You can route requests to specific Julia sessions in three ways (in order of priority):
+        1. **Per-request parameter**: Add `"target": "session_name_or_uuid"` to any request params
+        2. **HTTP header**: Set `X-MCPRepl-Target` header during initialization
+        3. **Session default**: Set at initialization, used if no override specified
+
+        Example per-request targeting:
+        ```json
+        {
+          "method": "tools/call",
+          "params": {
+            "name": "ex",
+            "target": "KoopmanInvest",
+            "arguments": {"code": "1 + 1"}
+          }
+        }
+        ```
+
         ## Getting Started
-        1. Call `list_julia_sessions` to see if any sessions exist
+        1. Call `list_julia_sessions` to see available sessions (shows names and UUIDs)
         2. If none exist, call `start_julia_session` with a project path
         3. Once started, Julia tools become available automatically
-        4. Use `dashboard_url` to access real-time monitoring
+        4. Use the `target` parameter to route requests to specific sessions
+        5. Use `dashboard_url` to access real-time monitoring
         """
     end
 
@@ -99,7 +118,7 @@ const PROXY_STATUS_TOOL =
         else
             status_text *= "\n\nConnected agents:\n"
             for repl in julia_sessions
-                status_text *= "  - $(repl.id) (port $(repl.port), status: $(repl.status))\n"
+                status_text *= "  - $(repl.name) (port $(repl.port), status: $(repl.status))\n"
             end
         end
         status_text
@@ -127,7 +146,8 @@ const LIST_JULIA_SESSIONS_TOOL =
             agent_text = "Connected Julia sessions ($(length(julia_sessions))):\n\n"
             for repl in julia_sessions
                 pid_str = repl.pid === nothing ? "N/A" : string(repl.pid)
-                agent_text *= "**$(repl.id)**\n"
+                agent_text *= "**$(repl.name)**\n"
+                agent_text *= "  - UUID: $(repl.uuid)\n"
                 agent_text *= "  - Port: $(repl.port)\n"
                 agent_text *= "  - PID: $pid_str\n"
                 agent_text *= "  - Status: $(repl.status)\n"
