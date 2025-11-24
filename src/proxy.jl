@@ -44,11 +44,10 @@ const VITE_DEV_PORT = 3001
 CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()
 CLIENT_CONNECTIONS_LOCK = ReentrantLock()
 
-# Initialize global state after precompilation
+# Initialize global state at runtime (after precompilation)
 # Note: JULIA_SESSION_REGISTRY, MCP_SESSION_REGISTRY and their locks
-# are defined in proxy/session_registry.jl and initialized there
+# are defined in proxy/session_registry.jl and re-initialized here
 function __init__()
-    ccall(:jl_generating_output, Cint, ()) == 1 && return
     # Re-initialize session registries (defined in session_registry.jl)
     global JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
     global JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
