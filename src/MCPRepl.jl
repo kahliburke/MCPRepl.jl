@@ -1107,7 +1107,8 @@ function start!(;
                 "id" => 1,
                 "method" => "proxy/register",
                 "params" => Dict(
-                    "id" => repl_id,
+                    "uuid" => SERVER[].uuid,
+                    "name" => repl_id,
                     "port" => actual_port,
                     "pid" => getpid(),
                     "metadata" => Dict(
@@ -1201,7 +1202,8 @@ function start!(;
                                     "id" => rand(1:1000000),
                                     "method" => "proxy/heartbeat",
                                     "params" => Dict(
-                                        "id" => repl_id,
+                                        "uuid" => SERVER[].uuid,
+                                        "name" => repl_id,
                                         "port" => actual_port,
                                         "pid" => getpid(),
                                         "metadata" => heartbeat_metadata,

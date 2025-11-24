@@ -12,6 +12,7 @@ import ..MCPRepl:
 
 # Server with tool registry and session management
 mutable struct MCPServer
+    uuid::String                          # Unique identifier for this session (persists across reconnections)
     port::Int
     server::HTTP.Server
     tools::Dict{Symbol,MCPTool}           # Symbol-keyed registry
@@ -667,6 +668,9 @@ function start_mcp_server(
     verbose::Bool = true,
     security_config::Union{SecurityConfig,Nothing} = nothing,
 )
+    # Generate UUID for this session (persists across reconnections)
+    session_uuid = string(UUIDs.uuid4())
+
     # Build symbol-keyed registry
     tools_dict = Dict{Symbol,MCPTool}(tool.id => tool for tool in tools)
     # Build string→symbol mapping for JSON-RPC
@@ -941,7 +945,7 @@ function start_mcp_server(
         end
     end
 
-    return MCPServer(port, server, tools_dict, name_to_id, session)
+    return MCPServer(session_uuid, port, server, tools_dict, name_to_id, session)
 end
 
 function stop_mcp_server(server::MCPServer)

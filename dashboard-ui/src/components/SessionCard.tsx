@@ -32,7 +32,10 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
             title="Click to view logs"
         >
             <div className="session-header">
-                <span className="session-id">{session.id}</span>
+                <span className="session-id">{session.name}</span>
+                <span className="session-uuid" title={`UUID: ${session.uuid}`} style={{ fontSize: '0.75em', color: '#64748b', marginLeft: '8px' }}>
+                    {session.uuid.substring(0, 8)}...
+                </span>
             </div>
 
             <div className="status-line">
@@ -48,7 +51,7 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
                             className="restart-btn"
                             onClick={(e) => {
                                 e.stopPropagation();
-                                onRestart(session.id);
+                                onRestart(session.uuid);
                             }}
                             title="Restart this session"
                         >
@@ -60,7 +63,7 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
                             className="shutdown-btn"
                             onClick={(e) => {
                                 e.stopPropagation();
-                                onShutdown(session.id);
+                                onShutdown(session.uuid);
                             }}
                             title="Shutdown this session"
                         >
@@ -113,7 +116,7 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
             )}
 
             <div className="heartbeat-container">
-                <HeartbeatChart sessionId={session.id} />
+                <HeartbeatChart sessionId={session.uuid} />
             </div>
         </div>
     );

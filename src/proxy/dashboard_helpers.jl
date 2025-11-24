@@ -111,7 +111,8 @@ function send_jsonrpc_to_session(conn, method::String, params::Dict)
         )
         return response.status == 200
     catch e
-        @warn "Failed to send JSON-RPC to session" session_id = conn.id error = e
+        @warn "Failed to send JSON-RPC to session" session_uuid = conn.uuid session_name =
+            conn.name error = e
         return false
     end
 end

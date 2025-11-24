@@ -184,14 +184,16 @@ function handle_sessions_list(http::HTTP.Stream)
     start_time = time()
     sessions = lock(JULIA_SESSION_REGISTRY_LOCK) do
         result = Dict{String,Any}()
-        for (id, conn) in JULIA_SESSION_REGISTRY
-            result[id] = Dict(
-                "id" => id,
+        for (uuid, conn) in JULIA_SESSION_REGISTRY
+            result[uuid] = Dict(
+                "uuid" => uuid,
+                "name" => conn.name,
                 "port" => conn.port,
                 "pid" => conn.pid,
                 "status" => string(conn.status),
                 "last_heartbeat" =>
                     Dates.format(conn.last_heartbeat, "yyyy-mm-dd HH:MM:SS"),
+                "created_at" => Dates.format(conn.created_at, "yyyy-mm-dd HH:MM:SS"),
             )
         end
         result

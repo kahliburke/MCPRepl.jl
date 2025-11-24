@@ -7,6 +7,7 @@ Pkg.activate(@__DIR__)
 using MCPRepl
 using MCPRepl.Proxy
 using MCPRepl.Dashboard
+
 # Check if proxy is already running and stop it if requested
 port = 3000
 if Proxy.is_server_running(port)

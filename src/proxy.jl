@@ -227,12 +227,13 @@ function route_to_session_streaming(
             return nothing
         else
             # julia_sessions exist but session doesn't have a target
-            julia_session_ids = join([s.id for s in julia_sessions], ", ")
+            julia_session_ids =
+                join(["$(s.name) ($(s.uuid))" for s in julia_sessions], ", ")
             send_jsonrpc_error(
                 http,
                 get(request, "id", nothing),
                 -32001,
-                "No target Julia session specified. Available ids: $julia_session_ids. Re-initialize with X-MCPRepl-Target header to specify a target.";
+                "No target Julia session specified. Available sessions: $julia_session_ids. Re-initialize with X-MCPRepl-Target header to specify a target.";
                 status = 400,
             )
             return nothing
@@ -752,7 +753,8 @@ function handle_request(http::HTTP.Stream)
                     "connected_sessions" => length(sessions),
                     "sessions" => [
                         Dict(
-                            "id" => s.id,
+                            "uuid" => s.uuid,
+                            "name" => s.name,
                             "port" => s.port,
                             "status" => string(s.status),
                             "pid" => s.pid,
@@ -766,7 +768,8 @@ function handle_request(http::HTTP.Stream)
         elseif method == "proxy/register"
             # Register a new julia session
             params = get(request, "params", Dict())
-            id = get(params, "id", nothing)
+            uuid = get(params, "uuid", nothing)
+            name = get(params, "name", nothing)
             port = get(params, "port", nothing)
             pid = get(params, "pid", nothing)
             metadata_raw = get(params, "metadata", Dict())
@@ -776,45 +779,45 @@ function handle_request(http::HTTP.Stream)
                 metadata_raw isa Dict ? metadata_raw :
                 Dict(String(k) => v for (k, v) in pairs(metadata_raw))
 
-            if id === nothing || port === nothing
+            if uuid === nothing || name === nothing || port === nothing
                 send_jsonrpc_error(
                     http,
                     get(request, "id", nothing),
                     -32602,
-                    "Invalid params: 'id' and 'port' are required";
+                    "Invalid params: 'uuid', 'name', and 'port' are required";
                     status = 400,
                 )
                 return nothing
             end
 
-            # Check if a session with this ID already exists
+            # Check if a session with this UUID already exists
             existing_session = lock(JULIA_SESSION_REGISTRY_LOCK) do
-                get(JULIA_SESSION_REGISTRY, id, nothing)
+                get(JULIA_SESSION_REGISTRY, uuid, nothing)
             end
 
             if existing_session !== nothing
                 # Session already exists - check if it's the same process or a duplicate
                 if existing_session.pid == pid
-                    @warn "Re-registration from same process - updating" id = id port = port pid =
-                        pid
+                    @warn "Re-registration from same process - updating" uuid = uuid name =
+                        name port = port pid = pid
                     # Allow re-registration from same PID (process restart case)
                 elseif existing_session.pid !== nothing &&
                        !process_running(existing_session.pid)
-                    @warn "Cleaning up stale registration - process no longer running" id =
-                        id stale_pid = existing_session.pid new_pid = pid
+                    @warn "Cleaning up stale registration - process no longer running" uuid =
+                        uuid stale_pid = existing_session.pid new_pid = pid
                     # Process is dead, allow re-registration by removing stale entry
                     lock(JULIA_SESSION_REGISTRY_LOCK) do
-                        delete!(JULIA_SESSION_REGISTRY, id)
+                        delete!(JULIA_SESSION_REGISTRY, uuid)
                     end
                 else
-                    @error "Duplicate registration attempted" id = id existing_pid =
+                    @error "Duplicate registration attempted" uuid = uuid existing_pid =
                         existing_session.pid new_pid = pid existing_port =
                         existing_session.port new_port = port
                     send_jsonrpc_error(
                         http,
                         get(request, "id", nothing),
                         -32000,
-                        "Session ID '$id' is already registered by another process (PID $(existing_session.pid) on port $(existing_session.port)). Choose a different session name or stop the existing session first.";
+                        "Session UUID '$uuid' is already registered by another process (PID $(existing_session.pid) on port $(existing_session.port)). This should not happen - UUIDs are unique per session.";
                         status = 409,
                         data = Dict(
                             "existing_pid" => existing_session.pid,
@@ -828,7 +831,7 @@ function handle_request(http::HTTP.Stream)
             end
 
             success, error_msg =
-                register_julia_session(id, port; pid = pid, metadata = metadata)
+                register_julia_session(uuid, name, port; pid = pid, metadata = metadata)
 
             if !success
                 send_jsonrpc_error(
@@ -844,44 +847,44 @@ function handle_request(http::HTTP.Stream)
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
-                Dict("status" => "registered", "id" => id),
+                Dict("status" => "registered", "uuid" => uuid, "name" => name),
             )
             return nothing
         elseif method == "proxy/unregister"
             # Unregister a Julia session
             params = get(request, "params", Dict())
-            id = get(params, "id", nothing)
+            uuid = get(params, "uuid", nothing)
 
-            if id === nothing
+            if uuid === nothing
                 send_jsonrpc_error(
                     http,
                     get(request, "id", nothing),
                     -32602,
-                    "Invalid params: 'id' is required";
+                    "Invalid params: 'uuid' is required";
                     status = 400,
                 )
                 return nothing
             end
 
-            unregister_julia_session(id)
+            unregister_julia_session(uuid)
 
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
-                Dict("status" => "unregistered", "id" => id),
+                Dict("status" => "unregistered", "uuid" => uuid),
             )
             return nothing
         elseif method == "proxy/heartbeat"
             # Julia session sends heartbeat to indicate it's alive
             params = get(request, "params", Dict())
-            id = get(params, "id", nothing)
+            uuid = get(params, "uuid", nothing)
 
-            if id === nothing
+            if uuid === nothing
                 send_jsonrpc_error(
                     http,
                     get(request, "id", nothing),
                     -32602,
-                    "Invalid params: 'id' is required";
+                    "Invalid params: 'uuid' is required";
                     status = 400,
                 )
                 return nothing
@@ -889,56 +892,59 @@ function handle_request(http::HTTP.Stream)
 
             # Update heartbeat and recover from disconnected/stopped state
             lock(JULIA_SESSION_REGISTRY_LOCK) do
-                if haskey(JULIA_SESSION_REGISTRY, id)
-                    existing_session = JULIA_SESSION_REGISTRY[id]
+                if haskey(JULIA_SESSION_REGISTRY, uuid)
+                    existing_session = JULIA_SESSION_REGISTRY[uuid]
                     heartbeat_pid = get(params, "pid", nothing)
 
                     # Check if this heartbeat is from the registered process
                     if heartbeat_pid !== nothing && existing_session.pid != heartbeat_pid
-                        @error "Duplicate heartbeat detected - different PID for same session ID" id =
-                            id registered_pid = existing_session.pid heartbeat_pid =
+                        @error "Duplicate heartbeat detected - different PID for same session UUID" uuid =
+                            uuid registered_pid = existing_session.pid heartbeat_pid =
                             heartbeat_pid
                         # Reject this heartbeat - don't update the legitimate session
                         # The duplicate process will not be registered
                         return nothing
                     end
 
-                    JULIA_SESSION_REGISTRY[id].last_heartbeat = now()
-                    JULIA_SESSION_REGISTRY[id].missed_heartbeats = 0  # Reset counter on successful heartbeat
+                    JULIA_SESSION_REGISTRY[uuid].last_heartbeat = now()
+                    JULIA_SESSION_REGISTRY[uuid].missed_heartbeats = 0  # Reset counter on successful heartbeat
                     # Automatically recover from disconnected or stopped state on heartbeat
-                    if JULIA_SESSION_REGISTRY[id].status in
+                    if JULIA_SESSION_REGISTRY[uuid].status in
                        (:stopped, :disconnected, :reconnecting)
-                        old_status = JULIA_SESSION_REGISTRY[id].status
-                        JULIA_SESSION_REGISTRY[id].status = :ready
-                        JULIA_SESSION_REGISTRY[id].last_error = nothing
-                        JULIA_SESSION_REGISTRY[id].disconnect_time = nothing
-                        @info "Julia session recovered via heartbeat" id = id old_status =
+                        old_status = JULIA_SESSION_REGISTRY[uuid].status
+                        JULIA_SESSION_REGISTRY[uuid].status = :ready
+                        JULIA_SESSION_REGISTRY[uuid].last_error = nothing
+                        JULIA_SESSION_REGISTRY[uuid].disconnect_time = nothing
+                        @info "Julia session recovered via heartbeat" uuid = uuid old_status =
                             old_status
                     end
 
                     # Log heartbeat event (don't spam - could be rate limited in Dashboard module)
-                    Dashboard.log_event(id, Dashboard.HEARTBEAT, Dict("status" => "ok"))
+                    Dashboard.log_event(uuid, Dashboard.HEARTBEAT, Dict("status" => "ok"))
                 else
                     # Session not in registry - proxy may have restarted
                     # Try to re-register by extracting info from heartbeat params
+                    name = get(params, "name", nothing)
                     port = get(params, "port", nothing)
                     pid = get(params, "pid", nothing)
                     metadata_raw = get(params, "metadata", Dict())
 
-                    if port !== nothing && pid !== nothing
-                        @info "Re-registering session from heartbeat (proxy restart detected)" id =
-                            id port = port pid = pid
+                    if name !== nothing && port !== nothing && pid !== nothing
+                        @info "Re-registering session from heartbeat (proxy restart detected)" uuid =
+                            uuid name = name port = port pid = pid
                         metadata =
                             metadata_raw isa Dict ? metadata_raw :
                             Dict(String(k) => v for (k, v) in pairs(metadata_raw))
 
                         # Register the session
-                        JULIA_SESSION_REGISTRY[id] = JuliaSession(
-                            id,
+                        JULIA_SESSION_REGISTRY[uuid] = JuliaSession(
+                            uuid,
+                            name,
                             port,
                             pid,
                             :ready,
-                            now(),
+                            now(),  # created_at
+                            now(),  # last_heartbeat
                             metadata,
                             nothing,
                             0,
@@ -948,18 +954,20 @@ function handle_request(http::HTTP.Stream)
 
                         # Log registration event
                         Dashboard.log_event(
-                            id,
+                            uuid,
                             Dashboard.AGENT_START,
                             Dict(
                                 "port" => port,
                                 "pid" => pid,
+                                "name" => name,
                                 "metadata" => metadata,
                                 "reason" => "reregistered_from_heartbeat",
                             ),
                         )
                     else
-                        @warn "Heartbeat from unknown session without port/pid info - cannot re-register" id =
-                            id has_port = (port !== nothing) has_pid = (pid !== nothing)
+                        @warn "Heartbeat from unknown session without name/port/pid info - cannot re-register" uuid =
+                            uuid has_name = (name !== nothing) has_port = (port !== nothing) has_pid =
+                            (pid !== nothing)
                     end
                 end
             end
@@ -1319,6 +1327,13 @@ function handle_request(http::HTTP.Stream)
                 # Parse arguments
                 args = get(params, "arguments", Dict())
                 project_path = get(args, "project_path", "")
+
+                # Expand tilde in path and strip trailing slashes
+                if startswith(project_path, "~/")
+                    project_path = joinpath(homedir(), project_path[3:end])
+                end
+                project_path = rstrip(project_path, '/')
+
                 session_name = get(args, "session_name", basename(project_path))
 
                 if isempty(project_path)
@@ -1332,7 +1347,7 @@ function handle_request(http::HTTP.Stream)
                 end
 
                 # Check if Julia session already exists
-                existing = findfirst(s -> s.id == session_name, julia_sessions)
+                existing = findfirst(s -> s.name == session_name, julia_sessions)
                 if existing !== nothing
                     send_mcp_tool_result(
                         http,
@@ -1365,8 +1380,6 @@ function handle_request(http::HTTP.Stream)
                     startup_code = """
                     Base.stderr = Base.IOContext(Base.stderr, :color => false)
                     Base.stdout = Base.IOContext(Base.stdout, :color => false)
-                    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t), Base.stdout.io, C_NULL, 0, 0)
-                    ccall(:setvbuf, Cint, (Ptr{Cvoid}, Ptr{Cvoid}, Cint, Csize_t), Base.stderr.io, C_NULL, 0, 0)
                     using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path))); wait()
                     """
                     julia_cmd = `julia --project=$project_path -e $startup_code`
@@ -1387,22 +1400,22 @@ function handle_request(http::HTTP.Stream)
                         wait = false,
                     )
 
-                    # Wait for Julia session to register (max 30 seconds to allow for precompilation)
+                    # Wait for Julia session to register (max 60 seconds to allow for precompilation)
                     # When agent_name is provided, MCPRepl registers using that name directly
                     registered = false
                     expected_id = session_name
-                    for i = 1:300  # 30 seconds with 0.1s sleep
+                    for i = 1:600  # 60 seconds with 0.1s sleep
                         sleep(0.1)
                         current_sessions = list_julia_sessions()
-                        # Check for the expected registration ID
-                        idx = findfirst(s -> s.id == expected_id, current_sessions)
+                        # Check for the expected registration name
+                        idx = findfirst(s -> s.name == expected_id, current_sessions)
                         if idx !== nothing
                             registered = true
                             new_session = current_sessions[idx]
                             send_mcp_tool_result(
                                 http,
                                 get(request, "id", nothing),
-                                "✅ Successfully started Julia session '$(new_session.id)' on port $(new_session.port)\n\nProject: $project_path\nPID: $(new_session.pid)\nStatus: $(new_session.status)\nLog: $log_file",
+                                "✅ Successfully started Julia session '$(new_session.name)' on port $(new_session.port)\n\nProject: $project_path\nPID: $(new_session.pid)\nStatus: $(new_session.status)\nLog: $log_file",
                             )
                             return nothing
                         end
@@ -1426,7 +1439,7 @@ function handle_request(http::HTTP.Stream)
                         http,
                         get(request, "id", nothing),
                         -32603,
-                        "Julia session process started but did not register within 30 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents",
+                        "Julia session process started but did not register within 60 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents",
                     )
                     return nothing
                 catch e

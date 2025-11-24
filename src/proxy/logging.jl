@@ -12,18 +12,40 @@ function setup_proxy_logging(port::Int)
     end
     mkpath(cache_dir)
 
-    log_file = joinpath(cache_dir, "proxy-$port.log")
+    # Two log files:
+    # 1. Full debug log with everything
+    full_log_file = joinpath(cache_dir, "proxy-$port.log")
+    # 2. Info-only log with just INFO, WARN, ERROR (no DEBUG)
+    info_log_file = joinpath(cache_dir, "proxy-$port-info.log")
 
-    # Use FileLogger with automatic flushing and timestamp formatting
-    logger = LoggingExtras.TransformerLogger(
-        LoggingExtras.FileLogger(log_file; append = true, always_flush = true),
-    ) do log
-        merge(log, (; message = "$(Dates.format(now(), "HH:MM:SS.sss")) $(log.message)"))
-    end
+    # Timestamp transformer for both loggers
+    add_timestamp =
+        log -> merge(
+            log,
+            (; message = "$(Dates.format(now(), "HH:MM:SS.sss")) $(log.message)"),
+        )
+
+    # Full logger (all levels including DEBUG)
+    full_logger = LoggingExtras.TransformerLogger(
+        add_timestamp,
+        LoggingExtras.FileLogger(full_log_file; append = true, always_flush = true),
+    )
+
+    # Info-only logger (INFO and above, no DEBUG)
+    info_logger = LoggingExtras.MinLevelLogger(
+        LoggingExtras.TransformerLogger(
+            add_timestamp,
+            LoggingExtras.FileLogger(info_log_file; append = true, always_flush = true),
+        ),
+        Logging.Info,
+    )
+
+    # Use TeeLogger to write to both files
+    logger = LoggingExtras.TeeLogger(full_logger, info_logger)
     global_logger(logger)
 
-    @info "Proxy logging initialized" log_file = log_file
-    return log_file
+    @info "Proxy logging initialized" full_log = full_log_file info_log = info_log_file
+    return full_log_file
 end
 
 # Helper function to log events to database with dual-session tracking

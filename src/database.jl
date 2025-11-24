@@ -1451,40 +1451,48 @@ function get_session_summary(session_id::String)
         error("Database not initialized. Call init_db!() first.")
     end
 
-    # Get session info
-    session_info =
+    # Try to find session in either mcp_sessions or julia_sessions
+    mcp_session =
+        DBInterface.execute(db, "SELECT * FROM mcp_sessions WHERE id = ?", (session_id,)) |>
+        DataFrame
+
+    julia_session =
         DBInterface.execute(
             db,
-            "SELECT * FROM sessions WHERE session_id = ?",
+            "SELECT * FROM julia_sessions WHERE id = ?",
             (session_id,),
         ) |> DataFrame
 
-    if nrow(session_info) == 0
-        error("Session not found: $session_id")
+    session_info = if nrow(mcp_session) > 0
+        mcp_session
+    elseif nrow(julia_session) > 0
+        julia_session
+    else
+        DataFrame()  # Session not found in either table
     end
 
-    # Count interactions
+    # Count interactions (check both mcp_session_id and julia_session_id)
     interaction_count =
         DBInterface.execute(
             db,
-            "SELECT COUNT(*) as count FROM interactions WHERE session_id = ?",
-            (session_id,),
+            "SELECT COUNT(*) as count FROM interactions WHERE mcp_session_id = ? OR julia_session_id = ?",
+            (session_id, session_id),
         ) |> DataFrame
 
     # Count events
     event_count =
         DBInterface.execute(
             db,
-            "SELECT COUNT(*) as count FROM events WHERE session_id = ?",
-            (session_id,),
+            "SELECT COUNT(*) as count FROM events WHERE mcp_session_id = ? OR julia_session_id = ?",
+            (session_id, session_id),
         ) |> DataFrame
 
     # Get total data size
     data_size =
         DBInterface.execute(
             db,
-            "SELECT SUM(content_size) as total_bytes FROM interactions WHERE session_id = ?",
-            (session_id,),
+            "SELECT SUM(content_size) as total_bytes FROM interactions WHERE mcp_session_id = ? OR julia_session_id = ?",
+            (session_id, session_id),
         ) |> DataFrame
 
     # Get request/response pairs
@@ -1494,19 +1502,19 @@ function get_session_summary(session_id::String)
             """
             SELECT request_id, COUNT(*) as pair_count
             FROM interactions
-            WHERE session_id = ? AND request_id IS NOT NULL
+            WHERE (mcp_session_id = ? OR julia_session_id = ?) AND request_id IS NOT NULL
             GROUP BY request_id
             HAVING pair_count >= 2
             """,
-            (session_id,),
+            (session_id, session_id),
         ) |> DataFrame
 
     return Dict(
         "session_id" => session_id,
-        "session_info" => session_info,
+        "session_info" => dataframe_to_array(session_info),
         "total_interactions" => interaction_count[1, :count],
         "total_events" => event_count[1, :count],
-        "total_data_bytes" => data_size[1, :total_bytes],
+        "total_data_bytes" => something(data_size[1, :total_bytes], 0),
         "complete_request_response_pairs" => nrow(request_response_pairs),
     )
 end
@@ -1682,10 +1690,11 @@ function get_session_timeline(session_id::String)
                 'event' as entry_type,
                 timestamp,
                 event_type,
-                level,
-                message,
+                duration_ms,
+                data,
                 NULL as method,
-                NULL as direction
+                NULL as direction,
+                NULL as request_id
             FROM events
             WHERE mcp_session_id = ? OR julia_session_id = ?
             """,
@@ -1701,10 +1710,11 @@ function get_session_timeline(session_id::String)
                 'interaction' as entry_type,
                 timestamp,
                 message_type as event_type,
-                NULL as level,
-                NULL as message,
+                NULL as duration_ms,
+                content as data,
                 method,
-                direction
+                direction,
+                request_id
             FROM interactions
             WHERE mcp_session_id = ? OR julia_session_id = ?
             """,
