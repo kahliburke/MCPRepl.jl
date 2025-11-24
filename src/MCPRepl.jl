@@ -890,6 +890,12 @@ function start!(;
     security_config = load_security_config(workspace_dir, agent_name, supervisor)
 
     if security_config === nothing
+        # Stop spinner before showing error
+        spinner_active[] = false
+        wait(spinner_task)
+        global_logger(old_logger)
+
+        print("\r\033[K")  # Clear spinner line
         printstyled("\n⚠️  NO SECURITY CONFIGURATION FOUND\n", color = :red, bold = true)
         println()
         println("MCPRepl requires security configuration before starting.")
@@ -930,6 +936,12 @@ function start!(;
     # Override security mode if specified
     if security_mode !== nothing
         if !(security_mode in [:strict, :relaxed, :lax])
+            # Stop spinner before showing error
+            spinner_active[] = false
+            wait(spinner_task)
+            global_logger(old_logger)
+
+            print("\r\033[K")  # Clear spinner line
             error("Invalid security_mode. Must be :strict, :relaxed, or :lax")
         end
         security_config = SecurityConfig(
@@ -1143,6 +1155,13 @@ function start!(;
                     "message",
                     "Session ID already in use",
                 )
+
+                # Stop spinner before showing error
+                spinner_active[] = false
+                wait(spinner_task)
+                global_logger(old_logger)
+
+                print("\r\033[K")  # Clear spinner line
                 printstyled("❌ Registration failed: ", color = :red, bold = true)
                 println(error_msg)
                 printstyled("💡 Tip: ", color = :yellow, bold = true)
@@ -1164,7 +1183,13 @@ function start!(;
                         length(body_str) > 200 ? body_str[1:200] * "..." : body_str
                 end
 
+                # Stop spinner before showing error
+                spinner_active[] = false
+                wait(spinner_task)
+                global_logger(old_logger)
+
                 # Show user-friendly error message
+                print("\r\033[K")  # Clear spinner line
                 printstyled("❌ Registration failed: ", color = :red, bold = true)
                 if !isempty(error_details)
                     println(error_details)
