@@ -438,11 +438,18 @@ function handle_events_stream(http::HTTP.Stream, req::HTTP.Request)
                 # Parse timestamp from event
                 event_timestamp = try
                     if haskey(event, "timestamp") && event["timestamp"] !== nothing
-                        DateTime(event["timestamp"], "yyyy-mm-dd HH:MM:SS")
+                        # Try parsing with milliseconds first, fall back to without
+                        try
+                            DateTime(event["timestamp"], "yyyy-mm-dd HH:MM:SS.sss")
+                        catch
+                            DateTime(event["timestamp"], "yyyy-mm-dd HH:MM:SS")
+                        end
                     else
                         continue
                     end
-                catch
+                catch e
+                    @debug "Failed to parse event timestamp" timestamp =
+                        get(event, "timestamp", nothing) exception = e
                     continue
                 end
 
