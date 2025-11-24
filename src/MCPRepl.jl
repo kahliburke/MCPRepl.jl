@@ -22,6 +22,7 @@ include("utils.jl")
 include("database.jl")
 include("dashboard.jl")
 include("proxy.jl")
+include("qdrant_client.jl")
 include("tools.jl")
 include("Generate.jl")
 
@@ -186,6 +187,7 @@ include("setup.jl")
 include("vscode.jl")
 include("lsp.jl")
 include("lsp_tool_definitions.jl")
+include("qdrant_tools.jl")
 
 # ============================================================================
 # VS Code Response Storage for Bidirectional Communication
@@ -1019,6 +1021,9 @@ function start!(;
     # Create LSP tools
     lsp_tools = create_lsp_tools()
 
+    # Create Qdrant tools
+    qdrant_tools = create_qdrant_tools()
+
     # Load tools configuration from workspace directory
     enabled_tools = load_tools_config(".mcprepl/tools.json", workspace_dir)
 
@@ -1055,6 +1060,7 @@ function start!(;
         pkg_rm_tool,
         run_tests_tool,
         lsp_tools...,  # LSP tools from lsp_tool_definitions.jl
+        qdrant_tools...,  # Qdrant vector database tools
     ]
 
     MCPRepl.ALL_TOOLS[] = all_tools
