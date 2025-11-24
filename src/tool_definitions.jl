@@ -1,3 +1,114 @@
+# ============================================================================
+# Helper Functions for Deduplication
+# ============================================================================
+
+"""
+    vscode_debug_command(command::String, success_message::String; args=nothing) -> String
+
+Helper function to execute VS Code debug commands via URI.
+Reduces duplication across debug step tools (step_over, step_into, step_out, continue, stop).
+
+# Arguments
+- `command`: VS Code command ID (e.g., "workbench.action.debug.stepOver")
+- `success_message`: Message to return on success
+- `args`: Optional arguments dict (can check for wait_for_response)
+
+# Returns
+Success or error message string
+"""
+function vscode_debug_command(command::String, success_message::String; args = nothing)
+    try
+        # Check if caller wants to wait for response (only step_over supports this)
+        if args !== nothing && get(args, "wait_for_response", false)
+            result = execute_repllike(
+                """execute_vscode_command("$command", wait_for_response=true, timeout=10.0)""";
+                silent = false,
+                quiet = false,
+            )
+            return result
+        else
+            trigger_vscode_uri(build_vscode_uri(command))
+            return success_message
+        end
+    catch e
+        return "Error executing $command: $e"
+    end
+end
+
+"""
+    pkg_operation_tool(operation::String, verb::String, args) -> String
+
+Helper function for package management operations (add/remove).
+Reduces duplication between pkg_add_tool and pkg_rm_tool.
+
+# Arguments
+- `operation`: Pkg function name ("add" or "rm")
+- `verb`: Past tense verb for success message ("Added" or "Removed")
+- `args`: Tool arguments containing packages array
+
+# Returns
+Success message with result or error string
+"""
+function pkg_operation_tool(operation::String, verb::String, args)
+    try
+        packages = get(args, "packages", String[])
+        if isempty(packages)
+            return "Error: packages array is required and cannot be empty"
+        end
+
+        # Use Pkg operation with io=devnull to disable interactivity
+        pkg_names = join(["\"$p\"" for p in packages], ", ")
+        code = "using Pkg; Pkg.$operation([$pkg_names]; io=devnull)"
+
+        result = execute_repllike(code; silent = false, quiet = false)
+        return "$verb packages: $(join(packages, ", "))\n\n$result"
+    catch e
+        action = lowercase(verb) * "ing"
+        return "Error $action packages: $e"
+    end
+end
+
+"""
+    code_introspection_tool(macro_name::String, description_prefix::String, args) -> String
+
+Helper function for code introspection tools (@code_lowered, @code_typed, etc.).
+Reduces duplication between code_lowered_tool and code_typed_tool.
+
+# Arguments
+- `macro_name`: Name of the macro (e.g., "code_lowered", "code_typed")
+- `description_prefix`: Prefix for description message
+- `args`: Tool arguments containing function_expr and types
+
+# Returns
+Result of code introspection or error string
+"""
+function code_introspection_tool(macro_name::String, description_prefix::String, args)
+    try
+        func_expr = get(args, "function_expr", "")
+        types_expr = get(args, "types", "")
+
+        if isempty(func_expr) || isempty(types_expr)
+            return "Error: function_expr and types parameters are required"
+        end
+
+        code = """
+        using InteractiveUtils
+        @$macro_name $func_expr($types_expr...)
+        """
+        execute_repllike(
+            code;
+            description = "[$description_prefix: $func_expr with types $types_expr]",
+            quiet = false,
+        )
+    catch e
+        return "Error getting $macro_name: $e"
+    end
+end
+
+# ============================================================================
+# Tool Definitions
+# ============================================================================
+
 ping_tool = @mcp_tool(
     :ping,
     "Check if the MCP server is responsive and return Revise.jl status.",
@@ -714,28 +825,7 @@ code_lowered_tool = @mcp_tool(
         ),
         "required" => ["function_expr", "types"],
     ),
-    args -> begin
-        try
-            func_expr = get(args, "function_expr", "")
-            types_expr = get(args, "types", "")
-
-            if isempty(func_expr) || isempty(types_expr)
-                return "Error: function_expr and types parameters are required"
-            end
-
-            code = """
-            using InteractiveUtils
-            @code_lowered $func_expr($types_expr...)
-            """
-            execute_repllike(
-                code;
-                description = "[Getting lowered code for: $func_expr with types $types_expr]",
-                quiet = false,
-            )
-        catch e
-            "Error getting lowered code: \$e"
-        end
-    end
+    args -> code_introspection_tool("code_lowered", "Getting lowered code for", args)
 )
 
 code_typed_tool = @mcp_tool(
@@ -755,28 +845,7 @@ code_typed_tool = @mcp_tool(
         ),
         "required" => ["function_expr", "types"],
     ),
-    args -> begin
-        try
-            func_expr = get(args, "function_expr", "")
-            types_expr = get(args, "types", "")
-
-            if isempty(func_expr) || isempty(types_expr)
-                return "Error: function_expr and types parameters are required"
-            end
-
-            code = """
-            using InteractiveUtils
-            @code_typed $func_expr($types_expr...)
-            """
-            execute_repllike(
-                code;
-                description = "[Getting typed code for: $func_expr with types $types_expr]",
-                quiet = false,
-            )
-        catch e
-            "Error getting typed code: \$e"
-        end
-    end
+    args -> code_introspection_tool("code_typed", "Getting typed code for", args)
 )
 
 # Optional formatting tool (requires JuliaFormatter.jl)
@@ -1196,26 +1265,11 @@ Must be in an active debug session (paused at a breakpoint).
         ),
         "required" => [],
     ),
-    function (args)
-        try
-            wait_response = get(args, "wait_for_response", false)
-
-            if wait_response
-                result = execute_repllike(
-                    """execute_vscode_command("workbench.action.debug.stepOver",
-                                              wait_for_response=true, timeout=10.0)""";
-                    silent = false,
-                    quiet = false,
-                )
-                return result
-            else
-                trigger_vscode_uri(build_vscode_uri("workbench.action.debug.stepOver"))
-                return "Stepped over current line"
-            end
-        catch e
-            return "Error stepping over: $e"
-        end
-    end
+    args -> vscode_debug_command(
+        "workbench.action.debug.stepOver",
+        "Stepped over current line";
+        args = args,
+    )
 )
 
 debug_step_into_tool = @mcp_tool(
@@ -1229,14 +1283,10 @@ Must be in an active debug session (paused at a breakpoint).
 - `debug_step_into()`
 """,
     Dict("type" => "object", "properties" => Dict(), "required" => []),
-    function (args)
-        try
-            trigger_vscode_uri(build_vscode_uri("workbench.action.debug.stepInto"))
-            return "Stepped into function"
-        catch e
-            return "Error stepping into: $e"
-        end
-    end
+    args -> vscode_debug_command(
+        "workbench.action.debug.stepInto",
+        "Stepped into function",
+    )
 )
 
 debug_step_out_tool = @mcp_tool(
@@ -1250,14 +1300,10 @@ Must be in an active debug session (paused at a breakpoint).
 - `debug_step_out()`
 """,
     Dict("type" => "object", "properties" => Dict(), "required" => []),
-    function (args)
-        try
-            trigger_vscode_uri(build_vscode_uri("workbench.action.debug.stepOut"))
-            return "Stepped out of current function"
-        catch e
-            return "Error stepping out: $e"
-        end
-    end
+    args -> vscode_debug_command(
+        "workbench.action.debug.stepOut",
+        "Stepped out of current function",
+    )
 )
 
 debug_continue_tool = @mcp_tool(
@@ -1271,14 +1317,8 @@ Must be in an active debug session (paused at a breakpoint).
 - `debug_continue()`
 """,
     Dict("type" => "object", "properties" => Dict(), "required" => []),
-    function (args)
-        try
-            trigger_vscode_uri(build_vscode_uri("workbench.action.debug.continue"))
-            return "Continued execution"
-        catch e
-            return "Error continuing: $e"
-        end
-    end
+    args ->
+        vscode_debug_command("workbench.action.debug.continue", "Continued execution")
 )
 
 debug_stop_tool = @mcp_tool(
@@ -1291,14 +1331,8 @@ Terminates the active debug session and returns to normal execution.
 - `debug_stop()`
 """,
     Dict("type" => "object", "properties" => Dict(), "required" => []),
-    function (args)
-        try
-            trigger_vscode_uri(build_vscode_uri("workbench.action.debug.stop"))
-            return "Debug session stopped"
-        catch e
-            return "Error stopping debug session: $e"
-        end
-    end
+    args ->
+        vscode_debug_command("workbench.action.debug.stop", "Debug session stopped")
 )
 
 # Package management tools
@@ -1316,23 +1350,7 @@ pkg_add_tool = @mcp_tool(
         ),
         "required" => ["packages"],
     ),
-    function (args)
-        try
-            packages = get(args, "packages", String[])
-            if isempty(packages)
-                return "Error: packages array is required and cannot be empty"
-            end
-
-            # Use Pkg.add directly with io=devnull to disable interactivity
-            pkg_names = join(["\"$p\"" for p in packages], ", ")
-            code = "using Pkg; Pkg.add([$pkg_names]; io=devnull)"
-
-            result = execute_repllike(code; silent = false, quiet = false)
-            return "Added packages: $(join(packages, ", "))\n\n$result"
-        catch e
-            return "Error adding packages: $e"
-        end
-    end
+    args -> pkg_operation_tool("add", "Added", args)
 )
 
 pkg_rm_tool = @mcp_tool(
@@ -1349,23 +1367,7 @@ pkg_rm_tool = @mcp_tool(
         ),
         "required" => ["packages"],
     ),
-    function (args)
-        try
-            packages = get(args, "packages", String[])
-            if isempty(packages)
-                return "Error: packages array is required and cannot be empty"
-            end
-
-            # Use Pkg.rm directly with io=devnull to disable interactivity
-            pkg_names = join(["\"$p\"" for p in packages], ", ")
-            code = "using Pkg; Pkg.rm([$pkg_names]; io=devnull)"
-
-            result = execute_repllike(code; silent = false, quiet = false)
-            return "Removed packages: $(join(packages, ", "))\n\n$result"
-        catch e
-            return "Error removing packages: $e"
-        end
-    end
+    args -> pkg_operation_tool("rm", "Removed", args)
 )
 
 run_tests_tool = @mcp_tool(
