@@ -1488,3 +1488,31 @@ h1 {
     color: var(--text-secondary);
     margin-bottom: 1.5rem;
 }
+/* Error Modal Styling */
+.error-modal {
+    max-width: 600px;
+    max-height: 80vh;
+}
+
+.error-modal .modal-body {
+    max-height: 60vh;
+    overflow: auto;
+}
+
+.error-message {
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin: 0;
+}
+
+.error-modal .modal-header h2 {
+    color: #ef4444;
+}

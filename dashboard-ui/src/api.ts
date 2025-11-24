@@ -99,7 +99,7 @@ export async function callTool(request: ToolCallRequest): Promise<ToolCallRespon
     };
 
     if (request.sessionId) {
-        headers['X-Agent-Id'] = request.sessionId;
+        headers['X-MCPRepl-Target'] = request.sessionId;
     }
 
     const response = await fetch('/', {
@@ -111,9 +111,16 @@ export async function callTool(request: ToolCallRequest): Promise<ToolCallRespon
     if (!response.ok) throw new Error('Failed to call tool');
 
     const data = await response.json();
+
+    // Throw if JSON-RPC error is present
+    if (data.error) {
+        const errorMsg = data.error.message || JSON.stringify(data.error);
+        throw new Error(errorMsg);
+    }
+
     return {
         result: data.result,
-        error: data.error
+        error: undefined
     };
 }
 

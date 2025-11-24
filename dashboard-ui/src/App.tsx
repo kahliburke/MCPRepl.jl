@@ -11,6 +11,7 @@ import { LogsView } from './components/LogsView';
 import { ToolsView } from './components/ToolsView';
 import { Analytics } from './components/Analytics';
 import { ErrorsModal } from './components/ErrorsModal';
+import { ErrorModal } from './components/ErrorModal';
 import { StaleSessionsModal } from './components/StaleSessionsModal';
 import { QuickStartModal } from './components/QuickStartModal';
 import { EventDetailsModal } from './components/EventDetailsModal';
@@ -50,6 +51,7 @@ export const App: React.FC = () => {
     const [recentSessionLoading, setRecentSessionLoading] = useState<string | null>(null);
     const [confirmSessionAction, setConfirmSessionAction] = useState<{ action: 'shutdown' | 'restart', sessionId: string } | null>(null);
     const [activeProgress, setActiveProgress] = useState<Record<string, { token: string, progress: number, total?: number, message: string }>>({});
+    const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
     useEffect(() => {
         if (autoRefreshLogs && activeTab === 'logs' && logSessionId) {
@@ -251,7 +253,7 @@ export const App: React.FC = () => {
             }
         } catch (error) {
             console.error('Failed to shutdown session:', error);
-            alert(`Failed to shutdown session: ${error}`);
+            setErrorMessage(`Failed to shutdown session: ${error}`);
         } finally {
             setConfirmSessionAction(null);
         }
@@ -271,12 +273,12 @@ export const App: React.FC = () => {
                     fetchSessions().then(setSessions);
                 }, 1000);
             } else {
-                alert(`Failed to restart session: Session not found or disconnected`);
+                setErrorMessage(`Failed to restart session: Session not found or disconnected`);
             }
         } catch (error) {
             console.error('Failed to restart session:', error);
             const errorMsg = error instanceof Error ? error.message : String(error);
-            alert(`Failed to restart session: ${errorMsg}`);
+            setErrorMessage(`Failed to restart session: ${errorMsg}`);
         } finally {
             setConfirmSessionAction(null);
         }
@@ -284,7 +286,7 @@ export const App: React.FC = () => {
 
     const handleQuickStart = async () => {
         if (!quickStartPath) {
-            alert('Please enter a project path');
+            setErrorMessage('Please enter a project path');
             return;
         }
 
@@ -324,7 +326,7 @@ export const App: React.FC = () => {
 
         } catch (error) {
             console.error('Failed to start session:', error);
-            alert(`Failed to start session: ${String(error)}`);
+            setErrorMessage(`Failed to start session: ${String(error)}`);
         } finally {
             setQuickStartLoading(false);
         }
@@ -333,14 +335,14 @@ export const App: React.FC = () => {
     const handleKillStaleSessions = async (force: boolean = false) => {
         try {
             const result = await killStaleSessions(force);
-            alert(result);
+            setErrorMessage(result);
             // Refresh stale sessions list
             const updated = await listStaleSessions();
             setStaleSessions(updated.sessions);
             setStaleSessionCount(updated.sessions.filter((s: any) => s.is_stale).length);
         } catch (error) {
             console.error('Failed to kill stale sessions:', error);
-            alert(`Failed to kill stale sessions: ${error}`);
+            setErrorMessage(`Failed to kill stale sessions: ${error}`);
         }
     };
 
@@ -488,6 +490,11 @@ export const App: React.FC = () => {
                 />
             )}
 
+            <ErrorModal
+                error={errorMessage}
+                onClose={() => setErrorMessage(null)}
+            />
+
             <div className="main-container">
                 <aside className="sidebar">
                     <div className="sidebar-header">
@@ -521,7 +528,7 @@ export const App: React.FC = () => {
                                             });
                                             setTimeout(() => fetchSessions().then(setSessions), 1000);
                                         } catch (e) {
-                                            alert(`Failed to start: ${e}`);
+                                            setErrorMessage(`Failed to start: ${e}`);
                                         } finally {
                                             setRecentSessionLoading(null);
                                         }
