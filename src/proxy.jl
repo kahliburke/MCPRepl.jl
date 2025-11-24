@@ -1385,16 +1385,16 @@ function handle_request(http::HTTP.Stream)
 
                 # Spawn new Julia session process
                 try
-                    @info "Starting Julia session" project_path = project_path session_id =
-                        session_name
+                    # Generate UUID for this session
+                    session_uuid = string(UUIDs.uuid4())
 
-                    # Create log file for session output
+                    @info "Starting Julia session" project_path = project_path session_id =
+                        session_name uuid = session_uuid
+
+                    # Create log file for session output (using UUID for consistent identification)
                     log_dir = joinpath(dirname(@__DIR__), "logs")
                     mkpath(log_dir)
-                    log_file = joinpath(
-                        log_dir,
-                        "session_$(session_name)_$(round(Int, time())).log",
-                    )
+                    log_file = joinpath(log_dir, "session_$(session_uuid).log")
 
                     # Build Julia command - inherit security config from the project itself
                     # Pass workspace_dir=project_path so it checks for .mcprepl/security.json in the project
@@ -1406,13 +1406,14 @@ function handle_request(http::HTTP.Stream)
                     startup_code = """
                     Base.stderr = Base.IOContext(Base.stderr, :color => false)
                     Base.stdout = Base.IOContext(Base.stdout, :color => false)
-                    using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path))); wait()
+                    using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path)), session_uuid=$(repr(session_uuid))); wait()
                     """
                     julia_cmd = `julia --project=$project_path -e $startup_code`
 
                     # Add environment variable tag for easy identification
                     env = copy(ENV)
                     env["MCPREPL_SESSION"] = session_name
+                    env["MCPREPL_SESSION_UUID"] = session_uuid
                     env["MCPREPL_PROXY_PORT"] =
                         string(get(ENV, "MCPREPL_PROXY_PORT", "3000"))
 

@@ -371,9 +371,19 @@ function handle_logs(http::HTTP.Stream, req::HTTP.Request)
         log_dir = joinpath(dirname(dirname(@__DIR__)), "logs")
 
         if isdir(log_dir)
-            # Find most recent log file for this session
-            log_files =
-                filter(f -> startswith(f, "session_$(session_id)_"), readdir(log_dir))
+            # Logs are now named by UUID: session_<uuid>.log
+            # Look up session to get UUID if given a name
+            session = get_julia_session(session_id)
+            if session === nothing
+                session = get_julia_session_by_name(session_id)
+            end
+
+            # Use UUID for log file lookup
+            search_uuid = session !== nothing ? session.uuid : session_id
+
+            # Find log file for this session (UUID-based, no timestamp suffix)
+            log_file_name = "session_$(search_uuid).log"
+            log_files = filter(f -> f == log_file_name, readdir(log_dir))
 
             if !isempty(log_files)
                 # Sort by modification time and filter out crash dumps (small files)
@@ -411,7 +421,7 @@ function handle_logs(http::HTTP.Stream, req::HTTP.Request)
                     result["error"] = "Log file not found"
                 end
             else
-                result["error"] = "No log files found for session: $session_id"
+                result["error"] = "No log files found for session: $session_id\n\nNote: This session may be logging to a parent process (VS Code, terminal, etc.) rather than to a file. Only background-started sessions write to log files."
             end
         else
             result["error"] = "Logs directory does not exist"

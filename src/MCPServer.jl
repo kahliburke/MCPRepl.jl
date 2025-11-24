@@ -725,9 +725,10 @@ function start_mcp_server(
     port::Int = 3000;
     verbose::Bool = true,
     security_config::Union{SecurityConfig,Nothing} = nothing,
+    session_uuid::Union{String,Nothing} = nothing,
 )
-    # Generate UUID for this session (persists across reconnections)
-    session_uuid = string(UUIDs.uuid4())
+    # Use provided UUID or generate a new one (persists across reconnections)
+    session_uuid = session_uuid !== nothing ? session_uuid : string(UUIDs.uuid4())
 
     # Build symbol-keyed registry
     tools_dict = Dict{Symbol,MCPTool}(tool.id => tool for tool in tools)

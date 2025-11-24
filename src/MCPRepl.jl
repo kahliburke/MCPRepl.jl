@@ -843,6 +843,7 @@ function start!(;
     agents_config::String = ".mcprepl/agents.json",
     agent_name::String = "",
     workspace_dir::String = pwd(),
+    session_uuid::Union{String,Nothing} = nothing,
 )
     SERVER[] !== nothing && stop!() # Stop existing server if running
 
@@ -1096,6 +1097,7 @@ function start!(;
         actual_port;
         verbose = verbose,
         security_config = security_config,
+        session_uuid = session_uuid,
     )
 
     # Register this REPL with the proxy if proxy is running

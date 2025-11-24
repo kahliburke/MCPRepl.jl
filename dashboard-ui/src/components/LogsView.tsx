@@ -96,9 +96,12 @@ export const LogsView: React.FC<LogsViewProps> = ({
                     className="log-session-select"
                 >
                     <option value="">Select a session...</option>
-                    {Object.keys(sessions).map(sessionId => (
-                        <option key={sessionId} value={sessionId}>{sessionId}</option>
-                    ))}
+                    {Object.keys(sessions).map(sessionId => {
+                        const session = sessions[sessionId];
+                        // Show name with abbreviated UUID (first 8 chars)
+                        const label = `${session.name} (${session.uuid.substring(0, 8)})`;
+                        return <option key={sessionId} value={sessionId}>{label}</option>;
+                    })}
                 </select>
                 <label className="auto-refresh-label">
                     <input
