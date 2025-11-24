@@ -2,9 +2,8 @@ using ReTest
 using HTTP
 using JSON
 
-# Import the proxy module
-include("../src/proxy.jl")
-using .Proxy
+using MCPRepl
+using MCPRepl.Proxy
 
 @testset "Proxy MCP Tool Routing" begin
     @testset "Route tools/list through proxy" begin

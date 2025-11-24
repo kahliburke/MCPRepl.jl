@@ -40,3 +40,4 @@ crush.json
 HANDOFF.md
 .mcprepl/events.db
 coverage.info
+.mcprepl/events-*.db

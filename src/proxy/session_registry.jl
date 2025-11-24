@@ -48,12 +48,14 @@ end
 # ============================================================================
 
 # Julia session registry - tracks all connected Julia sessions
-const JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
-const JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
+# Note: These are initialized in the parent Proxy module's __init__() function
+# to avoid precompilation issues with Dict and ReentrantLock
+JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
+JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
 
 # MCP session registry - tracks all connected MCP clients
-const MCP_SESSION_REGISTRY = Dict{String,MCPSession}()
-const MCP_SESSION_LOCK = ReentrantLock()
+MCP_SESSION_REGISTRY = Dict{String,MCPSession}()
+MCP_SESSION_LOCK = ReentrantLock()
 
 # ============================================================================
 # REPL Registration Functions

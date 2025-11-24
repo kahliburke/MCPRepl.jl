@@ -40,7 +40,7 @@ Represents an MCP protocol session with a client.
 - `created_at::DateTime`: Session creation timestamp
 - `initialized_at::Union{DateTime,Nothing}`: Session initialization timestamp
 - `closed_at::Union{DateTime,Nothing}`: Session close timestamp
-- `target_repl_id::Union{String,Nothing}`: Target REPL ID for proxy routing (proxy only)
+- `target_julia_session_id::Union{String,Nothing}`: Target Julia session ID for proxy routing (proxy only)
 - `last_activity::DateTime`: Last time this session was active
 """
 mutable struct MCPSession
@@ -53,19 +53,19 @@ mutable struct MCPSession
     created_at::DateTime
     initialized_at::Union{DateTime,Nothing}
     closed_at::Union{DateTime,Nothing}
-    target_repl_id::Union{String,Nothing}
+    target_julia_session_id::Union{String,Nothing}
     last_activity::DateTime
 end
 
 """
-    MCPSession(; target_repl_id::Union{String,Nothing}=nothing) -> MCPSession
+    MCPSession(; target_julia_session_id::Union{String,Nothing}=nothing) -> MCPSession
 
 Create a new uninitialized MCP session.
 
 # Arguments
-- `target_repl_id::Union{String,Nothing}=nothing`: Optional target REPL ID for proxy routing
+- `target_julia_session_id::Union{String,Nothing}=nothing`: Optional target Julia session ID for proxy routing
 """
-function MCPSession(; target_repl_id::Union{String,Nothing} = nothing)
+function MCPSession(; target_julia_session_id::Union{String,Nothing} = nothing)
     now_time = now()
     return MCPSession(
         string(uuid4()),                    # id
@@ -77,7 +77,7 @@ function MCPSession(; target_repl_id::Union{String,Nothing} = nothing)
         now_time,                           # created_at
         nothing,                            # initialized_at
         nothing,                            # closed_at
-        target_repl_id,                     # target_repl_id
+        target_julia_session_id,            # target_julia_session_id
         now_time,                           # last_activity
     )
 end

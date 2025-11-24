@@ -1,9 +1,8 @@
 using ReTest
 
-# Load Session module directly for testing
-include("../src/session.jl")
-using .Session
-using .Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
+using MCPRepl
+using MCPRepl.Session
+using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
 
 @testset "Session Management" begin
     @testset "Session Creation" begin

@@ -19,10 +19,22 @@ export @mcp_tool, MCPTool
 export start!, stop!, test_server
 
 include("utils.jl")
+include("database.jl")
+include("dashboard.jl")
 include("proxy.jl")
 include("tools.jl")
+include("Generate.jl")
 
-export Proxy
+# Export public API functions
+export start!, stop!, setup, test_server, reset
+export setup_security, security_status, generate_key, revoke_key
+export allow_ip, deny_ip, set_security_mode, quick_setup, gentle_setup
+export call_tool, list_tools, tool_help
+export start_proxy, stop_proxy  # Proxy server functions
+export Proxy  # Proxy server module
+# export Generate  # Project template generator module
+# export Dashboard
+# export Database
 
 # ============================================================================
 # Port Management
@@ -174,7 +186,6 @@ include("setup.jl")
 include("vscode.jl")
 include("lsp.jl")
 include("lsp_tool_definitions.jl")
-include("Generate.jl")
 
 # ============================================================================
 # VS Code Response Storage for Bidirectional Communication
@@ -3155,14 +3166,5 @@ Stop the proxy server on the specified port. Wrapper for Proxy.stop_server().
 function stop_proxy(port::Int = 3000)
     return Proxy.stop_server(port)
 end
-
-# Export public API functions
-export start!, stop!, setup, test_server, reset
-export setup_security, security_status, generate_key, revoke_key
-export allow_ip, deny_ip, set_security_mode, quick_setup, gentle_setup
-export call_tool, list_tools, tool_help
-export start_proxy, stop_proxy  # Proxy server functions
-export Proxy  # Proxy server module
-export Generate  # Project template generator module
 
 end #module

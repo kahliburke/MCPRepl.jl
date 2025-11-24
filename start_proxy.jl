@@ -4,11 +4,9 @@
 using Pkg
 Pkg.activate(@__DIR__)
 
-# Include and use the Proxy module
-include("src/dashboard.jl")
-include("src/proxy.jl")
-using .Proxy
-
+using MCPRepl
+using MCPRepl.Proxy
+using MCPRepl.Dashboard
 # Check if proxy is already running and stop it if requested
 port = 3000
 if Proxy.is_server_running(port)

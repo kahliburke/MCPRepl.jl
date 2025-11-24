@@ -15,11 +15,9 @@ using Logging
 using LoggingExtras
 using UUIDs
 
-include("dashboard.jl")
-using .Dashboard
-
-include("database.jl")
-using .Database
+# Access Dashboard and Database from parent MCPRepl module
+using ..Dashboard
+using ..Database
 
 include("session.jl")
 using .Session
@@ -33,53 +31,43 @@ include("proxy/session_registry.jl")
 include("proxy/process_management.jl")
 include("proxy/logging.jl")
 include("proxy/vite.jl")
+include("proxy/mcp_notification.jl")
 
-# Global state
+# Global state (simple Refs that can be precompiled)
 const SERVER = Ref{Union{HTTP.Server,Nothing}}(nothing)
 const SERVER_PORT = Ref{Int}(3000)
 const SERVER_PID_FILE = Ref{String}("")
-const JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
-const JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
-const MCP_SESSION_REGISTRY = Dict{String,MCPSession}()  # Track MCP client sessions
-const MCP_SESSION_LOCK = ReentrantLock()
-const CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()  # Track active client notification channels
-const CLIENT_CONNECTIONS_LOCK = ReentrantLock()
 const VITE_DEV_PROCESS = Ref{Union{Base.Process,Nothing}}(nothing)
 const VITE_DEV_PORT = 3001
 
-# ============================================================================
-# MCP Notification Support
-# ============================================================================
+# CLIENT_CONNECTIONS initialized in __init__() (can't be precompiled)
+CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()
+CLIENT_CONNECTIONS_LOCK = ReentrantLock()
 
-"""
-    notify_tools_list_changed()
+# Initialize global state after precompilation
+# Note: JULIA_SESSION_REGISTRY, MCP_SESSION_REGISTRY and their locks
+# are defined in proxy/session_registry.jl and initialized there
+function __init__()
+    ccall(:jl_generating_output, Cint, ()) == 1 && return
+    # Re-initialize session registries (defined in session_registry.jl)
+    global JULIA_SESSION_REGISTRY = Dict{String,JuliaSession}()
+    global JULIA_SESSION_REGISTRY_LOCK = ReentrantLock()
+    global MCP_SESSION_REGISTRY = Dict{String,MCPSession}()
+    global MCP_SESSION_LOCK = ReentrantLock()
+    # Initialize client connections
+    global CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()
+    global CLIENT_CONNECTIONS_LOCK = ReentrantLock()
+end
 
-Send notifications/tools/list_changed to all connected MCP clients.
-This tells clients to refresh their tools list after a Julia session registers.
-"""
-function notify_tools_list_changed()
-    @debug "Broadcasting tools/list_changed notification to all connected clients"
-
-    notification = Dict(
-        "jsonrpc" => "2.0",
-        "method" => "notifications/tools/list_changed",
-        "params" => Dict(),
-    )
-
-    # Send notification to all active client connections
-    lock(CLIENT_CONNECTIONS_LOCK) do
-        for (session_id, channel) in CLIENT_CONNECTIONS
-            try
-                # Non-blocking put - if channel is full, skip this client
-                if isopen(channel) && length(channel.data) < 10
-                    put!(channel, notification)
-                    @debug "Sent notification to client" session_id = session_id
-                end
-            catch e
-                @debug "Failed to send notification to client" session_id = session_id error =
-                    e
-            end
-        end
+# Database initialization - called explicitly when needed (not on module load)
+function init_database!(db_path::String)
+    try
+        Database.init_db!(db_path)
+        @debug "Proxy database initialized" db_path = db_path pid = getpid()
+        return true
+    catch e
+        @warn "Failed to initialize proxy database" exception = (e, catch_backtrace())
+        return false
     end
 end
 
@@ -2740,14 +2728,20 @@ function start_foreground_server(port::Int = 3000)
     log_file = setup_proxy_logging(port)
     println("Proxy log file: $log_file")
 
-    # Initialize database for persistent event storage
-    db_path = joinpath(dirname(@__DIR__), ".mcprepl", "events.db")
-    db = Database.init_db!(db_path)
-    @info "Database initialized for event storage" db_path = db_path
+    # Initialize database (lazy initialization on server start)
+    db_dir = joinpath(dirname(@__DIR__), ".mcprepl")
+    mkpath(db_dir)
+    db_path = joinpath(db_dir, "events-$(getpid()).db")
+    init_database!(db_path)
 
     # Start ETL scheduler for analytics
-    etl_task = Database.start_etl_scheduler(db; interval_seconds = 30)
-    @info "ETL scheduler started for analytics processing" interval_seconds = 30
+    db = Database.DB[]
+    if db !== nothing
+        etl_task = Database.start_etl_scheduler(db; interval_seconds = 30)
+        @info "ETL scheduler started for analytics processing" interval_seconds = 30
+    else
+        @warn "Database not initialized, ETL scheduler not started"
+    end
 
     # Set up dashboard to use database for event persistence
     Dashboard.set_db_callback!() do session_id, event_type, timestamp, data, duration_ms

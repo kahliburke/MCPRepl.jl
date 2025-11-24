@@ -2,17 +2,14 @@ using ReTest
 using HTTP
 using JSON
 
-# Import the modules we need to test
-include("../src/proxy.jl")
-using .Proxy
-
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Proxy
+using MCPRepl.Database
 
 @testset "Proxy Header Parsing" begin
     @testset "HTTP.header returns SubString or String" begin
         # Create a mock request with a header
-        req = HTTP.Request("POST", "/", ["X-MCPRepl-Target" => "test-repl"], "")
+        req = HTTP.Request("POST", "/", ["X-MCPRepl-Target" => "test-session"], "")
 
         # Test that HTTP.header returns what we expect
         header_value = HTTP.header(req, "X-MCPRepl-Target")
@@ -23,7 +20,7 @@ using .Database
 
         # Test our conversion logic
         target_id = isempty(header_value) ? nothing : String(header_value)
-        @test target_id == "test-repl"
+        @test target_id == "test-session"
         @test target_id isa String
     end
 
@@ -43,93 +40,92 @@ using .Database
     end
 end
 
-@testset "REPL Registry" begin
-    @testset "Register and retrieve REPL" begin
+@testset "Julia Session Registry" begin
+    @testset "Register and retrieve Julia Session" begin
         # Clear any existing registrations
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        # Register a test REPL
-        Proxy.register_repl(
-            "test-repl-1",
+        # Register a test Julia Session
+        Proxy.register_julia_session(
+            "test-session-1",
             3001;
             pid = 12345,
             metadata = Dict("test" => "data"),
         )
 
         # Verify it's in the registry
-        repl = Proxy.get_repl("test-repl-1")
-        @test repl !== nothing
-        @test repl.id == "test-repl-1"
-        @test repl.port == 3001
-        @test repl.pid == 12345
-        @test repl.status == :ready
-        @test repl.metadata["test"] == "data"
+        session = Proxy.get_julia_session("test-session-1")
+        @test session !== nothing
+        @test session.id == "test-session-1"
+        @test session.port == 3001
+        @test session.pid == 12345
+        @test session.status == :ready
+        @test session.metadata["test"] == "data"
     end
 
     @testset "List julia_sessions" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        Proxy.register_repl("repl-1", 3001)
-        Proxy.register_repl("repl-2", 3002)
+        Proxy.register_julia_session("session-1", 3001)
+        Proxy.register_julia_session("session-2", 3002)
 
         julia_sessions = Proxy.list_julia_sessions()
         @test length(julia_sessions) == 2
-        @test any(r -> r.id == "repl-1", julia_sessions)
-        @test any(r -> r.id == "repl-2", julia_sessions)
+        @test any(r -> r.id == "session-1", julia_sessions)
+        @test any(r -> r.id == "session-2", julia_sessions)
     end
 
-    @testset "Unregister REPL" begin
+    @testset "Unregister Julia Session" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        Proxy.register_repl("temp-repl", 3003)
-        @test Proxy.get_repl("temp-repl") !== nothing
-
-        Proxy.unregister_repl("temp-repl")
-        @test Proxy.get_repl("temp-repl") === nothing
+        Proxy.register_julia_session("temp-session", 3003)
+        @test Proxy.get_julia_session("temp-session") !== nothing
+        Proxy.unregister_julia_session("temp-session")
+        @test Proxy.get_julia_session("temp-session") === nothing
     end
 
-    @testset "Update REPL status" begin
+    @testset "Update Julia Session status" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        Proxy.register_repl("status-repl", 3004)
-        repl = Proxy.get_repl("status-repl")
-        @test repl.status == :ready
-        @test repl.missed_heartbeats == 0
+        Proxy.register_julia_session("status-session", 3004)
+        session = Proxy.get_julia_session("status-session")
+        @test session.status == :ready
+        @test session.missed_heartbeats == 0
 
-        Proxy.update_repl_status("status-repl", :stopped)
-        repl = Proxy.get_repl("status-repl")
-        @test repl.status == :stopped
+        Proxy.update_julia_session_status("status-session", :stopped)
+        session = Proxy.get_julia_session("status-session")
+        @test session.status == :stopped
     end
 
     @testset "Missed heartbeat counter" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        Proxy.register_repl("heartbeat-test", 3005)
-        repl = Proxy.get_repl("heartbeat-test")
-        @test repl.missed_heartbeats == 0
-        @test repl.status == :ready
+        Proxy.register_julia_session("heartbeat-test", 3005)
+        session = Proxy.get_julia_session("heartbeat-test")
+        @test session.missed_heartbeats == 0
+        @test session.status == :ready
 
         # Simulate first error - should increment counter but stay ready
-        Proxy.update_repl_status("heartbeat-test", :ready; error = "Error 1")
-        repl = Proxy.get_repl("heartbeat-test")
-        @test repl.missed_heartbeats == 1
-        @test repl.last_error == "Error 1"
+        Proxy.update_julia_session_status("heartbeat-test", :ready; error = "Error 1")
+        session = Proxy.get_julia_session("heartbeat-test")
+        @test session.missed_heartbeats == 1
+        @test session.last_error == "Error 1"
 
         # Second error - still ready
-        Proxy.update_repl_status("heartbeat-test", :ready; error = "Error 2")
-        repl = Proxy.get_repl("heartbeat-test")
-        @test repl.missed_heartbeats == 2
+        Proxy.update_julia_session_status("heartbeat-test", :ready; error = "Error 2")
+        session = Proxy.get_julia_session("heartbeat-test")
+        @test session.missed_heartbeats == 2
 
         # Third error - now should be stopped
-        Proxy.update_repl_status("heartbeat-test", :ready; error = "Error 3")
-        repl = Proxy.get_repl("heartbeat-test")
-        @test repl.missed_heartbeats == 3
+        Proxy.update_julia_session_status("heartbeat-test", :ready; error = "Error 3")
+        session = Proxy.get_julia_session("heartbeat-test")
+        @test session.missed_heartbeats == 3
 
         # Recovery - should reset counter
-        Proxy.update_repl_status("heartbeat-test", :ready)
-        repl = Proxy.get_repl("heartbeat-test")
-        @test repl.missed_heartbeats == 0
-        @test repl.last_error === nothing
+        Proxy.update_julia_session_status("heartbeat-test", :ready)
+        session = Proxy.get_julia_session("heartbeat-test")
+        @test session.missed_heartbeats == 0
+        @test session.last_error === nothing
     end
 end
 
@@ -212,8 +208,8 @@ end
         # This tests the exact flow that happens in the proxy
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        # Register a test REPL
-        Proxy.register_repl("route-test", 3006; pid = Int(getpid()))
+        # Register a test Julia session
+        Proxy.register_julia_session("route-test", 3006; pid = Int(getpid()))
 
         # Create a JSON request string (as would come from HTTP)
         json_str = """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
@@ -292,7 +288,7 @@ end
         end
     end
 
-    @testset "Full handle_request → route_to_repl → HTTP.post integration" begin
+    @testset "Full handle_request → route_to_session_streaming → HTTP.post integration" begin
         # This tests the COMPLETE flow from handle_request to actual backend call
         echo_port = 9998
         echo_server = HTTP.serve!(echo_port; verbose = false) do req
@@ -306,9 +302,9 @@ end
         end
 
         try
-            # Register a REPL pointing to our echo server
+            # Register a Julia session pointing to our echo server
             empty!(Proxy.JULIA_SESSION_REGISTRY)
-            Proxy.register_repl("integration-test", echo_port; pid = Int(getpid()))
+            Proxy.register_julia_session("integration-test", echo_port; pid = Int(getpid()))
 
             # Create HTTP request exactly as it would come from a client
             request_body = """{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"""
@@ -345,7 +341,7 @@ end
     end
 end
 
-@testset "REPL Registration" begin
+@testset "Julia Registration" begin
     # Initialize temp database for registration tests
     test_db = tempname() * ".db"
     Database.init_db!(test_db)
@@ -353,39 +349,43 @@ end
     @testset "Successful registration with database logging" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
-        # Register a REPL
-        Proxy.register_repl("test-registration-1", 5001; pid = 99999)
+        # Register a Julia session
+        Proxy.register_julia_session("test-registration-1", 5001; pid = 99999)
 
         # Verify it's in the registry
         @test haskey(Proxy.JULIA_SESSION_REGISTRY, "test-registration-1")
-        repl_info = Proxy.JULIA_SESSION_REGISTRY["test-registration-1"]
-        @test repl_info.port == 5001
-        @test repl_info.pid == 99999
-        @test repl_info.id == "test-registration-1"
+        session_info = Proxy.JULIA_SESSION_REGISTRY["test-registration-1"]
+        @test session_info.port == 5001
+        @test session_info.pid == 99999
+        @test session_info.id == "test-registration-1"
     end
 
     @testset "Duplicate registration throws error" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Register once
-        Proxy.register_repl("test-duplicate", 5002; pid = 88888)
+        Proxy.register_julia_session("test-duplicate", 5002; pid = 88888)
 
         # Try to register again - should throw
-        @test_throws Exception Proxy.register_repl("test-duplicate", 5003; pid = 77777)
+        @test_throws Exception Proxy.register_julia_session(
+            "test-duplicate",
+            5003;
+            pid = 77777,
+        )
 
         # Verify original registration still intact
         @test Proxy.JULIA_SESSION_REGISTRY["test-duplicate"].port == 5002
     end
 
-    @testset "Unregister REPL" begin
+    @testset "Unregister Julia Session" begin
         empty!(Proxy.JULIA_SESSION_REGISTRY)
 
         # Register and verify
-        Proxy.register_repl("test-unregister", 5004; pid = 66666)
+        Proxy.register_julia_session("test-unregister", 5004; pid = 66666)
         @test haskey(Proxy.JULIA_SESSION_REGISTRY, "test-unregister")
 
         # Unregister and verify removal
-        Proxy.unregister_repl("test-unregister")
+        Proxy.unregister_julia_session("test-unregister")
         @test !haskey(Proxy.JULIA_SESSION_REGISTRY, "test-unregister")
     end
 

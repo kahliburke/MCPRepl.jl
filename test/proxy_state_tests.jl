@@ -3,11 +3,9 @@ using Dates
 using HTTP
 using JSON
 
-# Load proxy and database modules
-include("../src/database.jl")
-include("../src/proxy.jl")
-using .Database
-using .Proxy
+using MCPRepl
+using MCPRepl.Proxy
+using MCPRepl.Database
 
 @testset "Proxy State Management" begin
     # Initialize temp database for these tests

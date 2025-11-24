@@ -27,9 +27,8 @@ using Pkg
 Pkg.activate(@__DIR__)
 
 # Include and use the Proxy module
-include("src/dashboard.jl")
-include("src/proxy.jl")
-using .Proxy
+using MCPRepl
+using MCPRepl.Proxy
 
 # Parse command line arguments
 const command = length(ARGS) >= 1 ? ARGS[1] : "start"
