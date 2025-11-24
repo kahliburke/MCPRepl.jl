@@ -12,7 +12,7 @@ Proxy module globals like JULIA_SESSION_REGISTRY, send_json_response, etc.
 # and we have direct access to Proxy module internals
 
 """
-    handle_dashboard_route(http::HTTP.Stream, req::HTTP.Request, body::String, path::String) -> Union{Bool, Nothing}
+    handle_dashboard_route(http::HTTP.Stream, req::HTTP.Request, body::String, path::AbstractString) -> Union{Bool, Nothing}
 
 Route and handle dashboard HTTP requests.
 
@@ -23,7 +23,7 @@ function handle_dashboard_route(
     http::HTTP.Stream,
     req::HTTP.Request,
     body::String,
-    path::String,
+    path::AbstractString,
 )
     # Redirect /dashboard to /dashboard/ (Vite expects trailing slash)
     if path == "/dashboard"
