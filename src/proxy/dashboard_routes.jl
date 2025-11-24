@@ -447,9 +447,20 @@ function handle_events_stream(http::HTTP.Stream, req::HTTP.Request)
                 end
 
                 if event_timestamp > last_event_time
+                    # Transform event to match frontend expectations
+                    # Frontend expects: {type, id, timestamp, data, duration_ms}
+                    # Database has: {event_type, julia_session_id, timestamp, data, duration_ms}
+                    frontend_event = Dict(
+                        "type" => get(event, "event_type", ""),
+                        "id" => get(event, "julia_session_id", ""),
+                        "timestamp" => get(event, "timestamp", ""),
+                        "data" => get(event, "data", Dict()),
+                        "duration_ms" => get(event, "duration_ms", nothing),
+                    )
+
                     # Send event in SSE format
                     write(http, "event: update\n")
-                    write(http, "data: $(JSON.json(event))\n\n")
+                    write(http, "data: $(JSON.json(frontend_event))\n\n")
                     flush(http)
 
                     last_event_time = max(last_event_time, event_timestamp)
