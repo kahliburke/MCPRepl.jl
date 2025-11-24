@@ -32,6 +32,7 @@ include("proxy/process_management.jl")
 include("proxy/logging.jl")
 include("proxy/vite.jl")
 include("proxy/mcp_notification.jl")
+include("proxy/dashboard_helpers.jl")
 include("proxy/dashboard_routes.jl")
 
 # Global state (simple Refs that can be precompiled)

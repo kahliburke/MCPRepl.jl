@@ -309,22 +309,16 @@ end
 
 # Database-backed handlers - these will query the Database module
 function handle_events(http::HTTP.Stream, req::HTTP.Request)
-    # Parse query parameters
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
-    limit = parse(Int, get(query_params, "limit", "100"))
-    offset = parse(Int, get(query_params, "offset", "0"))
-
-    events = Database.get_recent_events(limit, offset)
-    send_json_response(http, events)
-    return nothing
+    query_params = parse_query_params(req)
+    limit = get_int_param(query_params, "limit", "100")
+    offset = get_int_param(query_params, "offset", "0")
+    return handle_database_query(http, Database.get_recent_events, limit, offset)
 end
 
 function handle_interactions(http::HTTP.Stream, req::HTTP.Request)
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
+    query_params = parse_query_params(req)
     session_id = get(query_params, "session_id", nothing)
-    limit = parse(Int, get(query_params, "limit", "50"))
+    limit = get_int_param(query_params, "limit", "50")
 
     interactions = if session_id !== nothing
         Database.get_session_interactions(session_id, limit)
@@ -337,71 +331,31 @@ function handle_interactions(http::HTTP.Stream, req::HTTP.Request)
 end
 
 function handle_session_timeline(http::HTTP.Stream, req::HTTP.Request)
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
-    session_id = get(query_params, "session_id", "")
-
-    if isempty(session_id)
-        send_json_response(http, Dict("error" => "session_id required"); status = 400)
-        return nothing
-    end
-
-    timeline = Database.get_session_timeline(session_id)
-    send_json_response(http, timeline)
-    return nothing
+    return handle_session_query(http, req, Database.get_session_timeline)
 end
 
 function handle_session_summary(http::HTTP.Stream, req::HTTP.Request)
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
-    session_id = get(query_params, "session_id", "")
-
-    if isempty(session_id)
-        send_json_response(http, Dict("error" => "session_id required"); status = 400)
-        return nothing
-    end
-
-    summary = Database.get_session_summary(session_id)
-    send_json_response(http, summary)
-    return nothing
+    return handle_session_query(http, req, Database.get_session_summary)
 end
 
 function handle_db_sessions(http::HTTP.Stream)
-    sessions = Database.get_all_sessions()
-    send_json_response(http, sessions)
-    return nothing
+    return handle_database_query(http, Database.get_all_sessions)
 end
 
 function handle_analytics_tool_executions(http::HTTP.Stream, req::HTTP.Request)
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
-    days = parse(Int, get(query_params, "days", "7"))
-
-    data = Database.get_tool_executions(days)
-    send_json_response(http, data)
-    return nothing
+    return handle_analytics_with_days(http, req, Database.get_tool_executions)
 end
 
 function handle_analytics_errors(http::HTTP.Stream, req::HTTP.Request)
-    uri = HTTP.URI(req.target)
-    query_params = HTTP.queryparams(uri.query)
-    days = parse(Int, get(query_params, "days", "7"))
-
-    data = Database.get_error_analytics(days)
-    send_json_response(http, data)
-    return nothing
+    return handle_analytics_with_days(http, req, Database.get_error_analytics)
 end
 
 function handle_analytics_tool_summary(http::HTTP.Stream)
-    summary = Database.get_tool_summary()
-    send_json_response(http, summary)
-    return nothing
+    return handle_database_query(http, Database.get_tool_summary)
 end
 
 function handle_analytics_error_hotspots(http::HTTP.Stream)
-    hotspots = Database.get_error_hotspots()
-    send_json_response(http, hotspots)
-    return nothing
+    return handle_database_query(http, Database.get_error_hotspots)
 end
 
 function handle_analytics_run_etl(http::HTTP.Stream)
