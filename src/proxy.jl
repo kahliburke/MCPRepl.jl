@@ -798,6 +798,14 @@ function handle_request(http::HTTP.Stream)
                     @warn "Re-registration from same process - updating" id = id port = port pid =
                         pid
                     # Allow re-registration from same PID (process restart case)
+                elseif existing_session.pid !== nothing &&
+                       !process_running(existing_session.pid)
+                    @warn "Cleaning up stale registration - process no longer running" id =
+                        id stale_pid = existing_session.pid new_pid = pid
+                    # Process is dead, allow re-registration by removing stale entry
+                    lock(JULIA_SESSION_REGISTRY_LOCK) do
+                        delete!(JULIA_SESSION_REGISTRY, id)
+                    end
                 else
                     @error "Duplicate registration attempted" id = id existing_pid =
                         existing_session.pid new_pid = pid existing_port =
