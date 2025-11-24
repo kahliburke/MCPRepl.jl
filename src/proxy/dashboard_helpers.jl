@@ -85,3 +85,61 @@ function handle_session_query(http::HTTP.Stream, req::HTTP.Request, database_fun
     end
     return handle_database_query(http, database_func, session_id)
 end
+
+"""
+    send_jsonrpc_to_session(conn, method::String, params::Dict) -> Bool
+
+Send a JSON-RPC request to a Julia session socket.
+Returns true on success, false on failure.
+"""
+function send_jsonrpc_to_session(conn, method::String, params::Dict)
+    try
+        request = Dict(
+            "jsonrpc" => "2.0",
+            "id" => rand(1:999999),
+            "method" => method,
+            "params" => params,
+        )
+        write(conn.socket, JSON.json(request) * "\n")
+        return true
+    catch e
+        return false
+    end
+end
+
+"""
+    handle_session_control(http::HTTP.Stream, session_id::String, action_func::Function, action_name::String)
+
+Generic handler for session control operations (restart, shutdown, etc.).
+
+The action_func is called with (conn, session_id) and should return (success::Bool, should_delete::Bool).
+"""
+function handle_session_control(
+    http::HTTP.Stream,
+    session_id::String,
+    action_func::Function,
+    action_name::String,
+)
+    success = lock(JULIA_SESSION_REGISTRY_LOCK) do
+        if haskey(JULIA_SESSION_REGISTRY, session_id)
+            conn = JULIA_SESSION_REGISTRY[session_id]
+            success, should_delete = action_func(conn, session_id)
+
+            if should_delete
+                delete!(JULIA_SESSION_REGISTRY, session_id)
+            end
+
+            return success
+        else
+            @warn "Session not found for $action_name" session_id
+            return false
+        end
+    end
+
+    send_json_response(
+        http,
+        Dict("success" => success, "session_id" => session_id);
+        status = success ? 200 : 404,
+    )
+    return nothing
+end

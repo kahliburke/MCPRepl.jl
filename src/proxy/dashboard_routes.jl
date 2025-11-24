@@ -182,87 +182,40 @@ function handle_sessions_list(http::HTTP.Stream)
 end
 
 function handle_session_restart(http::HTTP.Stream, session_id::String)
-    success = lock(JULIA_SESSION_REGISTRY_LOCK) do
-        if haskey(JULIA_SESSION_REGISTRY, session_id)
-            conn = JULIA_SESSION_REGISTRY[session_id]
+    return handle_session_control(http, session_id, "restart") do conn, sid
+        # Send restart request via exit tool
+        params = Dict("name" => "exit", "arguments" => Dict("restart" => true))
+        success = send_jsonrpc_to_session(conn, "tools/call", params)
 
-            # Send restart request via exit tool
-            try
-                restart_req = Dict(
-                    "jsonrpc" => "2.0",
-                    "id" => rand(1:999999),
-                    "method" => "tools/call",
-                    "params" => Dict(
-                        "name" => "exit",
-                        "arguments" => Dict("restart" => true),
-                    ),
-                )
-                write(conn.socket, JSON.json(restart_req) * "\n")
-                @info "Session restart requested" session_id
-                return true
-            catch e
-                @error "Failed to restart session" session_id error = e
-                return false
-            end
+        if success
+            @info "Session restart requested" session_id = sid
         else
-            @warn "Session not found for restart" session_id
-            return false
+            @error "Failed to restart session" session_id = sid
         end
-    end
 
-    send_json_response(
-        http,
-        Dict("success" => success, "session_id" => session_id);
-        status = success ? 200 : 404,
-    )
-    return nothing
+        return (success, false)  # success, don't delete from registry
+    end
 end
 
 function handle_session_shutdown(http::HTTP.Stream, session_id::String)
-    success = lock(JULIA_SESSION_REGISTRY_LOCK) do
-        if haskey(JULIA_SESSION_REGISTRY, session_id)
-            conn = JULIA_SESSION_REGISTRY[session_id]
-
-            # If disconnected, just unregister it
-            if conn.status == :disconnected
-                delete!(JULIA_SESSION_REGISTRY, session_id)
-                @info "Unregistered disconnected session" session_id
-                return true
-            end
-
-            # Otherwise, try to send shutdown request
-            try
-                shutdown_req = Dict(
-                    "jsonrpc" => "2.0",
-                    "id" => rand(1:999999),
-                    "method" => "shutdown",
-                    "params" => Dict(),
-                )
-                write(conn.socket, JSON.json(shutdown_req) * "\n")
-
-                # Remove from registry
-                delete!(JULIA_SESSION_REGISTRY, session_id)
-                @info "Session shutdown requested" session_id
-                return true
-            catch e
-                # If write fails, just unregister anyway
-                delete!(JULIA_SESSION_REGISTRY, session_id)
-                @warn "Failed to send shutdown request, unregistered anyway" session_id error =
-                    e
-                return true
-            end
-        else
-            @warn "Session not found for shutdown" session_id
-            return false
+    return handle_session_control(http, session_id, "shutdown") do conn, sid
+        # If disconnected, just unregister it
+        if conn.status == :disconnected
+            @info "Unregistered disconnected session" session_id = sid
+            return (true, true)  # success, delete from registry
         end
-    end
 
-    send_json_response(
-        http,
-        Dict("success" => success, "session_id" => session_id);
-        status = success ? 200 : 404,
-    )
-    return nothing
+        # Otherwise, try to send shutdown request
+        success = send_jsonrpc_to_session(conn, "shutdown", Dict())
+
+        if success
+            @info "Session shutdown requested" session_id = sid
+        else
+            @warn "Failed to send shutdown request, unregistering anyway" session_id = sid
+        end
+
+        return (true, true)  # always success (unregister even if write fails), always delete
+    end
 end
 
 function handle_tools_list(http::HTTP.Stream, agent_id::Union{String,Nothing})
