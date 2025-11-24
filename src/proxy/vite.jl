@@ -8,7 +8,8 @@
 Check if we're in a development environment (dashboard-ui source exists).
 """
 function is_dev_environment()
-    dashboard_src = joinpath(dirname(dirname(@__FILE__)), "dashboard-ui", "src")
+    # Since this file is at src/proxy/vite.jl, we need to go up 2 levels to reach project root
+    dashboard_src = joinpath(dirname(dirname(dirname(@__FILE__))), "dashboard-ui", "src")
     return isdir(dashboard_src)
 end
 
@@ -51,7 +52,8 @@ function start_vite_dev_server()
         return VITE_DEV_PROCESS[]
     end
 
-    dashboard_dir = joinpath(dirname(dirname(@__FILE__)), "dashboard-ui")
+    # Since this file is at src/proxy/vite.jl, go up 2 levels to reach project root
+    dashboard_dir = joinpath(dirname(dirname(dirname(@__FILE__))), "dashboard-ui")
 
     # Check if node_modules exists
     if !isdir(joinpath(dashboard_dir, "node_modules"))
@@ -62,22 +64,49 @@ function start_vite_dev_server()
     @info "Starting Vite dev server..." dashboard_dir = dashboard_dir port = VITE_DEV_PORT
 
     try
+        # Check if npm is available
+        npm_check = try
+            read(`which npm`, String)
+            true
+        catch
+            false
+        end
+
+        if !npm_check
+            @error "npm not found in PATH. Cannot start Vite dev server."
+            return nothing
+        end
+
+        # Create log file for Vite output
+        log_file = joinpath(dashboard_dir, ".vite-dev.log")
+
         # Start npm run dev in the background
-        # Need to change directory before running
+        # Redirect output to log file for debugging
         proc = cd(dashboard_dir) do
-            run(pipeline(`npm run dev`, stdout = devnull, stderr = devnull), wait = false)
+            log_io = open(log_file, "w")
+            # Note: log_io will be closed when process exits or via atexit
+            run(pipeline(`npm run dev`, stdout = log_io, stderr = log_io), wait = false)
         end
 
         VITE_DEV_PROCESS[] = proc
 
         # Give it a moment to start
-        sleep(2)
+        sleep(3)
 
         if is_vite_running()
             @info "✅ Vite dev server started on port $VITE_DEV_PORT"
             return proc
         else
-            @warn "Vite dev server may not have started successfully"
+            @warn "Vite dev server may not have started successfully. Check $(log_file) for details."
+            # Try to read first few lines of log for immediate feedback
+            try
+                log_content = readlines(log_file)
+                if !isempty(log_content)
+                    @warn "Vite log (first 5 lines):" log_lines =
+                        join(log_content[1:min(5, length(log_content))], "\n")
+                end
+            catch
+            end
             return proc
         end
     catch e

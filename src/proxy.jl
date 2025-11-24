@@ -513,6 +513,12 @@ function handle_request(http::HTTP.Stream)
         # Read the full request body FIRST (required by HTTP.jl before writing response)
         body = String(read(http))
 
+        # Handle CORS preflight requests
+        if req.method == "OPTIONS"
+            send_empty_response(http; status = 204)
+            return nothing
+        end
+
         # Log incoming requests at debug level
         @debug "Incoming request" method = req.method target = req.target content_length =
             length(body)

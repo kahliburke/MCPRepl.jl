@@ -52,6 +52,16 @@ function send_json_response(
 
     HTTP.setstatus(http, status)
     HTTP.setheader(http, "Content-Type" => "application/json")
+    # Add CORS headers for dashboard API access
+    HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
+    HTTP.setheader(
+        http,
+        "Access-Control-Allow-Methods" => "GET, POST, PUT, DELETE, OPTIONS",
+    )
+    HTTP.setheader(
+        http,
+        "Access-Control-Allow-Headers" => "Content-Type, Authorization, X-Agent-Id",
+    )
     HTTP.startwrite(http)
     write(http, json_str)
     return nothing
@@ -190,9 +200,27 @@ Used for endpoints that don't need to return data (e.g., successful DELETE reque
 send_empty_response(http; status=204)  # No Content
 ```
 """
-function send_empty_response(http::HTTP.Stream; status::Int = 200)
+function send_empty_response(
+    http::HTTP.Stream;
+    status::Int = 200,
+    headers::Vector{Pair{String,String}} = Pair{String,String}[],
+)
     HTTP.setstatus(http, status)
     HTTP.setheader(http, "Content-Length" => "0")
+    # Add CORS headers for dashboard API access
+    HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
+    HTTP.setheader(
+        http,
+        "Access-Control-Allow-Methods" => "GET, POST, PUT, DELETE, OPTIONS",
+    )
+    HTTP.setheader(
+        http,
+        "Access-Control-Allow-Headers" => "Content-Type, Authorization, X-Agent-Id",
+    )
+    # Add any additional headers
+    for (key, value) in headers
+        HTTP.setheader(http, key => value)
+    end
     HTTP.startwrite(http)
     return nothing
 end

@@ -80,6 +80,19 @@ function handle_dashboard_route(
         return handle_events(http, req)
     end
 
+    # SSE streaming endpoints (not yet implemented - return 501 to prevent retries)
+    if path == "/dashboard/api/events/stream" || path == "/dashboard/api/sessions/stream"
+        send_json_response(
+            http,
+            Dict(
+                "error" => "SSE streaming not yet implemented",
+                "message" => "Real-time streaming via Server-Sent Events is not yet available. Please use polling endpoints instead.",
+            );
+            status = 501,
+        )
+        return nothing
+    end
+
     if path == "/dashboard/api/interactions"
         return handle_interactions(http, req)
     end
@@ -265,7 +278,11 @@ function handle_events(http::HTTP.Stream, req::HTTP.Request)
     query_params = parse_query_params(req)
     limit = get_int_param(query_params, "limit", "100")
     offset = get_int_param(query_params, "offset", "0")
-    return handle_database_query(http, Database.get_recent_events, limit, offset)
+
+    # get_events uses keyword arguments
+    events = Database.get_events(; limit = limit, offset = offset)
+    send_json_response(http, events)
+    return nothing
 end
 
 function handle_interactions(http::HTTP.Stream, req::HTTP.Request)
@@ -273,10 +290,11 @@ function handle_interactions(http::HTTP.Stream, req::HTTP.Request)
     session_id = get(query_params, "session_id", nothing)
     limit = get_int_param(query_params, "limit", "50")
 
+    # get_interactions uses keyword arguments
     interactions = if session_id !== nothing
-        Database.get_session_interactions(session_id, limit)
+        Database.get_interactions(; julia_session_id = session_id, limit = limit)
     else
-        Database.get_recent_interactions(limit)
+        Database.get_interactions(; limit = limit)
     end
 
     send_json_response(http, interactions)
@@ -284,7 +302,12 @@ function handle_interactions(http::HTTP.Stream, req::HTTP.Request)
 end
 
 function handle_session_timeline(http::HTTP.Stream, req::HTTP.Request)
-    return handle_session_query(http, req, Database.get_session_timeline)
+    query_params = parse_query_params(req)
+    session_id = require_session_id(http, query_params)
+    if session_id === nothing
+        return nothing
+    end
+    return handle_database_query(http, Database.get_session_timeline, session_id)
 end
 
 function handle_session_summary(http::HTTP.Stream, req::HTTP.Request)
@@ -296,11 +319,29 @@ function handle_db_sessions(http::HTTP.Stream)
 end
 
 function handle_analytics_tool_executions(http::HTTP.Stream, req::HTTP.Request)
-    return handle_analytics_with_days(http, req, Database.get_tool_executions)
+    query_params = parse_query_params(req)
+    days = get_int_param(query_params, "days", "7")
+    try
+        data = Database.get_tool_executions(; days = days)
+        send_json_response(http, data)
+    catch e
+        @error "Failed to get tool executions" exception = e
+        send_json_response(http, Dict("error" => string(e)); status = 500)
+    end
+    return nothing
 end
 
 function handle_analytics_errors(http::HTTP.Stream, req::HTTP.Request)
-    return handle_analytics_with_days(http, req, Database.get_error_analytics)
+    query_params = parse_query_params(req)
+    days = get_int_param(query_params, "days", "7")
+    try
+        data = Database.get_error_analytics(; days = days)
+        send_json_response(http, data)
+    catch e
+        @error "Failed to get error analytics" exception = e
+        send_json_response(http, Dict("error" => string(e)); status = 500)
+    end
+    return nothing
 end
 
 function handle_analytics_tool_summary(http::HTTP.Stream)

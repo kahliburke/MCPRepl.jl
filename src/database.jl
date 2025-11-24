@@ -1056,7 +1056,8 @@ function get_events(;
     query *= " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
     push!(params, limit, offset)
 
-    return DBInterface.execute(db, query, params) |> DataFrame
+    result = DBInterface.execute(db, query, params) |> DataFrame
+    return dataframe_to_array(result)
 end
 
 """
@@ -1117,7 +1118,8 @@ function get_interactions(;
     query *= " ORDER BY timestamp ASC LIMIT ? OFFSET ?"
     push!(params, limit, offset)
 
-    return DBInterface.execute(db, query, params) |> DataFrame
+    result = DBInterface.execute(db, query, params) |> DataFrame
+    return dataframe_to_array(result)
 end
 
 """
@@ -1234,15 +1236,16 @@ function get_all_sessions(; limit::Int = 100)
         error("Database not initialized. Call init_db!() first.")
     end
 
-    return DBInterface.execute(
+    result = DBInterface.execute(
         db,
         """
-    SELECT * FROM sessions 
+    SELECT * FROM sessions
     ORDER BY last_activity DESC
     LIMIT ?
 """,
         (limit,),
     ) |> DataFrame
+    return dataframe_to_array(result)
 end
 
 """
@@ -1505,6 +1508,264 @@ function get_session_summary(session_id::String)
         "total_events" => event_count[1, :count],
         "total_data_bytes" => data_size[1, :total_bytes],
         "complete_request_response_pairs" => nrow(request_response_pairs),
+    )
+end
+
+"""
+Convert DataFrame to array of dictionaries for JSON serialization.
+"""
+function dataframe_to_array(df::DataFrame)
+    if nrow(df) == 0
+        return Dict[]
+    end
+    result = Dict[]
+    for row in eachrow(df)
+        push!(result, Dict(names(df) .=> values(row)))
+    end
+    return result
+end
+
+"""
+    get_tool_executions(; days::Int = 7) -> Vector{Dict}
+
+Get tool execution analytics from the last N days.
+Returns tool execution records with timing and status information.
+"""
+function get_tool_executions(; days::Int = 7)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    cutoff_date = Dates.format(now() - Day(days), "yyyy-mm-dd HH:MM:SS")
+
+    result =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                id, mcp_session_id, julia_session_id, request_id,
+                tool_name, tool_method, request_time, response_time,
+                duration_ms, input_size, output_size, argument_count,
+                status, result_type, result_summary
+            FROM tool_executions
+            WHERE request_time >= ?
+            ORDER BY request_time DESC
+            LIMIT 1000
+            """,
+            (cutoff_date,),
+        ) |> DataFrame
+
+    return dataframe_to_array(result)
+end
+
+"""
+    get_error_analytics(; days::Int = 7) -> Vector{Dict}
+
+Get error analytics from the last N days.
+Returns error records with categorization and context.
+"""
+function get_error_analytics(; days::Int = 7)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    cutoff_date = Dates.format(now() - Day(days), "yyyy-mm-dd HH:MM:SS")
+
+    result =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                id, mcp_session_id, julia_session_id, timestamp,
+                error_type, error_code, error_category,
+                tool_name, method, request_id, message,
+                resolved, resolution_notes
+            FROM errors
+            WHERE timestamp >= ?
+            ORDER BY timestamp DESC
+            LIMIT 1000
+            """,
+            (cutoff_date,),
+        ) |> DataFrame
+
+    return dataframe_to_array(result)
+end
+
+"""
+    get_tool_summary() -> Dict
+
+Get summary statistics of tool usage.
+Returns aggregated counts and metrics per tool.
+"""
+function get_tool_summary()
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    result =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                tool_name,
+                COUNT(*) as total_executions,
+                COUNT(CASE WHEN status = 'success' THEN 1 END) as success_count,
+                COUNT(CASE WHEN status = 'error' THEN 1 END) as error_count,
+                AVG(duration_ms) as avg_duration_ms,
+                MIN(duration_ms) as min_duration_ms,
+                MAX(duration_ms) as max_duration_ms,
+                AVG(input_size) as avg_input_size,
+                AVG(output_size) as avg_output_size
+            FROM tool_executions
+            GROUP BY tool_name
+            ORDER BY total_executions DESC
+            """,
+        ) |> DataFrame
+
+    return dataframe_to_array(result)
+end
+
+"""
+    get_error_hotspots() -> Vector{Dict}
+
+Get most frequent errors grouped by type and tool.
+Returns error frequency analysis.
+"""
+function get_error_hotspots()
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    result =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                error_category,
+                error_type,
+                tool_name,
+                COUNT(*) as error_count,
+                COUNT(CASE WHEN resolved = 1 THEN 1 END) as resolved_count,
+                MAX(timestamp) as last_occurrence
+            FROM errors
+            GROUP BY error_category, error_type, tool_name
+            ORDER BY error_count DESC
+            LIMIT 50
+            """,
+        ) |> DataFrame
+
+    return dataframe_to_array(result)
+end
+
+"""
+    get_session_timeline(session_id::String) -> Vector{Dict}
+
+Get chronological timeline of events and interactions for a session.
+Combines events and interactions into a unified timeline.
+"""
+function get_session_timeline(session_id::String)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    # Get events
+    events =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                'event' as entry_type,
+                timestamp,
+                event_type,
+                level,
+                message,
+                NULL as method,
+                NULL as direction
+            FROM events
+            WHERE mcp_session_id = ? OR julia_session_id = ?
+            """,
+            (session_id, session_id),
+        ) |> DataFrame
+
+    # Get interactions
+    interactions =
+        DBInterface.execute(
+            db,
+            """
+            SELECT
+                'interaction' as entry_type,
+                timestamp,
+                message_type as event_type,
+                NULL as level,
+                NULL as message,
+                method,
+                direction
+            FROM interactions
+            WHERE mcp_session_id = ? OR julia_session_id = ?
+            """,
+            (session_id, session_id),
+        ) |> DataFrame
+
+    # Combine and sort by timestamp
+    if nrow(events) > 0 && nrow(interactions) > 0
+        timeline = vcat(events, interactions)
+        sort!(timeline, :timestamp, rev = true)
+    elseif nrow(events) > 0
+        timeline = events
+    elseif nrow(interactions) > 0
+        timeline = interactions
+    else
+        timeline = DataFrame()
+    end
+
+    return dataframe_to_array(timeline)
+end
+
+"""
+    get_etl_status() -> Dict
+
+Get ETL pipeline status and metadata.
+Returns information about the last ETL run and processing status.
+"""
+function get_etl_status()
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT
+            last_processed_interaction_id,
+            last_processed_event_id,
+            last_run_time,
+            last_run_status,
+            last_error
+        FROM etl_metadata
+        WHERE id = 1
+        """,
+    ) |> DataFrame
+
+    if nrow(result) == 0
+        return Dict(
+            "status" => "not_initialized",
+            "last_run_time" => nothing,
+            "last_run_status" => "never_run",
+        )
+    end
+
+    return Dict(
+        "last_processed_interaction_id" => result[1, :last_processed_interaction_id],
+        "last_processed_event_id" => result[1, :last_processed_event_id],
+        "last_run_time" => result[1, :last_run_time],
+        "last_run_status" => result[1, :last_run_status],
+        "last_error" => result[1, :last_error],
     )
 end
 
