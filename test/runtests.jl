@@ -15,6 +15,9 @@ include("proxy_state_tests.jl")
 include("proxy_registration_tests.jl")
 include("proxy_registration_validation_tests.jl")
 include("database_dual_session_tests.jl")
+include("session_name_preservation_test.jl")
+include("session_id_name_integrity_test.jl")
+include("logs_endpoint_test.jl")
 
 # Run all tests with ReTest
 retest()

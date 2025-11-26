@@ -5,7 +5,7 @@ Handles all /dashboard/* HTTP endpoints for the MCPRepl proxy dashboard.
 Extracted from the monolithic handle_request function for better maintainability.
 
 This file is included within the Proxy module, so it has direct access to
-Proxy module globals like JULIA_SESSION_REGISTRY, send_json_response, etc.
+Proxy module functions like get_julia_session, send_json_response, etc.
 """
 
 # Note: This file is included in proxy.jl, so HTTP, JSON, Dates are already available
@@ -182,27 +182,39 @@ end
 
 function handle_sessions_list(http::HTTP.Stream)
     start_time = time()
-    sessions = lock(JULIA_SESSION_REGISTRY_LOCK) do
-        result = Dict{String,Any}()
-        for (uuid, conn) in JULIA_SESSION_REGISTRY
-            result[uuid] = Dict(
-                "uuid" => uuid,
-                "name" => conn.name,
-                "port" => conn.port,
-                "pid" => conn.pid,
-                "status" => string(conn.status),
-                "last_heartbeat" =>
-                    Dates.format(conn.last_heartbeat, "yyyy-mm-dd HH:MM:SS"),
-                "created_at" => Dates.format(conn.created_at, "yyyy-mm-dd HH:MM:SS"),
+    # Query Julia sessions from database
+    julia_sessions = list_julia_sessions()
+
+    result = Dict{String,Any}()
+    for session in julia_sessions
+        # Convert all fields explicitly, handling Missing
+        session_id = ismissing(session.id) ? "" : String(session.id)
+        session_name = ismissing(session.name) ? "" : String(session.name)
+        session_port = ismissing(session.port) ? nothing : session.port
+        session_pid = ismissing(session.pid) ? nothing : session.pid
+        session_status = ismissing(session.status) ? "unknown" : String(session.status)
+        session_last_activity =
+            ismissing(session.last_activity) ? "" : String(session.last_activity)
+        session_start_time = ismissing(session.start_time) ? "" : String(session.start_time)
+
+        if !isempty(session_id)
+            result[session_id] = Dict(
+                "uuid" => session_id,
+                "name" => session_name,
+                "port" => session_port,
+                "pid" => session_pid,
+                "status" => session_status,
+                "last_heartbeat" => session_last_activity,
+                "created_at" => session_start_time,
             )
         end
-        result
     end
+
     elapsed = (time() - start_time) * 1000
     if elapsed > 100
         @warn "Slow sessions API call" elapsed_ms = elapsed
     end
-    send_json_response(http, sessions)
+    send_json_response(http, result)
     return nothing
 end
 
@@ -252,36 +264,55 @@ function handle_tools_list(http::HTTP.Stream, agent_id::Union{String,Nothing})
         )
 
         # If agent_id specified, fetch tools from that agent
-        if agent_id !== nothing && haskey(JULIA_SESSION_REGISTRY, agent_id)
-            conn = JULIA_SESSION_REGISTRY[agent_id]
-            if conn.status == :ready
-                try
-                    # Make tools/list request to agent
-                    agent_req = Dict(
-                        "jsonrpc" => "2.0",
-                        "id" => 1,
-                        "method" => "tools/list",
-                        "params" => Dict(),
-                    )
+        if agent_id !== nothing
+            session = get_julia_session(agent_id)
+            if session === nothing
+                @warn "Tools requested for non-existent session" agent_id = agent_id
+                # Return empty tools for non-existent session, UI will show "No tools available"
+            else
+                session_status = ismissing(session.status) ? "unknown" : session.status
+                session_port = ismissing(session.port) ? nothing : session.port
+                if session_status != "ready" || session_port === nothing
+                    @warn "Tools requested for non-ready session" agent_id = agent_id status =
+                        session_status
+                    # Return empty tools for non-ready session, UI will show "No tools available"
+                else
+                    try
+                        # Make tools/list request to agent
+                        agent_req = Dict(
+                            "jsonrpc" => "2.0",
+                            "id" => 1,
+                            "method" => "tools/list",
+                            "params" => Dict(),
+                        )
 
-                    agent_resp = HTTP.post(
-                        "http://127.0.0.1:$(conn.port)/",
-                        ["Content-Type" => "application/json"],
-                        JSON.json(agent_req);
-                        readtimeout = 5,
-                    )
+                        agent_resp = HTTP.post(
+                            "http://127.0.0.1:$(session_port)/",
+                            ["Content-Type" => "application/json"],
+                            JSON.json(agent_req);
+                            readtimeout = 5,
+                        )
 
-                    if agent_resp.status == 200
-                        agent_data = JSON.parse(String(agent_resp.body))
-                        if haskey(agent_data, "result") &&
-                           haskey(agent_data["result"], "tools")
-                            result["session_tools"][agent_id] =
-                                agent_data["result"]["tools"]
+                        if agent_resp.status == 200
+                            agent_data = JSON.parse(String(agent_resp.body))
+                            if haskey(agent_data, "result") &&
+                               haskey(agent_data["result"], "tools")
+                                result["session_tools"][agent_id] =
+                                    agent_data["result"]["tools"]
+                                @info "Fetched tools for session" agent_id = agent_id tool_count =
+                                    length(agent_data["result"]["tools"])
+                            else
+                                @warn "Invalid tools/list response from session" agent_id =
+                                    agent_id
+                            end
+                        else
+                            @warn "Failed to fetch tools from session" agent_id = agent_id status =
+                                agent_resp.status
                         end
+                    catch e
+                        @warn "Exception while fetching tools from session" agent_id =
+                            agent_id exception = e
                     end
-                catch e
-                    @warn "Failed to fetch tools from agent" agent_id = agent_id exception =
-                        e
                 end
             end
         end
@@ -372,14 +403,11 @@ function handle_logs(http::HTTP.Stream, req::HTTP.Request)
 
         if isdir(log_dir)
             # Logs are now named by UUID: session_<uuid>.log
-            # Look up session to get UUID if given a name
+            # session_id parameter should always be a UUID
             session = get_julia_session(session_id)
-            if session === nothing
-                session = get_julia_session_by_name(session_id)
-            end
 
-            # Use UUID for log file lookup
-            search_uuid = session !== nothing ? session.uuid : session_id
+            # Use UUID for log file lookup (session_id should already be UUID)
+            search_uuid = session !== nothing ? session.id : session_id
 
             # Find log file for this session (UUID-based, no timestamp suffix)
             log_file_name = "session_$(search_uuid).log"

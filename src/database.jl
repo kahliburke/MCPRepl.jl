@@ -31,7 +31,9 @@ export init_db!,
     cleanup_old_events!,
     get_global_stats,
     get_recent_session_events,
-    close_db!
+    close_db!,
+    save_mcp_session!,
+    update_mcp_session_protocol!
 
 # Global database connection
 const DB = Ref{Union{SQLite.DB,Nothing}}(nothing)
@@ -52,6 +54,7 @@ function init_db!(db_path::String = ".mcprepl/events.db")
     # ============================================================================
 
     # MCP sessions table - MCP clients/agents that connect to the proxy
+    # Stores complete MCP session state for proxy restart persistence
     DBInterface.execute(
         db,
         """
@@ -62,16 +65,27 @@ function init_db!(db_path::String = ".mcprepl/events.db")
         start_time DATETIME NOT NULL,
         last_activity DATETIME NOT NULL,
         status TEXT NOT NULL,
-        metadata TEXT
-    )
+        state TEXT NOT NULL DEFAULT 'UNINITIALIZED',
+        target_julia_session_id TEXT,
+        session_data TEXT
+    );
+
 """,
     )
 
     DBInterface.execute(
         db,
         """
-    CREATE INDEX IF NOT EXISTS idx_mcp_sessions_name 
+    CREATE INDEX IF NOT EXISTS idx_mcp_sessions_name
     ON mcp_sessions(name)
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_mcp_sessions_target
+    ON mcp_sessions(target_julia_session_id)
 """,
     )
 
@@ -642,6 +656,7 @@ function register_mcp_session!(
     status::String = "active";
     name::Union{String,Nothing} = nothing,
     session_type::String = "unknown",
+    target_julia_session_id::Union{String,Nothing} = nothing,
     metadata::Dict = Dict(),
 )
     db = DB[]
@@ -653,18 +668,316 @@ function register_mcp_session!(
     now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
 
     # Insert or update MCP session
+    # Store protocol-specific fields in session_data JSON
+    session_data = Dict(
+        "protocol_version" => "",
+        "client_info" => Dict{String,Any}(),
+        "server_capabilities" => Dict{String,Any}(),
+        "client_capabilities" => Dict{String,Any}(),
+        "initialized_at" => nothing,
+        "closed_at" => nothing,
+        "metadata" => metadata,  # Keep user metadata in the blob
+    )
+    session_data_json = JSON.json(session_data)
+
     DBInterface.execute(
         db,
         """
-        INSERT INTO mcp_sessions (id, name, session_type, start_time, last_activity, status, metadata)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO mcp_sessions (id, name, session_type, start_time, last_activity, status, state, target_julia_session_id, session_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = COALESCE(excluded.name, name),
             last_activity = excluded.last_activity,
             status = excluded.status,
-            metadata = excluded.metadata
+            target_julia_session_id = COALESCE(excluded.target_julia_session_id, target_julia_session_id),
+            session_data = excluded.session_data
         """,
-        (id, name, session_type, now_str, now_str, status, metadata_json),
+        (
+            id,
+            name,
+            session_type,
+            now_str,
+            now_str,
+            status,
+            "UNINITIALIZED",
+            target_julia_session_id,
+            session_data_json,
+        ),
+    )
+end
+
+"""
+    update_mcp_session_target!(mcp_session_id::String, target_julia_session_id::Union{String,Nothing})
+
+Update the target Julia session for an MCP session. This persists which Julia backend
+the MCP client is connected to, allowing the connection to survive proxy restarts.
+
+Arguments:
+- mcp_session_id: ID of the MCP client session
+- target_julia_session_id: UUID of the Julia session to target, or nothing to clear
+"""
+function update_mcp_session_target!(
+    mcp_session_id::String,
+    target_julia_session_id::Union{String,Nothing},
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+
+    DBInterface.execute(
+        db,
+        """
+        UPDATE mcp_sessions
+        SET target_julia_session_id = ?, last_activity = ?
+        WHERE id = ?
+        """,
+        (target_julia_session_id, now_str, mcp_session_id),
+    )
+end
+
+"""
+    update_mcp_session_protocol!(session_id::String, state::String, protocol_data::Dict)
+
+Update MCP session state and protocol-specific data (capabilities, client info, etc).
+This is called during session initialization and lifecycle changes.
+
+Arguments:
+- session_id: MCP session ID
+- state: Session state (UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED)
+- protocol_data: Dict with protocol_version, client_info, capabilities, etc.
+"""
+function update_mcp_session_protocol!(
+    session_id::String,
+    state::String,
+    protocol_data::Dict,
+)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+    protocol_data_json = JSON.json(protocol_data)
+
+    DBInterface.execute(
+        db,
+        """
+        UPDATE mcp_sessions
+        SET state = ?, session_data = ?, last_activity = ?
+        WHERE id = ?
+        """,
+        (state, protocol_data_json, now_str, session_id),
+    )
+end
+
+"""
+    get_active_mcp_sessions() -> Vector{NamedTuple}
+
+Get all active MCP sessions from the database with their target Julia session IDs.
+Used to restore MCP session state on proxy startup.
+
+Returns a vector of NamedTuples with fields:
+- id: MCP session ID
+- target_julia_session_id: UUID of target Julia session (or nothing)
+- start_time: Session start time
+- last_activity: Last activity time
+"""
+function get_active_mcp_sessions()
+    db = DB[]
+    if db === nothing
+        return NamedTuple[]
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT id, target_julia_session_id, start_time, last_activity
+        FROM mcp_sessions
+        WHERE status = 'active'
+        ORDER BY start_time DESC
+        """,
+    )
+
+    return collect(result)
+end
+
+"""
+    get_julia_session(uuid::String) -> Union{NamedTuple, Nothing}
+
+Get a single Julia session by UUID from the database.
+Returns a NamedTuple with session data or nothing if not found.
+"""
+function get_julia_session(uuid::String)
+    db = DB[]
+    if db === nothing
+        return nothing
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT id, name, port, pid, start_time, last_activity, status, metadata
+        FROM julia_sessions
+        WHERE id = ?
+        """,
+        (uuid,),
+    )
+
+    # Convert SQLite.Row to NamedTuple to avoid forward-only iterator issues
+    for row in result
+        return (
+            id = row.id,
+            name = row.name,
+            port = row.port,
+            pid = row.pid,
+            start_time = row.start_time,
+            last_activity = row.last_activity,
+            status = row.status,
+            metadata = row.metadata,
+        )
+    end
+    return nothing
+end
+
+"""
+    get_mcp_session(session_id::String) -> Union{NamedTuple, Nothing}
+
+Get a single MCP session by ID from the database.
+Returns a NamedTuple with session data (state and session_data are included).
+The session_data column contains JSON with protocol_version, client_info, capabilities, etc.
+"""
+function get_mcp_session(session_id::String)
+    db = DB[]
+    if db === nothing
+        return nothing
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT id, name, session_type, start_time, last_activity, status, state, target_julia_session_id, session_data
+        FROM mcp_sessions
+        WHERE id = ?
+        """,
+        (session_id,),
+    )
+
+    # Convert SQLite.Row to NamedTuple to avoid forward-only iterator issues
+    for row in result
+        return (
+            id = row.id,
+            name = row.name,
+            session_type = row.session_type,
+            start_time = row.start_time,
+            last_activity = row.last_activity,
+            status = row.status,
+            state = row.state,
+            target_julia_session_id = row.target_julia_session_id,
+            session_data = row.session_data,
+        )
+    end
+    return nothing
+end
+
+"""
+    get_julia_sessions_by_name(name::String) -> Vector{NamedTuple}
+
+Get all Julia sessions with a specific name from the database.
+Returns a vector of NamedTuples ordered by start time (oldest first).
+"""
+function get_julia_sessions_by_name(name::String)
+    db = DB[]
+    if db === nothing
+        return NamedTuple[]
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT id, name, port, pid, start_time, last_activity, status, metadata
+        FROM julia_sessions
+        WHERE name = ?
+        ORDER BY start_time ASC
+        """,
+        (name,),
+    )
+
+    # Convert to NamedTuples to avoid SQLite.Row forward-only iterator issues
+    return [
+        (
+            id = row.id,
+            name = row.name,
+            port = row.port,
+            pid = row.pid,
+            start_time = row.start_time,
+            last_activity = row.last_activity,
+            status = row.status,
+            metadata = row.metadata,
+        ) for row in result
+    ]
+end
+
+"""
+    get_mcp_sessions_by_target(target_julia_session_id::String) -> Vector{NamedTuple}
+
+Get all MCP sessions targeting a specific Julia session.
+Returns a vector of NamedTuples.
+"""
+function get_mcp_sessions_by_target(target_julia_session_id::String)
+    db = DB[]
+    if db === nothing
+        return NamedTuple[]
+    end
+
+    result = DBInterface.execute(
+        db,
+        """
+        SELECT id, name, session_type, start_time, last_activity, status, target_julia_session_id, metadata
+        FROM mcp_sessions
+        WHERE target_julia_session_id = ?
+        """,
+        (target_julia_session_id,),
+    )
+
+    # Convert to NamedTuples to avoid SQLite.Row forward-only iterator issues
+    return [
+        (
+            id = row.id,
+            name = row.name,
+            session_type = row.session_type,
+            start_time = row.start_time,
+            last_activity = row.last_activity,
+            status = row.status,
+            target_julia_session_id = row.target_julia_session_id,
+            metadata = row.metadata,
+        ) for row in result
+    ]
+end
+
+"""
+    update_mcp_session_status!(session_id::String, status::String)
+
+Update the status of an MCP session in the database.
+"""
+function update_mcp_session_status!(session_id::String, status::String)
+    db = DB[]
+    if db === nothing
+        error("Database not initialized. Call init_db!() first.")
+    end
+
+    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
+
+    DBInterface.execute(
+        db,
+        """
+        UPDATE mcp_sessions
+        SET status = ?, last_activity = ?
+        WHERE id = ?
+        """,
+        (status, now_str, session_id),
     )
 end
 
@@ -722,16 +1035,13 @@ function register_session!(
     status::String = "active";
     metadata::Dict = Dict(),
 )
+    # DEPRECATED: This function should not be used for Julia sessions.
+    # Julia sessions need proper names from proxy/register.
     # Check if it looks like a Julia REPL session (has port/pid in metadata)
     if haskey(metadata, "port") || haskey(metadata, "pid")
-        register_julia_session!(
-            session_id,
-            session_id,  # Use ID as name for legacy calls
-            status;
-            port = get(metadata, "port", nothing),
-            pid = get(metadata, "pid", nothing),
-            metadata = metadata,
-        )
+        @warn "register_session! called for Julia session - use register_julia_session! with proper name instead" session_id
+        # Do NOT auto-create - this would overwrite the proper name
+        return
     else
         # Treat as MCP session
         register_mcp_session!(
@@ -816,16 +1126,12 @@ function log_event_safe!(
 )
     try
         # Ensure sessions exist (auto-create with minimal info)
+        # Note: We only auto-create MCP sessions. Julia sessions MUST be registered
+        # by the REPL itself via proxy/register to get the correct logical name.
         if mcp_session_id !== nothing
             register_mcp_session!(mcp_session_id; metadata = Dict("auto_created" => true))
         end
-        if julia_session_id !== nothing
-            register_julia_session!(
-                julia_session_id,
-                julia_session_id;  # Use ID as name for auto-created sessions
-                metadata = Dict("auto_created" => true),
-            )
-        end
+        # Do NOT auto-create julia_sessions - they need proper names from registration
 
         log_event!(
             event_type,
@@ -975,18 +1281,12 @@ function log_interaction_safe!(
 )
     try
         # Ensure sessions exist (auto-create with minimal info)
+        # Note: We only auto-create MCP sessions. Julia sessions MUST be registered
+        # by the REPL itself via proxy/register to get the correct logical name.
         if mcp_session_id !== nothing
             register_mcp_session!(mcp_session_id; metadata = Dict("auto_created" => true))
         end
-        if julia_session_id !== nothing
-            register_julia_session!(
-                julia_session_id,
-                julia_session_id;  # Use ID as name for auto-created sessions
-                port = julia_session_port,
-                pid = julia_session_pid,
-                metadata = Dict("auto_created" => true),
-            )
-        end
+        # Do NOT auto-create julia_sessions - they need proper names from registration
 
         log_interaction!(
             direction,
@@ -1155,14 +1455,18 @@ function get_session_stats(session_id::String)
         (session_id,),
     )
 
-    # Get session info
+    # Get session info from either julia_sessions or mcp_sessions
     session_info =
         DBInterface.execute(
             db,
             """
-        SELECT * FROM sessions WHERE session_id = ?
+        SELECT id, name, 'julia' as session_type, status, start_time, last_activity, port, pid, metadata
+        FROM julia_sessions WHERE id = ?
+        UNION ALL
+        SELECT id, name, session_type, status, start_time, last_activity, NULL as port, NULL as pid, metadata
+        FROM mcp_sessions WHERE id = ?
     """,
-            (session_id,),
+            (session_id, session_id),
         ) |> DataFrame
 
     return Dict(
@@ -1173,7 +1477,7 @@ function get_session_stats(session_id::String)
 end
 
 """
-Get all active sessions.
+Get all active sessions from both julia_sessions and mcp_sessions.
 """
 function get_active_sessions()
     db = DB[]
@@ -1184,7 +1488,11 @@ function get_active_sessions()
     return DBInterface.execute(
         db,
         """
-    SELECT * FROM sessions WHERE status = 'active'
+    SELECT id, name, 'julia' as session_type, status, start_time, last_activity, port, pid, metadata
+    FROM julia_sessions WHERE status = 'active'
+    UNION ALL
+    SELECT id, name, session_type, status, start_time, last_activity, NULL as port, NULL as pid, metadata
+    FROM mcp_sessions WHERE status = 'active'
     ORDER BY last_activity DESC
 """,
     ) |> DataFrame
@@ -1236,20 +1544,27 @@ function get_all_sessions(; limit::Int = 100)
         error("Database not initialized. Call init_db!() first.")
     end
 
-    result = DBInterface.execute(
-        db,
-        """
-    SELECT * FROM sessions
-    ORDER BY last_activity DESC
-    LIMIT ?
-""",
-        (limit,),
-    ) |> DataFrame
+    # Return all sessions from both julia_sessions and mcp_sessions tables
+    # Add a session_type field to distinguish them
+    result =
+        DBInterface.execute(
+            db,
+            """
+        SELECT id, name, 'julia' as session_type, status, start_time, last_activity, port, pid, metadata
+        FROM julia_sessions
+        UNION ALL
+        SELECT id, name, session_type, status, start_time, last_activity, NULL as port, NULL as pid, metadata
+        FROM mcp_sessions
+        ORDER BY last_activity DESC
+        LIMIT ?
+    """,
+            (limit,),
+        ) |> DataFrame
     return dataframe_to_array(result)
 end
 
 """
-Update session status.
+Update Julia session status.
 """
 function update_session_status!(session_id::String, status::String)
     db = DB[]
@@ -1262,9 +1577,9 @@ function update_session_status!(session_id::String, status::String)
     DBInterface.execute(
         db,
         """
-    UPDATE sessions 
+    UPDATE julia_sessions
     SET status = ?, last_activity = ?
-    WHERE session_id = ?
+    WHERE id = ?
 """,
         (status, now_str, session_id),
     )
@@ -1303,18 +1618,18 @@ function get_global_stats()
         error("Database not initialized. Call init_db!() first.")
     end
 
-    # Total sessions
+    # Total sessions (count from both tables)
     total_sessions =
         DBInterface.execute(
             db,
-            "SELECT COUNT(DISTINCT session_id) as count FROM sessions",
+            "SELECT (SELECT COUNT(*) FROM julia_sessions) + (SELECT COUNT(*) FROM mcp_sessions) as count",
         ) |> DataFrame
 
-    # Active sessions
+    # Active sessions (count from both tables)
     active_sessions =
         DBInterface.execute(
             db,
-            "SELECT COUNT(*) as count FROM sessions WHERE status = 'active'",
+            "SELECT (SELECT COUNT(*) FROM julia_sessions WHERE status = 'active') + (SELECT COUNT(*) FROM mcp_sessions WHERE status = 'active') as count",
         ) |> DataFrame
 
     # Total events
