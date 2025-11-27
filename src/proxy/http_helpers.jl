@@ -29,7 +29,7 @@ function send_json_response(
     status::Int = 200,
     mcp_session_id::Union{String,Nothing} = nothing,
     julia_session_id::Union{String,Nothing} = nothing,
-    request_id = nothing,
+    request_id::Union{String,Nothing} = nothing,
 )
     json_str = JSON.json(data)
 
@@ -91,12 +91,14 @@ function send_jsonrpc_result(
     status::Int = 200,
     session_id::String = "proxy",
 )
+    # Convert id to string for logging (JSON-RPC ids can be strings or numbers)
+    request_id_str = id === nothing ? nothing : string(id)
     send_json_response(
         http,
         Dict("jsonrpc" => "2.0", "id" => id, "result" => result);
         status = status,
         mcp_session_id = session_id,
-        request_id = id,
+        request_id = request_id_str,
     )
 end
 
@@ -140,12 +142,14 @@ function send_jsonrpc_error(
     if data !== nothing
         error_dict["data"] = data
     end
+    # Convert id to string for logging (JSON-RPC ids can be strings or numbers)
+    request_id_str = id === nothing ? nothing : string(id)
     send_json_response(
         http,
         Dict("jsonrpc" => "2.0", "id" => id, "error" => error_dict);
         status = status,
         mcp_session_id = session_id,
-        request_id = id,
+        request_id = request_id_str,
     )
 end
 

@@ -44,6 +44,10 @@ const SERVER_PID_FILE = Ref{String}("")
 const VITE_DEV_PROCESS = Ref{Union{Base.Process,Nothing}}(nothing)
 const VITE_DEV_PORT = 3001
 
+# Proxy's own MCP session ID for tool calls it makes on its own behalf
+# (e.g., dashboard Quick Start, internal operations)
+const PROXY_MCP_SESSION_ID = "proxy-system"
+
 # CLIENT_CONNECTIONS initialized in __init__() (can't be precompiled)
 CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()
 CLIENT_CONNECTIONS_LOCK = ReentrantLock()
@@ -704,8 +708,10 @@ function handle_request(http::HTTP.Stream)
             !isnothing(params)
 
         # Extract session ID for logging
+        # If no MCP client session header, use the proxy's own session ID
         session_id_header = HTTP.header(req, "Mcp-Session-Id")
-        log_session_id = !isempty(session_id_header) ? String(session_id_header) : "proxy"
+        log_session_id =
+            !isempty(session_id_header) ? String(session_id_header) : PROXY_MCP_SESSION_ID
 
         # Note: Request is already logged as an interaction via log_db_interaction earlier
         # No need to duplicate it as an event
@@ -1756,7 +1762,20 @@ function start_foreground_server(port::Int = 3000)
     db_path = joinpath(cache_dir, "mcprepl.db")
     init_database!(db_path)
 
-    # Note: MCP sessions are restored on-demand when clients reconnect and include
+    # Register the proxy's own MCP session for tool calls it makes on its own behalf
+    # (e.g., dashboard Quick Start, internal operations)
+    try
+        Database.register_mcp_session!(
+            PROXY_MCP_SESSION_ID;
+            metadata = Dict("type" => "proxy-system", "created_at" => string(now())),
+        )
+        @info "Registered proxy system MCP session" session_id = PROXY_MCP_SESSION_ID
+    catch e
+        # Session may already exist from previous run
+        @debug "Proxy MCP session already registered" session_id = PROXY_MCP_SESSION_ID
+    end
+
+    # Note: Client MCP sessions are restored on-demand when clients reconnect and include
     # their Mcp-Session-Id header in the initialize request. This allows clients
     # to maintain their Julia backend routing across proxy restarts.
 

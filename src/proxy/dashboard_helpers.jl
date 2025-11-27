@@ -122,7 +122,7 @@ end
 
 Generic handler for session control operations (restart, shutdown, etc.).
 
-The action_func is called with (conn, session_id) and should return (success::Bool, should_delete::Bool).
+The action_func is called with (session, session_id) and should return (success::Bool, should_delete::Bool).
 Note: action_func is first to support do-block syntax.
 """
 function handle_session_control(
@@ -131,19 +131,23 @@ function handle_session_control(
     session_id::String,
     action_name::String,
 )
-    # Execute action and determine if we should unregister
-    success, should_delete = lock(JULIA_SESSION_REGISTRY_LOCK) do
-        if haskey(JULIA_SESSION_REGISTRY, session_id)
-            conn = JULIA_SESSION_REGISTRY[session_id]
-            success, should_delete = action_func(conn, session_id)
-            return (success, should_delete)
-        else
-            @warn "Session not found for $action_name" session_id
-            return (false, false)
-        end
+    # Get session from database
+    session = get_julia_session(session_id)
+
+    if session === nothing
+        @warn "Session not found for $action_name" session_id
+        send_json_response(
+            http,
+            Dict("success" => false, "session_id" => session_id);
+            status = 404,
+        )
+        return nothing
     end
 
-    # Properly unregister the session if requested (outside the lock to avoid issues)
+    # Execute action and determine if we should unregister
+    success, should_delete = action_func(session, session_id)
+
+    # Properly unregister the session if requested
     if should_delete && success
         unregister_julia_session(session_id)
     end

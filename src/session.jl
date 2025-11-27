@@ -15,7 +15,12 @@ using Dates
 using UUIDs
 
 export MCPSession,
-    SessionState, initialize_session!, close_session!, get_session_info, update_activity!
+    SessionState,
+    initialize_session!,
+    close_session!,
+    get_session_info,
+    update_activity!,
+    session_from_db
 
 # Session states
 @enum SessionState begin
@@ -79,6 +84,88 @@ function MCPSession(; target_julia_session_id::Union{String,Nothing} = nothing)
         nothing,                            # closed_at
         target_julia_session_id,            # target_julia_session_id
         now_time,                           # last_activity
+    )
+end
+
+# Define JSON serialization for MCPSession (struct → JSON)
+# This hook is used by JSON.json() to convert MCPSession to a Dict
+# Timestamps are serialized in ISO 8601 format (yyyy-mm-ddTHH:MM:SS)
+JSON.lower(session::MCPSession) = Dict(
+    "id" => session.id,
+    "state" => string(session.state),
+    "protocol_version" => session.protocol_version,
+    "client_info" => session.client_info,
+    "server_capabilities" => session.server_capabilities,
+    "client_capabilities" => session.client_capabilities,
+    "created_at" => Dates.format(session.created_at, "yyyy-mm-dd\\THH:MM:SS"),
+    "initialized_at" =>
+        session.initialized_at === nothing ? nothing :
+        Dates.format(session.initialized_at, "yyyy-mm-dd\\THH:MM:SS"),
+    "closed_at" =>
+        session.closed_at === nothing ? nothing :
+        Dates.format(session.closed_at, "yyyy-mm-dd\\THH:MM:SS"),
+    "target_julia_session_id" => session.target_julia_session_id,
+    "last_activity" => Dates.format(session.last_activity, "yyyy-mm-dd\\THH:MM:SS"),
+)
+
+"""
+    session_from_db(db_row::NamedTuple) -> MCPSession
+
+Reconstruct an MCPSession from a database row.
+The database row should have: id, state, session_data (JSON), start_time, last_activity, target_julia_session_id.
+"""
+function session_from_db(db_row)
+    # Parse the session_data JSON blob
+    session_data =
+        ismissing(db_row.session_data) ? Dict{String,Any}() :
+        JSON.parse(db_row.session_data)
+
+    # Parse state enum
+    state_str = ismissing(db_row.state) ? "UNINITIALIZED" : String(db_row.state)
+    state = if state_str == "UNINITIALIZED"
+        UNINITIALIZED
+    elseif state_str == "INITIALIZING"
+        INITIALIZING
+    elseif state_str == "INITIALIZED"
+        INITIALIZED
+    elseif state_str == "CLOSED"
+        CLOSED
+    else
+        UNINITIALIZED
+    end
+
+    # Parse timestamps - database format is "yyyy-mm-dd HH:MM:SS.sss"
+    db_format = Dates.DateFormat("yyyy-mm-dd HH:MM:SS.sss")
+    created_at = Dates.DateTime(db_row.start_time, db_format)
+    last_activity = Dates.DateTime(db_row.last_activity, db_format)
+
+    # JSON serialized timestamps use ISO format
+    iso_format = Dates.DateFormat("yyyy-mm-dd\\THH:MM:SS")
+    initialized_at =
+        haskey(session_data, "initialized_at") &&
+        session_data["initialized_at"] !== nothing ?
+        Dates.DateTime(session_data["initialized_at"], iso_format) : nothing
+    closed_at =
+        haskey(session_data, "closed_at") && session_data["closed_at"] !== nothing ?
+        Dates.DateTime(session_data["closed_at"], iso_format) : nothing
+
+    # Extract target
+    target_julia_session_id =
+        ismissing(db_row.target_julia_session_id) ? nothing : db_row.target_julia_session_id
+
+    # Reconstruct the session
+    return MCPSession(
+        String(db_row.id),
+        state,
+        get(session_data, "protocol_version", ""),
+        get(session_data, "client_info", Dict{String,Any}()),
+        get(session_data, "server_capabilities", get_server_capabilities()),
+        get(session_data, "client_capabilities", Dict{String,Any}()),
+        created_at,
+        initialized_at,
+        closed_at,
+        target_julia_session_id,
+        last_activity,
     )
 end
 

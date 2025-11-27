@@ -77,8 +77,8 @@ function log_db_interaction(
     content::Union{String,Dict};
     mcp_session_id::Union{String,Nothing} = nothing,
     julia_session_id::Union{String,Nothing} = nothing,
-    request_id = nothing,
-    method = nothing,
+    request_id::Union{String,Nothing} = nothing,
+    method::Union{String,Nothing} = nothing,
     http_method::Union{String,Nothing} = nothing,
     http_path::Union{String,Nothing} = nothing,
     http_headers::Union{String,Nothing} = nothing,
@@ -94,10 +94,12 @@ function log_db_interaction(
         julia_session_port = nothing
         julia_session_pid = nothing
         if julia_session_id !== nothing
-            julia_session = get(JULIA_SESSION_REGISTRY, julia_session_id, nothing)
+            julia_session = get_julia_session(julia_session_id)
             if julia_session !== nothing
-                julia_session_port = julia_session.port
-                julia_session_pid = julia_session.pid
+                julia_session_port =
+                    ismissing(julia_session.port) ? nothing : julia_session.port
+                julia_session_pid =
+                    ismissing(julia_session.pid) ? nothing : julia_session.pid
             end
         end
 

@@ -47,8 +47,9 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                             setSelectedToolSession(sessionId);
                             fetchTools(sessionId).then(setTools);
                         }}
+                        title={`UUID: ${sessionId}`}
                     >
-                        {sessionId} Tools
+                        {sessions[sessionId].name} Tools
                     </button>
                 ))}
             </div>
@@ -108,7 +109,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                                     </div>
                                 )}
                             </div>
-                        )) : <p>No tools available for {selectedToolSession}</p>
+                        )) : <p>No tools available for session "{sessions[selectedToolSession]?.name || selectedToolSession}"</p>
                     )}
                 </div>
             )}

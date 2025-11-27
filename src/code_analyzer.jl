@@ -288,8 +288,8 @@ function find_similar_functions(directory::String = "src/"; min_similarity = 0.7
     similar_pairs = []
 
     # Compare all pairs of functions
-    for i = 1:length(all_functions)
-        for j = (i+1):length(all_functions)
+    for i in eachindex(all_functions)
+        for j = (i+1):lastindex(all_functions)
             func1 = all_functions[i]
             func2 = all_functions[j]
 

@@ -1,4 +1,4 @@
-using Test
+using ReTest
 using SQLite
 using JSON
 using DataFrames
@@ -289,6 +289,120 @@ using .Database
         # Filter by request_id
         r1_interactions = get_interactions(session_id = session_id, request_id = "r1")
         @test nrow(r1_interactions) == 2  # request + response pair
+    end
+
+    @testset "MCP Session Target Persistence" begin
+        # Test MCP session target persistence and switching
+        mcp_session_id = "mcp-client-1"
+        julia_session_1 = "julia-session-uuid-1"
+        julia_session_2 = "julia-session-uuid-2"
+
+        # Register MCP session with initial target
+        register_mcp_session!(
+            mcp_session_id,
+            "active";
+            target_julia_session_id = julia_session_1,
+        )
+
+        # Verify MCP session was created with target
+        active_sessions = Database.get_active_mcp_sessions()
+        @test !isempty(active_sessions)
+        mcp_session = first(filter(s -> s.id == mcp_session_id, active_sessions))
+        @test mcp_session.target_julia_session_id == julia_session_1
+
+        # Update target to different Julia session (switching)
+        Database.update_mcp_session_target!(mcp_session_id, julia_session_2)
+
+        # Verify target was updated
+        active_sessions = Database.get_active_mcp_sessions()
+        mcp_session = first(filter(s -> s.id == mcp_session_id, active_sessions))
+        @test mcp_session.target_julia_session_id == julia_session_2
+
+        # Clear target (set to nothing)
+        Database.update_mcp_session_target!(mcp_session_id, nothing)
+
+        # Verify target was cleared
+        active_sessions = Database.get_active_mcp_sessions()
+        mcp_session = first(filter(s -> s.id == mcp_session_id, active_sessions))
+        @test mcp_session.target_julia_session_id === nothing
+
+        # Re-register with new target (simulating proxy restart scenario)
+        register_mcp_session!(
+            mcp_session_id,
+            "active";
+            target_julia_session_id = julia_session_2,
+        )
+
+        # Verify target was updated (not overwritten to nothing)
+        active_sessions = Database.get_active_mcp_sessions()
+        mcp_session = first(filter(s -> s.id == mcp_session_id, active_sessions))
+        @test mcp_session.target_julia_session_id == julia_session_2
+    end
+
+    @testset "Multiple MCP Sessions" begin
+        # Test multiple MCP sessions with different targets
+        mcp_1 = "mcp-client-multi-1"
+        mcp_2 = "mcp-client-multi-2"
+        mcp_3 = "mcp-client-multi-3"
+        julia_1 = "julia-uuid-1"
+        julia_2 = "julia-uuid-2"
+
+        register_mcp_session!(mcp_1, "active"; target_julia_session_id = julia_1)
+        register_mcp_session!(mcp_2, "active"; target_julia_session_id = julia_2)
+        register_mcp_session!(mcp_3, "active"; target_julia_session_id = nothing)
+
+        active_sessions = Database.get_active_mcp_sessions()
+        @test length(active_sessions) >= 3
+
+        # Verify each session has correct target
+        session_1 = first(filter(s -> s.id == mcp_1, active_sessions))
+        @test session_1.target_julia_session_id == julia_1
+
+        session_2 = first(filter(s -> s.id == mcp_2, active_sessions))
+        @test session_2.target_julia_session_id == julia_2
+
+        session_3 = first(filter(s -> s.id == mcp_3, active_sessions))
+        @test session_3.target_julia_session_id === nothing
+
+        # Switch session 2 to same target as session 1
+        Database.update_mcp_session_target!(mcp_2, julia_1)
+
+        active_sessions = Database.get_active_mcp_sessions()
+        session_2_updated = first(filter(s -> s.id == mcp_2, active_sessions))
+        @test session_2_updated.target_julia_session_id == julia_1
+    end
+
+    @testset "MCP Session Restoration After Proxy Restart" begin
+        # Test that MCP sessions can be restored from DB with their Julia targets
+        mcp_id = "persistent-mcp-session"
+        julia_id = "julia-backend-uuid"
+
+        # Simulate agent connecting and setting target
+        register_mcp_session!(mcp_id, "active"; target_julia_session_id = julia_id)
+
+        # Verify it's in the database
+        sessions = Database.get_active_mcp_sessions()
+        found = first(filter(s -> s.id == mcp_id, sessions))
+        @test found.id == mcp_id
+        @test found.target_julia_session_id == julia_id
+
+        # Simulate proxy restart: query DB to get the target
+        # (In real code, this happens in initialize handler when client provides Mcp-Session-Id header)
+        restored_sessions = Database.get_active_mcp_sessions()
+        restored = first(filter(s -> s.id == mcp_id, restored_sessions))
+
+        # Verify we can restore the mapping
+        @test restored.id == mcp_id
+        @test restored.target_julia_session_id == julia_id
+
+        # Simulate agent switching to different backend
+        new_julia_id = "different-julia-backend"
+        Database.update_mcp_session_target!(mcp_id, new_julia_id)
+
+        # Verify the update persisted
+        updated_sessions = Database.get_active_mcp_sessions()
+        updated = first(filter(s -> s.id == mcp_id, updated_sessions))
+        @test updated.target_julia_session_id == new_julia_id
     end
 
     # Cleanup

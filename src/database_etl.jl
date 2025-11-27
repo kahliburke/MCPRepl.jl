@@ -91,8 +91,10 @@ Parses request/response pairs and creates structured tool_executions records.
 """
 function extract_tool_executions(db, last_id::Int)
     # Query for new request/response pairs
+    # CRITICAL: Must join on BOTH request_id AND mcp_session_id because
+    # request_id is only unique per session (multiple sessions can use id=1)
     query = """
-        SELECT 
+        SELECT
             req.id as req_id,
             resp.id as resp_id,
             req.mcp_session_id as session_id,
@@ -103,8 +105,9 @@ function extract_tool_executions(db, last_id::Int)
             req.content as request_content,
             resp.content as response_content
         FROM interactions req
-        LEFT JOIN interactions resp 
-            ON req.request_id = resp.request_id 
+        LEFT JOIN interactions resp
+            ON req.request_id = resp.request_id
+            AND req.mcp_session_id = resp.mcp_session_id
             AND resp.direction = 'outbound'
             AND resp.message_type IN ('response', 'error')
         WHERE req.direction = 'inbound'

@@ -115,7 +115,12 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
                                                 </>
                                             );
                                         case 'SESSION_START':
-                                            return <span className="terminal-info">→ Session started on port {event.data.port}</span>;
+                                            const startedByProxy = event.data.metadata?.started_by_proxy;
+                                            const logFile = event.data.metadata?.log_file;
+                                            const contextNote = startedByProxy && logFile
+                                                ? ` (logs: ${logFile})`
+                                                : ' (logs in VS Code Output panel or terminal)';
+                                            return <span className="terminal-info">→ Session started on port {event.data.port}{contextNote}</span>;
                                         case 'SESSION_STOP':
                                             return <span className="terminal-info">→ Session stopped</span>;
                                         case 'PROGRESS':

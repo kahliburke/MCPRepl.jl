@@ -206,6 +206,42 @@ using MCPRepl.Database
         @test repl.missed_heartbeats == 0
     end
 
+    @testset "MCP Session Auto-Creation on Missing Session" begin
+        # This tests the scenario where an MCP session ID doesn't exist
+        # (e.g., after proxy restart) and gets auto-created on demand
+
+        empty!(Proxy.MCP_SESSION_REGISTRY)
+
+        # Create a test MCP session ID
+        test_session_id = "test-mcp-session-123"
+
+        # Verify it doesn't exist initially
+        @test Proxy.get_mcp_session(test_session_id) === nothing
+
+        # Simulate what connect_to_session does: create on the fly
+        session = Proxy.create_mcp_session(nothing)
+
+        # Override with the client's session ID
+        lock(Proxy.MCP_SESSION_LOCK) do
+            delete!(Proxy.MCP_SESSION_REGISTRY, session.id)
+            session.id = test_session_id
+            Proxy.MCP_SESSION_REGISTRY[test_session_id] = session
+        end
+
+        # Verify the session now exists with the expected ID
+        retrieved = Proxy.get_mcp_session(test_session_id)
+        @test retrieved !== nothing
+        @test retrieved.id == test_session_id
+        @test retrieved.target_julia_session_id === nothing
+
+        # Test setting a target
+        retrieved.target_julia_session_id = "julia-uuid-123"
+        @test retrieved.target_julia_session_id == "julia-uuid-123"
+
+        # Clean up
+        empty!(Proxy.MCP_SESSION_REGISTRY)
+    end
+
     # Cleanup
     Database.close_db!()
     rm(test_db; force = true)

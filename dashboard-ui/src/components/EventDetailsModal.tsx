@@ -1,13 +1,16 @@
 import React from 'react';
 import { JsonViewer } from '@textea/json-viewer';
-import { SessionEvent } from '../types';
+import { SessionEvent, Session } from '../types';
 
 interface EventDetailsModalProps {
     event: SessionEvent;
+    sessions: Record<string, Session>;
     onClose: () => void;
 }
 
-export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, onClose }) => {
+export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, sessions, onClose }) => {
+    const sessionName = sessions[event.id]?.name || 'Unknown';
+    const shortUuid = event.id.substring(0, 8) + '...';
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -21,8 +24,10 @@ export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, onC
                         <span className={`detail-value event-badge event-${event.type.toLowerCase()}`}>{event.type}</span>
                     </div>
                     <div className="detail-row">
-                        <span className="detail-label">Agent ID:</span>
-                        <span className="detail-value">{event.id}</span>
+                        <span className="detail-label">Session:</span>
+                        <span className="detail-value" title={`UUID: ${event.id}`}>
+                            {sessionName} <span style={{ color: '#64748b', fontSize: '0.85em' }}>({shortUuid})</span>
+                        </span>
                     </div>
                     <div className="detail-row">
                         <span className="detail-label">Timestamp:</span>

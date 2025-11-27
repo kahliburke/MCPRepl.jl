@@ -10,14 +10,18 @@ Commands:
     stop        Stop the running proxy server
     restart     Restart the proxy server
     status      Check if proxy is running
+    clean       Remove all logs and database files
 
 Options:
     --background, -b    Run in background (for start/restart)
     --port PORT, -p     Port to use (default: 3000)
+    --clean, -c         Clean logs/database before starting (for start/restart)
 
 Examples:
     julia proxy.jl                    # Start in foreground
     julia proxy.jl start --background # Start in background
+    julia proxy.jl start --clean      # Clean then start
+    julia proxy.jl clean              # Just clean files
     julia proxy.jl restart            # Restart proxy
     julia proxy.jl stop               # Stop proxy
     julia proxy.jl status             # Check status
@@ -33,6 +37,7 @@ using MCPRepl.Proxy
 # Parse command line arguments
 const command = length(ARGS) >= 1 ? ARGS[1] : "start"
 const background = "--background" in ARGS || "-b" in ARGS
+const clean_first = "--clean" in ARGS || "-c" in ARGS
 
 # Parse port if provided
 port = 3000
@@ -46,6 +51,13 @@ end
 
 # Execute command
 if command == "start"
+    # Clean first if requested
+    if clean_first
+        println("🧹 Cleaning logs and database...")
+        Proxy.clean_proxy_data(port; verbose = true)
+        println()
+    end
+
     if Proxy.is_server_running(port)
         existing_pid = Proxy.get_server_pid(port)
         println("❌ Proxy already running on port $port (PID: $existing_pid)")
@@ -75,6 +87,13 @@ elseif command == "stop"
     println("✅ Proxy stopped")
 
 elseif command == "restart"
+    # Clean first if requested
+    if clean_first
+        println("🧹 Cleaning logs and database...")
+        Proxy.clean_proxy_data(port; verbose = true)
+        println()
+    end
+
     println(
         "🔄 Restarting proxy server on port $port$(background ? " (background)" : "")...",
     )
@@ -98,6 +117,15 @@ elseif command == "status"
     else
         println("❌ Proxy server is not running on port $port")
         exit(1)
+    end
+
+elseif command == "clean"
+    println("🧹 Cleaning all proxy logs and database files...")
+    println()
+    files = Proxy.clean_proxy_data(port; verbose = true)
+    println()
+    if !isempty(files)
+        println("✅ Clean complete! Ready for a fresh start.")
     end
 
 elseif command == "help" || command == "--help" || command == "-h"

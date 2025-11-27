@@ -72,7 +72,7 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
     };
 
     const formatDuration = (ms: number | null) => {
-        if (ms === null) return 'N/A';
+        if (ms === null || isNaN(ms)) return 'N/A';
         if (ms < 1000) return `${ms.toFixed(0)}ms`;
         return `${(ms / 1000).toFixed(2)}s`;
     };
@@ -162,7 +162,9 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
                             <div className="metric-label">Avg Duration</div>
                             <div className="metric-value">
                                 {formatDuration(
-                                    toolSummary.reduce((sum, t) => sum + (t.avg_duration_ms || 0), 0) / toolSummary.length
+                                    toolSummary.length > 0
+                                        ? toolSummary.reduce((sum, t) => sum + (t.avg_duration_ms || 0), 0) / toolSummary.length
+                                        : null
                                 )}
                             </div>
                         </div>

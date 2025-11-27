@@ -227,6 +227,26 @@ const START_JULIA_SESSION_TOOL =
         :start_julia_session_special
     end
 
+"""
+Connect to Julia Session tool - associates this MCP session with a specific Julia REPL session
+"""
+const CONNECT_TO_SESSION_TOOL =
+    @mcp_tool :connect_to_session "Connect this MCP client to a specific Julia REPL session to access its tools. Use list_julia_sessions to see available sessions." Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "session_id" => Dict(
+                "type" => "string",
+                "description" => "UUID or name of the Julia session to connect to",
+            ),
+        ),
+        "required" => ["session_id"],
+    ) (args) -> begin
+        # This tool is special - it needs the MCP session context
+        # The actual implementation is handled in the proxy.jl tools/call handler
+        # This is just the schema definition
+        "This tool must be called through the proxy with MCP session context"
+    end
+
 # ============================================================================
 # Tool Registry
 # ============================================================================
@@ -235,6 +255,7 @@ const PROXY_TOOLS = Dict{String,MCPTool}(
     "help" => HELP_TOOL,
     "proxy_status" => PROXY_STATUS_TOOL,
     "list_julia_sessions" => LIST_JULIA_SESSIONS_TOOL,
+    "connect_to_session" => CONNECT_TO_SESSION_TOOL,
     "dashboard_url" => DASHBOARD_URL_TOOL,
     "kill_stale_sessions" => KILL_STALE_SESSIONS_TOOL,
     "start_julia_session" => START_JULIA_SESSION_TOOL,

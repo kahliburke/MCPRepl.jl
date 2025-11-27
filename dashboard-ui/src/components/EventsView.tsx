@@ -14,6 +14,66 @@ export const EventsView: React.FC<EventsViewProps> = ({
     setEventFilter,
     setSelectedEvent
 }) => {
+    const formatEventSummary = (event: SessionEvent): string => {
+        const { type, data } = event;
+
+        switch (type) {
+            case 'AGENT_START':
+            case 'SESSION_START':
+                const port = data.port || data.metadata?.port;
+                const name = data.name || data.metadata?.agent_name;
+                const portStr = port ? `port ${port}` : 'session';
+                return `Started ${portStr}${name ? ` (${name})` : ''}`;
+
+            case 'AGENT_STOP':
+            case 'SESSION_STOP':
+                return data.name ? `Stopped: ${data.name}` : 'Session stopped';
+
+            case 'TOOL_CALL':
+                return `Tool: ${data.tool || 'unknown'}${data.arguments ? ` with ${Object.keys(data.arguments).length} args` : ''}`;
+
+            case 'CODE_EXECUTION':
+                return `Method: ${data.method || 'unknown'}`;
+
+            case 'OUTPUT':
+                const output = data.result?.content?.[0]?.text || data.result || '';
+                const preview = typeof output === 'string' ? output.substring(0, 80) : JSON.stringify(output).substring(0, 80);
+                return preview + (preview.length >= 80 ? '...' : '');
+
+            case 'ERROR':
+                return `Error: ${data.message || data.error_message || 'Unknown error'}`;
+
+            case 'PROGRESS':
+                const params = data.notification?.params;
+                if (params) {
+                    const progress = params.progress !== undefined ? `${params.progress}/${params.total || '?'}` : '';
+                    return `${params.message || 'Progress'}${progress ? ` (${progress})` : ''}`;
+                }
+                return 'Progress update';
+
+            case 'tool.call.start':
+            case 'tool.call.complete':
+                return `Tool: ${data.tool_name || 'unknown'}${data.is_proxy_tool ? ' (proxy)' : ''}`;
+
+            case 'session.initialized':
+                return `Client: ${data.client_name || 'unknown'}`;
+
+            default:
+                // Fallback: try common fields
+                if (data.description) return data.description;
+                if (data.tool) return `Tool: ${data.tool}`;
+                if (data.method) return `Method: ${data.method}`;
+                if (data.message) return data.message;
+
+                // Last resort: show a few key fields
+                const keys = Object.keys(data).slice(0, 3);
+                if (keys.length > 0) {
+                    return keys.map(k => `${k}: ${String(data[k]).substring(0, 20)}`).join(', ');
+                }
+                return 'No details available';
+        }
+    };
+
     return (
         <div className="view active" id="events-view">
             <div className="events-header">
@@ -50,7 +110,7 @@ export const EventsView: React.FC<EventsViewProps> = ({
                                 )}
                             </div>
                             <div className="event-body">
-                                {event.data.description || event.data.tool || event.data.method || JSON.stringify(event.data)}
+                                {formatEventSummary(event)}
                             </div>
                         </div>
                     ))}

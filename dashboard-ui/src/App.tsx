@@ -440,7 +440,7 @@ export const App: React.FC = () => {
                         </div>
                         <div className="modal-body">
                             <p className="confirm-message">
-                                Are you sure you want to {confirmSessionAction.action} session <strong>{confirmSessionAction.sessionId}</strong>?
+                                Are you sure you want to {confirmSessionAction.action} session <strong>{sessions[confirmSessionAction.sessionId]?.name || confirmSessionAction.sessionId}</strong>?
                             </p>
                         </div>
                         <div className="modal-footer">
@@ -708,6 +708,7 @@ export const App: React.FC = () => {
             {selectedEvent && (
                 <EventDetailsModal
                     event={selectedEvent}
+                    sessions={sessions}
                     onClose={() => setSelectedEvent(null)}
                 />
             )}
