@@ -736,7 +736,7 @@ function handle_request(http::HTTP.Stream)
                     "connected_sessions" => length(sessions),
                     "sessions" => [
                         Dict(
-                            "uuid" => s.uuid,
+                            "uuid" => s.id,
                             "name" => s.name,
                             "port" => s.port,
                             "status" => string(s.status),
@@ -1169,7 +1169,7 @@ function handle_request(http::HTTP.Stream)
 
                 # Auto-target if exactly one Julia session exists
                 if length(sessions) == 1
-                    target_julia_session_id = sessions[1].uuid
+                    target_julia_session_id = sessions[1].id
                     @debug "tools/list - auto-targeting single session" target =
                         target_julia_session_id name = sessions[1].name
 

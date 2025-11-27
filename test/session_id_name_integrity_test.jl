@@ -40,6 +40,10 @@ using .Database
             @test session.id == uuid
             @test session.name == name
             @test session.id != session.name  # They MUST be different
+
+            # CRITICAL: Field must be named 'id' not 'uuid' (catches .uuid access bug)
+            @test hasfield(typeof(session), :id)
+            @test !hasfield(typeof(session), :uuid)
         end
 
         @testset "Registration with different port" begin

@@ -147,7 +147,7 @@ const LIST_JULIA_SESSIONS_TOOL =
             for repl in julia_sessions
                 pid_str = repl.pid === nothing ? "N/A" : string(repl.pid)
                 agent_text *= "**$(repl.name)**\n"
-                agent_text *= "  - UUID: $(repl.uuid)\n"
+                agent_text *= "  - UUID: $(repl.id)\n"
                 agent_text *= "  - Port: $(repl.port)\n"
                 agent_text *= "  - PID: $pid_str\n"
                 agent_text *= "  - Status: $(repl.status)\n"
