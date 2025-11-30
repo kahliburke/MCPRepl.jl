@@ -17,7 +17,10 @@ export type EventType =
     | 'OUTPUT'
     | 'ERROR'
     | 'HEARTBEAT'
-    | 'PROGRESS';
+    | 'PROGRESS'
+    | 'tool.call.start'
+    | 'tool.call.complete'
+    | 'session.initialized';
 
 export interface SessionEvent {
     id: string;
