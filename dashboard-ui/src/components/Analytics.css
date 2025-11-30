@@ -20,8 +20,8 @@
 
 .session-filter {
     font-size: 14px;
-    color: #666;
-    background: #f5f5f5;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
     padding: 4px 8px;
     border-radius: 4px;
 }
@@ -77,7 +77,7 @@
 .analytics-tabs {
     display: flex;
     gap: 8px;
-    border-bottom: 2px solid #e0e0e0;
+    border-bottom: 2px solid var(--border);
     margin-bottom: 20px;
 }
 
@@ -88,20 +88,20 @@
     cursor: pointer;
     font-size: 14px;
     font-weight: 500;
-    color: #666;
+    color: var(--text-secondary);
     border-bottom: 3px solid transparent;
     margin-bottom: -2px;
     transition: all 0.2s;
 }
 
 .analytics-tab:hover {
-    color: #333;
-    background: #f5f5f5;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
 }
 
 .analytics-tab.active {
-    color: #007bff;
-    border-bottom-color: #007bff;
+    color: var(--accent-primary);
+    border-bottom-color: var(--accent-primary);
 }
 
 .analytics-overview {
@@ -116,25 +116,25 @@
     gap: 16px;
 }
 
-.metric-card {
-    background: white;
-    border: 1px solid #e0e0e0;
+.analytics-overview .metric-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 16px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
-.metric-label {
+.analytics-overview .metric-label {
     font-size: 12px;
-    color: #666;
+    color: var(--text-secondary);
     text-transform: uppercase;
     margin-bottom: 8px;
 }
 
-.metric-value {
+.analytics-overview .metric-value {
     font-size: 32px;
     font-weight: bold;
-    color: #333;
+    color: var(--accent-primary);
 }
 
 .metric-value.error {
@@ -142,11 +142,11 @@
 }
 
 .section {
-    background: white;
-    border: 1px solid #e0e0e0;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 20px;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
 .section h3 {
@@ -163,15 +163,15 @@
 
 .tool-item {
     padding: 12px;
-    border: 1px solid #e0e0e0;
+    border: 1px solid var(--border);
     border-radius: 4px;
     cursor: pointer;
     transition: all 0.2s;
 }
 
 .tool-item:hover {
-    background: #f5f5f5;
-    border-color: #007bff;
+    background: var(--bg-tertiary);
+    border-color: var(--accent-primary);
 }
 
 .tool-item .tool-name {

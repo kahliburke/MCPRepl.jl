@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { Session } from '../types';
 import { ToolSchema } from '../api';
 
@@ -24,6 +24,17 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
     setSelectedTool,
     fetchTools
 }) => {
+    const [isLoading, setIsLoading] = useState(false);
+
+    const handleFetchTools = async (sessionId?: string) => {
+        setIsLoading(true);
+        try {
+            const result = await fetchTools(sessionId);
+            setTools(result);
+        } finally {
+            setIsLoading(false);
+        }
+    };
     return (
         <div className="view active" id="tools-view">
             <h2>🛠️ Tools Explorer</h2>
@@ -34,7 +45,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                     className={`tools-tab ${selectedToolSession === null ? 'active' : ''}`}
                     onClick={() => {
                         setSelectedToolSession(null);
-                        fetchTools().then(setTools);
+                        handleFetchTools();
                     }}
                 >
                     Proxy Tools
@@ -45,7 +56,7 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                         className={`tools-tab ${selectedToolSession === sessionId ? 'active' : ''}`}
                         onClick={() => {
                             setSelectedToolSession(sessionId);
-                            fetchTools(sessionId).then(setTools);
+                            handleFetchTools(sessionId);
                         }}
                         title={`UUID: ${sessionId}`}
                     >
@@ -54,7 +65,19 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                 ))}
             </div>
 
-            {tools && (
+            {isLoading ? (
+                <div className="tools-loading">
+                    <div className="loading-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                    <span>Loading tools</span>
+                </div>
+            ) : tools && (
                 <div className="tools-grid">
                     {selectedToolSession === null ? (
                         // Show proxy tools

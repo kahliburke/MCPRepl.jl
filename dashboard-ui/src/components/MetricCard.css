@@ -1,6 +1,6 @@
 .metric-card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
+    background: var(--bg-card, #151515);
+    border: 1px solid var(--border, rgba(82, 82, 82, 0.3));
     border-radius: 12px;
     padding: 1.5rem;
     display: flex;

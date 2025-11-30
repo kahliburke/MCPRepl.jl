@@ -234,8 +234,8 @@ function route_to_session_streaming(
             )
             return nothing
         else
-            # julia_sessions exist but session doesn't have a target
-            julia_session_ids = join(["$(s.name) ($(s.id))" for s in julia_sessions], ", ")
+            # Sessions exist but no target specified
+            julia_session_ids = join(["$(s.name) ($(s.id))" for s in sessions], ", ")
             send_jsonrpc_error(
                 http,
                 get(request, "id", nothing),
@@ -303,12 +303,12 @@ function route_to_session_streaming(
         )
         return nothing
 
-    elseif session.status != :ready
+    elseif session_status != "ready"
         send_jsonrpc_error(
             http,
             get(request, "id", nothing),
             -32003,
-            "Julia session not ready: $(session.status)";
+            "Julia session not ready: $(session_status)";
             status = 503,
         )
         return nothing

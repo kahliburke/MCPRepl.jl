@@ -220,6 +220,10 @@ end
 
 function handle_session_restart(http::HTTP.Stream, session_id::String)
     return handle_session_control(http, session_id, "restart") do conn, sid
+        # Immediately mark session as restarting in database
+        Database.update_session_status!(sid, "restarting")
+        @info "Marked session as restarting" session_id = sid
+
         # Send restart request via manage_repl tool
         params = Dict("name" => "manage_repl", "arguments" => Dict("command" => "restart"))
         success = send_jsonrpc_to_session(conn, "tools/call", params)
@@ -227,7 +231,9 @@ function handle_session_restart(http::HTTP.Stream, session_id::String)
         if success
             @info "Session restart requested" session_id = sid
         else
-            @error "Failed to restart session" session_id = sid
+            @error "Failed to send restart command" session_id = sid
+            # Revert status if restart command failed
+            Database.update_session_status!(sid, "ready")
         end
 
         return (success, false)  # success, don't delete from registry
@@ -237,7 +243,8 @@ end
 function handle_session_shutdown(http::HTTP.Stream, session_id::String)
     return handle_session_control(http, session_id, "shutdown") do conn, sid
         # If disconnected, just unregister it
-        if conn.status == :disconnected
+        session_status = ismissing(conn.status) ? "unknown" : conn.status
+        if session_status == "disconnected"
             @info "Unregistered disconnected session" session_id = sid
             return (true, true)  # success, delete from registry
         end

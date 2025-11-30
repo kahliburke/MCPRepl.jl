@@ -181,7 +181,6 @@ include("security.jl")
 include("security_wizard.jl")
 include("repl_status.jl")
 include("tool_definitions.jl")
-include("Supervisor.jl")
 include("MCPServer.jl")
 include("setup.jl")
 include("vscode.jl")
@@ -207,8 +206,6 @@ const VSCODE_NONCES = Dict{String,Tuple{String,Float64}}()
 # Lock for thread-safe access to nonces dictionary
 const VSCODE_NONCE_LOCK = ReentrantLock()
 
-# Global reference to supervisor registry (if supervisor mode is enabled)
-const SUPERVISOR_REGISTRY = Ref{Union{Supervisor.AgentRegistry,Nothing}}(nothing)
 
 """
     store_vscode_response(request_id::String, result, error::Union{Nothing,String})
@@ -722,88 +719,9 @@ function filter_tools_by_config(enabled_tools::Union{Set{Symbol},Nothing})
     return filter(tool -> tool.id in enabled_tools, ALL_TOOLS[])
 end
 
-"""
-    start_session_heartbeat(agent_name::String, agents_config::String, verbose::Bool)
-
-Start a background task that sends periodic heartbeats to the supervisor.
-
-This function spawns a separate thread that:
-1. Reads supervisor configuration from agents.json
-2. Sends HTTP POST heartbeats every second
-3. Silently ignores failures (supervisor may not be running yet)
-
-The heartbeat task runs indefinitely until the Julia process exits.
-"""
-function start_session_heartbeat(agent_name::String, agents_config::String, verbose::Bool)
-    if verbose
-        printstyled("💓 Session Heartbeat: ", color = :cyan, bold = true)
-        printstyled("Enabled for '$agent_name'\n", color = :green, bold = true)
-    end
-
-    # Spawn heartbeat task on a separate thread
-    Threads.@spawn begin
-        # Read supervisor configuration
-        config_path = agents_config  # Already includes .mcprepl/ prefix
-        supervisor_port = nothing
-
-        if isfile(config_path)
-            try
-                config = JSON.parsefile(config_path)
-                supervisor_port = get(get(config, "supervisor", Dict()), "port", nothing)
-                if supervisor_port === nothing
-                    # No supervisor configured, skip supervisor heartbeat
-                    return
-                end
-            catch e
-                @warn "Could not read supervisor config from $config_path" exception = e
-                return
-            end
-        else
-            # No agents config file, skip supervisor heartbeat
-            return
-        end
-
-        supervisor_url = "http://localhost:$supervisor_port/"
-
-        if verbose
-            printstyled("   • Sending to: $supervisor_url\n", color = :green)
-            println()
-        end
-
-        # Heartbeat loop
-        while true
-            try
-                heartbeat = Dict(
-                    "jsonrpc" => "2.0",
-                    "method" => "supervisor/heartbeat",
-                    "id" => 1,
-                    "params" => Dict(
-                        "agent_name" => agent_name,
-                        "pid" => getpid(),
-                        "status" => "healthy",
-                        "timestamp" => string(Dates.now()),
-                    ),
-                )
-
-                HTTP.post(
-                    supervisor_url,
-                    ["Content-Type" => "application/json"],
-                    JSON.json(heartbeat);
-                    readtimeout = 2,
-                    connect_timeout = 1,
-                )
-            catch e
-                # Silently ignore heartbeat failures (supervisor may not be running yet)
-            end
-
-            sleep(1)  # Send heartbeat every second
-        end
-    end
-end
 
 """
-    start!(; port=nothing, verbose=true, security_mode=nothing, supervisor=false, 
-           agents_config=".mcprepl/agents.json", agent_name="", workspace_dir=pwd())
+    start!(; port=nothing, verbose=true, security_mode=nothing, agent_name="", workspace_dir=pwd())
 
 Start the MCP REPL server.
 
@@ -811,13 +729,11 @@ Start the MCP REPL server.
 - `port::Union{Int,Nothing}=nothing`: Server port. Use `0` for dynamic port assignment (finds first available port in 40000-49999). If `nothing`, uses port from configuration.
 - `verbose::Bool=true`: Show startup messages
 - `security_mode::Union{Symbol,Nothing}=nothing`: Override security mode (:strict, :relaxed, or :lax)
-- `supervisor::Bool=false`: Start in supervisor mode (monitors multiple agents)
-- `agents_config::String=".mcprepl/agents.json"`: Path to agents configuration file
-- `agent_name::String=""`: Agent name (when running as a managed agent)
+- `agent_name::String=""`: Session name for identification
 - `workspace_dir::String=pwd()`: Project root directory
 
 # Dynamic Port Assignment
-Set `port=0` (or use `"port": 0` in security.json/agents.json) to automatically find and use an available port.
+Set `port=0` (or use `"port": 0` in security.json) to automatically find and use an available port.
 The server will search ports 40000-49999 for the first free port. This higher range avoids conflicts with common services.
 
 # Examples
@@ -831,7 +747,7 @@ MCPRepl.start!(port=4000)
 # Use dynamic port assignment
 MCPRepl.start!(port=0)
 
-# Start as supervised agent
+# Start with a custom name
 MCPRepl.start!(agent_name="data-processor")
 ```
 """
@@ -839,8 +755,6 @@ function start!(;
     port::Union{Int,Nothing} = nothing,
     verbose::Bool = true,
     security_mode::Union{Symbol,Nothing} = nothing,
-    supervisor::Bool = false,
-    agents_config::String = ".mcprepl/agents.json",
     agent_name::String = "",
     workspace_dir::String = pwd(),
     session_uuid::Union{String,Nothing} = nothing,
@@ -884,11 +798,9 @@ function start!(;
     end
 
     # Load or prompt for security configuration
-    # Pass agent_name and supervisor flag so it can load from agents.json if needed
     # Use workspace_dir (project root) not pwd() (which may be agent dir)
-    @debug "Loading security config" workspace_dir = workspace_dir agent_name = agent_name supervisor =
-        supervisor
-    security_config = load_security_config(workspace_dir, agent_name, supervisor)
+    @debug "Loading security config" workspace_dir = workspace_dir
+    security_config = load_security_config(workspace_dir)
 
     if security_config === nothing
         # Stop spinner before showing error
@@ -919,17 +831,15 @@ function start!(;
             port
         end
     else
-        # load_security_config already loaded the right port based on mode (agent/supervisor/normal)
+        # load_security_config already loaded the right port
         config_port = security_config.port
         if config_port == 0
             # Port 0 in config means find a free port dynamically
             @info "Finding available port dynamically (from config)"
             find_free_port()
         else
-            @debug "Using port from loaded config" port = config_port mode = (
-                supervisor ? "supervisor" :
+            @debug "Using port from loaded config" port = config_port mode =
                 (agent_name != "" ? "agent:$agent_name" : "normal")
-            )
             config_port
         end
     end
@@ -962,73 +872,6 @@ function start!(;
         printstyled("\n📡 Server Port: ", color = :cyan, bold = true)
         printstyled("$actual_port\n", color = :green, bold = true)
         println()
-    end
-
-    # Initialize supervisor if requested
-    if supervisor
-        if verbose
-            printstyled("👁️  Supervisor Mode: ", color = :cyan, bold = true)
-            printstyled("Enabled\n", color = :green, bold = true)
-        end
-
-        # Load agents configuration (use absolute path)
-        agents_config_path = joinpath(workspace_dir, agents_config)
-        registry = Supervisor.load_agents_config(agents_config_path)
-
-        if registry === nothing
-            @warn "Failed to load agents configuration from $agents_config. Supervisor mode disabled."
-        else
-            # Store registry globally
-            SUPERVISOR_REGISTRY[] = registry
-
-            # Start supervisor monitor loop
-            Supervisor.start_supervisor(registry)
-
-            agent_count = length(registry.agents)
-            if verbose
-                printstyled("   • Managing $agent_count agent(s)\n", color = :green)
-            end
-
-            # Start auto-start agents with staggered delays to avoid package lock conflicts
-            auto_start_count = 0
-            for (i, (name, agent)) in enumerate(Supervisor.get_all_agents(registry))
-                @info "Checking agent for auto-start" name = name auto_start =
-                    agent.auto_start status = agent.status
-                if agent.auto_start
-                    @info "Starting agent" name = name
-                    if Supervisor.start_agent(agent)
-                        auto_start_count += 1
-                        @info "Agent started successfully" name = name
-                        # Wait between agent starts to avoid simultaneous package operations
-                        # This prevents git lock conflicts during Pkg.instantiate()
-                        if i < length(registry.agents)
-                            sleep(5)  # 5 second delay to allow package operations to complete
-                        end
-                    else
-                        @warn "Failed to start agent" name = name
-                    end
-                end
-            end
-
-            if verbose
-                if auto_start_count > 0
-                    printstyled(
-                        "   • Auto-started $auto_start_count agent(s)\n",
-                        color = :green,
-                    )
-                else
-                    @warn "No agents were auto-started"
-                end
-                println()
-            end
-        end
-    end
-
-    # Start heartbeat task if running as an agent
-    if !isempty(agent_name)
-        # Use absolute path to agents_config so agent can find it from its own directory
-        agents_config_path = joinpath(workspace_dir, agents_config)
-        start_session_heartbeat(agent_name, agents_config_path, verbose)
     end
 
     # Create LSP tools
@@ -1104,13 +947,11 @@ function start!(;
     if Proxy.is_server_running(proxy_port)
         try
             # Determine REPL ID
-            # Priority: MCPREPL_ID env var > agent_name > supervisor > workspace basename
+            # Priority: MCPREPL_ID env var > agent_name > workspace basename
             repl_id = if haskey(ENV, "MCPREPL_ID") && !isempty(ENV["MCPREPL_ID"])
                 ENV["MCPREPL_ID"]
             elseif !isempty(agent_name)
                 agent_name  # Use agent_name directly without prefix
-            elseif supervisor
-                "supervisor"
             else
                 basename(workspace_dir)
             end
@@ -1127,7 +968,6 @@ function start!(;
                     "pid" => getpid(),
                     "metadata" => Dict(
                         "workspace" => workspace_dir,
-                        "supervisor" => supervisor,
                         "agent_name" => agent_name,
                     ),
                 ),
@@ -1213,11 +1053,8 @@ function start!(;
                     @debug "Heartbeat task started" repl_id = repl_id proxy_port =
                         proxy_port
                     # Capture metadata in closure for heartbeat
-                    heartbeat_metadata = Dict(
-                        "workspace" => workspace_dir,
-                        "supervisor" => supervisor,
-                        "agent_name" => agent_name,
-                    )
+                    heartbeat_metadata =
+                        Dict("workspace" => workspace_dir, "agent_name" => agent_name)
                     while SERVER[] !== nothing
                         try
                             sleep(5)  # Send heartbeat every 5 seconds
@@ -1314,13 +1151,6 @@ function stop!()
         end
     else
         println("No server running to stop.")
-    end
-
-    # Stop supervisor if running
-    if SUPERVISOR_REGISTRY[] !== nothing
-        println("Stopping supervisor...")
-        Supervisor.stop_supervisor(SUPERVISOR_REGISTRY[]; stop_agents = true)
-        SUPERVISOR_REGISTRY[] = nothing
     end
 end
 

@@ -50,98 +50,15 @@ function get_security_config_path(workspace_dir::String = pwd())
 end
 
 """
-    load_security_config(workspace_dir::String=pwd(), agent_name::String="", supervisor::Bool=false) -> Union{SecurityConfig, Nothing}
+    load_security_config(workspace_dir::String=pwd()) -> Union{SecurityConfig, Nothing}
 
 Load security configuration from workspace .mcprepl/security.json file.
 Returns nothing if no configuration exists.
 
 If port is not specified in configuration, defaults to 0 (dynamic port assignment in 40000-49999 range).
 """
-function load_security_config(
-    workspace_dir::String = pwd(),
-    agent_name::String = "",
-    supervisor::Bool = false,
-)
+function load_security_config(workspace_dir::String = pwd())
     config_path = get_security_config_path(workspace_dir)
-
-    # Try to load from agents.json if in agent or supervisor mode
-    agents_config_path = joinpath(workspace_dir, ".mcprepl", "agents.json")
-
-    # If agent mode, ALWAYS use agents.json (never security.json)
-    if !isempty(agent_name)
-        if isfile(agents_config_path)
-            try
-                agents_config = JSON.parsefile(agents_config_path)
-                if haskey(agents_config, "agents") &&
-                   haskey(agents_config["agents"], agent_name)
-                    agent_config = agents_config["agents"][agent_name]
-
-                    mode = Symbol(get(agent_config, "mode", "lax"))
-                    api_keys = get(agent_config, "api_keys", String[])
-                    allowed_ips = get(agent_config, "allowed_ips", String[])
-                    # Port defaults to 0 (dynamic assignment) if not specified
-                    port = get(agent_config, "port", 0)
-                    created_at = Int64(round(time()))
-
-                    @info "Loaded security config for agent from agents.json" agent =
-                        agent_name mode = mode port = port path = agents_config_path
-                    return SecurityConfig(mode, api_keys, allowed_ips, port, created_at)
-                else
-                    # Agent not in agents.json - fall back to lax mode with warning
-                    available = collect(keys(get(agents_config, "agents", Dict())))
-                    @warn "Agent '$agent_name' not found in agents.json" path =
-                        agents_config_path available = available fallback = "lax mode with dynamic port"
-                    created_at = Int64(round(time()))
-                    return SecurityConfig(:lax, String[], String[], 0, created_at)
-                end
-            catch e
-                if e isa ErrorException && contains(e.msg, "not found in agents.json")
-                    rethrow(e)  # Re-throw our specific error
-                end
-                error("Failed to load agent config from agents.json: $e")
-            end
-        else
-            # No agents.json found - fall back to lax mode with warning
-            @warn "Agents config file not found for agent '$agent_name'" path =
-                agents_config_path fallback = "lax mode with dynamic port"
-            created_at = Int64(round(time()))
-            return SecurityConfig(:lax, String[], String[], 0, created_at)
-        end
-    end
-
-    # If supervisor mode, ALWAYS use agents.json (never security.json)
-    if supervisor
-        if isfile(agents_config_path)
-            try
-                agents_config = JSON.parsefile(agents_config_path)
-                if haskey(agents_config, "supervisor")
-                    supervisor_config = agents_config["supervisor"]
-
-                    mode = Symbol(get(supervisor_config, "mode", "lax"))
-                    api_keys = get(supervisor_config, "api_keys", String[])
-                    allowed_ips = get(supervisor_config, "allowed_ips", String[])
-                    # Port defaults to 0 (dynamic assignment) if not specified
-                    port = get(supervisor_config, "port", 0)
-                    created_at = Int64(round(time()))
-
-                    @info "Loaded security config for supervisor from agents.json" mode =
-                        mode port = port path = agents_config_path
-                    return SecurityConfig(mode, api_keys, allowed_ips, port, created_at)
-                else
-                    error(
-                        "Supervisor config not found in agents.json at $agents_config_path",
-                    )
-                end
-            catch e
-                if e isa ErrorException && contains(e.msg, "Supervisor config not found")
-                    rethrow(e)  # Re-throw our specific error
-                end
-                error("Failed to load supervisor config from agents.json: $e")
-            end
-        else
-            error("Agents config file not found for supervisor at $agents_config_path")
-        end
-    end
 
     if !isfile(config_path)
         return nothing

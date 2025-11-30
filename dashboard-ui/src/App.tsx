@@ -574,19 +574,19 @@ export const App: React.FC = () => {
                             className={`tab ${activeTab === 'overview' ? 'active' : ''}`}
                             onClick={() => setActiveTab('overview')}
                         >
-                            Overview
+                            📈 Overview
                         </button>
                         <button
                             className={`tab ${activeTab === 'events' ? 'active' : ''}`}
                             onClick={() => setActiveTab('events')}
                         >
-                            Events
+                            ⚡ Events
                         </button>
                         <button
                             className={`tab ${activeTab === 'terminal' ? 'active' : ''}`}
                             onClick={() => setActiveTab('terminal')}
                         >
-                            Terminal
+                            💻 Terminal
                         </button>
                         <button
                             className={`tab ${activeTab === 'tools' ? 'active' : ''}`}
