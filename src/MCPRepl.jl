@@ -721,7 +721,7 @@ end
 
 
 """
-    start!(; port=nothing, verbose=true, security_mode=nothing, agent_name="", workspace_dir=pwd())
+    start!(; port=nothing, verbose=true, security_mode=nothing, julia_session_name="", workspace_dir=pwd())
 
 Start the MCP REPL server.
 
@@ -729,7 +729,7 @@ Start the MCP REPL server.
 - `port::Union{Int,Nothing}=nothing`: Server port. Use `0` for dynamic port assignment (finds first available port in 40000-49999). If `nothing`, uses port from configuration.
 - `verbose::Bool=true`: Show startup messages
 - `security_mode::Union{Symbol,Nothing}=nothing`: Override security mode (:strict, :relaxed, or :lax)
-- `agent_name::String=""`: Session name for identification
+- `julia_session_name::String=""`: Name for this Julia session
 - `workspace_dir::String=pwd()`: Project root directory
 
 # Dynamic Port Assignment
@@ -748,14 +748,14 @@ MCPRepl.start!(port=4000)
 MCPRepl.start!(port=0)
 
 # Start with a custom name
-MCPRepl.start!(agent_name="data-processor")
+MCPRepl.start!(julia_session_name="data-processor")
 ```
 """
 function start!(;
     port::Union{Int,Nothing} = nothing,
     verbose::Bool = true,
     security_mode::Union{Symbol,Nothing} = nothing,
-    agent_name::String = "",
+    julia_session_name::String = "",
     workspace_dir::String = pwd(),
     session_uuid::Union{String,Nothing} = nothing,
 )
@@ -839,7 +839,7 @@ function start!(;
             find_free_port()
         else
             @debug "Using port from loaded config" port = config_port mode =
-                (agent_name != "" ? "agent:$agent_name" : "normal")
+                (julia_session_name != "" ? "agent:$julia_session_name" : "normal")
             config_port
         end
     end
@@ -947,11 +947,11 @@ function start!(;
     if Proxy.is_server_running(proxy_port)
         try
             # Determine REPL ID
-            # Priority: MCPREPL_ID env var > agent_name > workspace basename
+            # Priority: MCPREPL_ID env var > julia_session_name > workspace basename
             repl_id = if haskey(ENV, "MCPREPL_ID") && !isempty(ENV["MCPREPL_ID"])
                 ENV["MCPREPL_ID"]
-            elseif !isempty(agent_name)
-                agent_name  # Use agent_name directly without prefix
+            elseif !isempty(julia_session_name)
+                julia_session_name  # Use julia_session_name directly without prefix
             else
                 basename(workspace_dir)
             end
@@ -968,7 +968,7 @@ function start!(;
                     "pid" => getpid(),
                     "metadata" => Dict(
                         "workspace" => workspace_dir,
-                        "agent_name" => agent_name,
+                        "julia_session_name" => julia_session_name,
                     ),
                 ),
             )
@@ -1007,7 +1007,7 @@ function start!(;
                 printstyled("❌ Registration failed: ", color = :red, bold = true)
                 println(error_msg)
                 printstyled("💡 Tip: ", color = :yellow, bold = true)
-                println("Use a different agent_name or stop the existing session")
+                println("Use a different julia_session_name or stop the existing session")
                 # Don't start heartbeat if registration failed
                 return nothing
             else
@@ -1053,8 +1053,10 @@ function start!(;
                     @debug "Heartbeat task started" repl_id = repl_id proxy_port =
                         proxy_port
                     # Capture metadata in closure for heartbeat
-                    heartbeat_metadata =
-                        Dict("workspace" => workspace_dir, "agent_name" => agent_name)
+                    heartbeat_metadata = Dict(
+                        "workspace" => workspace_dir,
+                        "julia_session_name" => julia_session_name,
+                    )
                     while SERVER[] !== nothing
                         try
                             sleep(5)  # Send heartbeat every 5 seconds

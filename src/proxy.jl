@@ -1547,7 +1547,7 @@ function handle_request(http::HTTP.Stream)
                     startup_code = """
                     Base.stderr = Base.IOContext(Base.stderr, :color => false)
                     Base.stdout = Base.IOContext(Base.stdout, :color => false)
-                    using MCPRepl; MCPRepl.start!(agent_name=$(repr(session_name)), workspace_dir=$(repr(project_path)), session_uuid=$(repr(session_uuid))); wait()
+                    using MCPRepl; MCPRepl.start!(julia_session_name=$(repr(session_name)), workspace_dir=$(repr(project_path)), session_uuid=$(repr(session_uuid))); wait()
                     """
                     julia_cmd = `julia --project=$project_path -e $startup_code`
 
@@ -1569,7 +1569,7 @@ function handle_request(http::HTTP.Stream)
                     )
 
                     # Wait for Julia session to register (max 60 seconds to allow for precompilation)
-                    # When agent_name is provided, MCPRepl registers using that name directly
+                    # MCPRepl registers using the julia_session_name directly
                     registered = false
                     expected_id = session_name
                     for i = 1:600  # 60 seconds with 0.1s sleep

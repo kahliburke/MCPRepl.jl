@@ -21,7 +21,7 @@ export const EventsView: React.FC<EventsViewProps> = ({
             case 'AGENT_START':
             case 'SESSION_START':
                 const port = data.port || data.metadata?.port;
-                const name = data.name || data.metadata?.agent_name;
+                const name = data.name || data.metadata?.julia_session_name;
                 const portStr = port ? `port ${port}` : 'session';
                 return `Started ${portStr}${name ? ` (${name})` : ''}`;
 
