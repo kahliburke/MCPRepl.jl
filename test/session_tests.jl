@@ -137,7 +137,6 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         @test haskey(caps, "experimental")
 
         @test caps["experimental"]["vscode_integration"] == true
-        @test caps["experimental"]["supervisor_mode"] == true
         @test caps["experimental"]["proxy_routing"] == true
     end
 

@@ -184,7 +184,6 @@ function get_server_capabilities()
         "logging" => Dict{String,Any}(),  # We support logging
         "experimental" => Dict{String,Any}(
             "vscode_integration" => true,  # Custom VS Code integration
-            "supervisor_mode" => true,     # Multi-agent supervision
             "proxy_routing" => true,       # Proxy-based routing
         ),
     )
