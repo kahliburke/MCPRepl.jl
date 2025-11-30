@@ -1541,8 +1541,6 @@ function handle_request(http::HTTP.Stream)
 
                     # Build Julia command - inherit security config from the project itself
                     # Pass workspace_dir=project_path so it checks for .mcprepl/security.json in the project
-                    # If project has .mcprepl/agents.json with this agent name, it uses that
-                    # Otherwise falls back to .mcprepl/security.json or lax mode with warning
                     # Use wait() to keep the process alive until the server is stopped
                     # Set stdout/stderr to unbuffered mode for real-time log updates
 
