@@ -70,12 +70,16 @@ export const ToolDetailsModal: React.FC<ToolDetailsModalProps> = ({
                         <div className="tool-test-section">
                             <h3>Test Tool</h3>
                             <div className="tool-params-form">
-                                {Object.entries(tool.inputSchema.properties).map(([name, schema]: [string, any]) => (
-                                    <div key={name} className="param-input-group">
+                                {Object.entries(tool.inputSchema.properties).map(([name, schema]: [string, any]) => {
+                                    const isRequired = tool.inputSchema.required?.includes(name);
+                                    return (
+                                    <div key={name} className={`param-input-group ${isRequired ? 'param-required' : 'param-optional'}`}>
                                         <label>
-                                            {name}
-                                            {tool.inputSchema.required?.includes(name) && <span className="required">*</span>}
+                                            <span className="param-name-text">{name}</span>
                                             <span className="param-type">({schema.type})</span>
+                                            <span className={`param-badge ${isRequired ? 'badge-required' : 'badge-optional'}`}>
+                                                {isRequired ? 'required' : 'optional'}
+                                            </span>
                                         </label>
                                         {schema.description && <p className="param-help">{schema.description}</p>}
                                         {schema.type === 'boolean' ? (
@@ -190,7 +194,8 @@ export const ToolDetailsModal: React.FC<ToolDetailsModalProps> = ({
                                             />
                                         )}
                                     </div>
-                                ))}
+                                    );
+                                })}
                             </div>
                             <button
                                 className="tool-execute-btn"
