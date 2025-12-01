@@ -17,6 +17,7 @@
     opacity: 0;
     transition: opacity 0.3s;
     box-shadow: 0 0 20px rgba(125, 211, 252, 0.1);
+    pointer-events: none;
 }
 
 .session-card:hover::before {
