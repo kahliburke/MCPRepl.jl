@@ -11,8 +11,8 @@ using DBInterface
 using UUIDs
 
 # Load modules directly
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 include("../src/session.jl")
 using .Session

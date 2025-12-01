@@ -1,14 +1,18 @@
 using ReTest
 using HTTP
 using JSON
+using UUIDs
 
 using MCPRepl
 using MCPRepl.Proxy
+using MCPRepl.Database
 
 @testset "Proxy MCP Tool Routing" begin
-    @testset "Route tools/list through proxy" begin
-        empty!(Proxy.JULIA_SESSION_REGISTRY)
+    # Initialize temp database for these tests
+    test_db = tempname() * ".db"
+    Database.init_db!(test_db)
 
+    @testset "Route tools/list through proxy" begin
         # Start a mock MCP server that responds to tools/list
         mock_port = 19001
         mock_server = HTTP.serve!(mock_port; verbose = false) do req
@@ -33,11 +37,16 @@ using MCPRepl.Proxy
 
         try
             # Register the mock backend
-            Proxy.register_repl("test-backend", mock_port; pid = Int(getpid()))
+            uuid = string(uuid4())
+            Proxy.register_julia_session(
+                uuid,
+                "test-backend",
+                mock_port;
+                pid = Int(getpid()),
+            )
 
             # Create a proxy request
-            req_headers =
-                ["Content-Type" => "application/json", "X-MCPRepl-Target" => "test-backend"]
+            req_headers = ["Content-Type" => "application/json", "X-MCPRepl-Target" => uuid]
             req_body = JSON.json(
                 Dict(
                     "jsonrpc" => "2.0",
@@ -69,8 +78,6 @@ using MCPRepl.Proxy
     end
 
     @testset "Route tools/call through proxy" begin
-        empty!(Proxy.JULIA_SESSION_REGISTRY)
-
         # Start a mock MCP server that responds to tools/call
         mock_port = 19002
         mock_server = HTTP.serve!(mock_port; verbose = false) do req
@@ -102,13 +109,16 @@ using MCPRepl.Proxy
 
         try
             # Register the mock backend
-            Proxy.register_repl("test-backend-2", mock_port; pid = Int(getpid()))
+            uuid = string(uuid4())
+            Proxy.register_julia_session(
+                uuid,
+                "test-backend-2",
+                mock_port;
+                pid = Int(getpid()),
+            )
 
             # Create a proxy request for tools/call
-            req_headers = [
-                "Content-Type" => "application/json",
-                "X-MCPRepl-Target" => "test-backend-2",
-            ]
+            req_headers = ["Content-Type" => "application/json", "X-MCPRepl-Target" => uuid]
             req_body = JSON.json(
                 Dict(
                     "jsonrpc" => "2.0",
@@ -140,4 +150,8 @@ using MCPRepl.Proxy
             close(mock_server)
         end
     end
+
+    # Cleanup
+    Database.close_db!()
+    rm(test_db; force = true)
 end

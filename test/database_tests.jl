@@ -6,8 +6,8 @@ using Dates
 using DBInterface
 
 # Load the Database module directly
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 @testset "Database Event and Interaction Logging" begin
     # Use temporary database for testing

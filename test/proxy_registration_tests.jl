@@ -4,7 +4,8 @@ Tests validation logic and registration behavior without HTTP server.
 """
 
 using ReTest
-using MCPRepl: Proxy
+using UUIDs
+using MCPRepl: Proxy, Database
 
 @testset "Registration validation" begin
     @testset "Valid parameters" begin
@@ -72,9 +73,6 @@ using MCPRepl: Proxy
 end
 
 @testset "REPL registration" begin
-    using MCPRepl: Database
-    using Dates
-
     # Create a temp database for testing
     db_path = tempname() * ".db"
 
@@ -83,8 +81,10 @@ end
         Database.init_db!(db_path)
 
         @testset "Valid registration" begin
+            uuid = string(uuid4())
             # Register a Julia session
             success, error_msg = Proxy.register_julia_session(
+                uuid,
                 "test-repl-1",
                 9000;
                 pid = 12345,
@@ -94,22 +94,21 @@ end
             @test success == true
             @test error_msg === nothing
 
-            # Verify it's in the registry
-            repl = lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
-                get(Proxy.JULIA_SESSION_REGISTRY, "test-repl-1", nothing)
-            end
+            # Verify it's in the database
+            session = Proxy.get_julia_session(uuid)
 
-            @test repl !== nothing
-            @test repl.id == "test-repl-1"
-            @test repl.port == 9000
-            @test repl.pid == 12345
-            @test repl.status == :ready
-            @test get(repl.metadata, "project", nothing) == "/tmp/test"
+            @test session !== nothing
+            @test session.name == "test-repl-1"
+            @test session.port == 9000
+            @test session.pid == 12345
+            @test session.status == "ready"
         end
 
         @testset "Invalid registration - validation failure" begin
+            uuid = string(uuid4())
             # Try to register with invalid port
             success, error_msg = Proxy.register_julia_session(
+                uuid,
                 "test-repl-2",
                 0;  # Invalid port
                 pid = 12345,
@@ -118,41 +117,57 @@ end
             @test success == false
             @test occursin("Port must be between 1024 and 65535", error_msg)
 
-            # Verify it's NOT in the registry
-            repl = lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
-                get(Proxy.JULIA_SESSION_REGISTRY, "test-repl-2", nothing)
-            end
-
-            @test repl === nothing
+            # Verify it's NOT in the database
+            session = Proxy.get_julia_session(uuid)
+            @test session === nothing
         end
 
-        @testset "Re-registration (reconnection)" begin
+        @testset "Re-registration (same UUID reconnection)" begin
+            uuid = string(uuid4())
+
             # Register a REPL
-            success1, _ = Proxy.register_julia_session("test-repl-3", 9001; pid = 12346)
+            success1, _ =
+                Proxy.register_julia_session(uuid, "test-repl-3", 9001; pid = 12346)
             @test success1 == true
 
-            # Re-register with different port (simulating restart)
+            # Re-register with same UUID but different port (simulating reconnection)
             success2, error_msg2 =
-                Proxy.register_julia_session("test-repl-3", 9002; pid = 12346)
+                Proxy.register_julia_session(uuid, "test-repl-3", 9002; pid = 12346)
 
             @test success2 == true
             @test error_msg2 === nothing
 
             # Verify updated registration
-            repl = lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
-                get(Proxy.JULIA_SESSION_REGISTRY, "test-repl-3", nothing)
-            end
+            session = Proxy.get_julia_session(uuid)
+            @test session !== nothing
+            @test session.port == 9002  # Updated port
+        end
 
-            @test repl !== nothing
-            @test repl.port == 9002  # Updated port
+        @testset "Restart with new UUID" begin
+            uuid1 = string(uuid4())
+            uuid2 = string(uuid4())
+
+            # Register first session
+            success1, _ =
+                Proxy.register_julia_session(uuid1, "restart-test", 9003; pid = 12347)
+            @test success1 == true
+
+            # Register second session with same name but new UUID (restart scenario)
+            success2, _ =
+                Proxy.register_julia_session(uuid2, "restart-test", 9004; pid = 12348)
+            @test success2 == true
+
+            # Both should exist in database (old one may be marked as replaced)
+            session1 = Proxy.get_julia_session(uuid1)
+            session2 = Proxy.get_julia_session(uuid2)
+            @test session1 !== nothing
+            @test session2 !== nothing
+            @test session2.status == "ready"  # New one should be ready
         end
 
     finally
         # Clean up
-        # Clear registry
-        lock(Proxy.JULIA_SESSION_REGISTRY_LOCK) do
-            empty!(Proxy.JULIA_SESSION_REGISTRY)
-        end
+        Database.close_db!()
 
         # Remove temp database
         if isfile(db_path)

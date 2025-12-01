@@ -324,7 +324,7 @@ export interface DBSession {
     start_time: string;
     last_activity: string;
     status: string;
-    metadata: string;
+    session_data: string;
 }
 
 export async function fetchInteractions(params: {

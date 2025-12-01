@@ -621,6 +621,9 @@ search_methods_tool = @mcp_tool(
     args -> begin
         try
             query = get(args, "query", "")
+            if isempty(query)
+                return "Error: query parameter is required"
+            end
             code = """
             using InteractiveUtils
             target = $query
@@ -640,7 +643,7 @@ search_methods_tool = @mcp_tool(
                 quiet = false,
             )
         catch e
-            "Error searching methods: \$e"
+            "Error searching methods: $e"
         end
     end
 )

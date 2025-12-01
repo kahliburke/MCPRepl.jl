@@ -11,9 +11,8 @@ using JSON
 using Dates
 using DBInterface
 
-# Load the Database module directly
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 @testset "Session Name Preservation" begin
     # Use temporary database for testing

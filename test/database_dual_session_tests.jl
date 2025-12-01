@@ -233,7 +233,8 @@ using MCPRepl
     end
 
     @testset "Safe Logging with Auto-Creation" begin
-        # Should auto-create sessions if they don't exist
+        # Should auto-create MCP sessions if they don't exist
+        # Note: Julia sessions are NOT auto-created - they must be registered by the REPL
         mcp_auto = "mcp-auto-123"
         julia_auto = "julia-auto-456"
 
@@ -248,7 +249,7 @@ using MCPRepl
             request_id = "auto-1",
         )
 
-        # Verify both sessions were auto-created
+        # Verify MCP session was auto-created
         db = Database.DB[]
 
         mcp_sessions =
@@ -259,19 +260,19 @@ using MCPRepl
             ) |> DataFrame
         @test nrow(mcp_sessions) == 1
 
+        # Verify session_data contains auto_created flag in nested metadata
+        session_data = JSON.parse(mcp_sessions[1, :session_data])
+        @test session_data["metadata"]["auto_created"] == true
+
+        # Julia sessions are NOT auto-created (by design)
+        # They must be properly registered with a logical name by the REPL itself
         julia_sessions =
             DBInterface.execute(
                 db,
                 "SELECT * FROM julia_sessions WHERE id = ?",
                 (julia_auto,),
             ) |> DataFrame
-        @test nrow(julia_sessions) == 1
-        @test julia_sessions[1, :port] == 4000
-        @test julia_sessions[1, :pid] == 11111
-
-        # Check metadata
-        metadata = JSON.parse(julia_sessions[1, :metadata])
-        @test metadata["auto_created"] == true
+        @test nrow(julia_sessions) == 0  # Should NOT be auto-created
     end
 
     @testset "ETL: Tool Executions" begin

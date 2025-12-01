@@ -23,7 +23,7 @@ using MCPRepl: MCPTool
 
         @testset "call_tool with Symbol" begin
             # Start server for testing
-            MCPRepl.start!(; verbose = false, port = test_port)
+            MCPRepl.start!(; verbose = false, port = test_port, register_with_proxy = false)
 
             try
                 # Test symbol-based call
@@ -45,7 +45,11 @@ using MCPRepl: MCPTool
         end
 
         @testset "call_tool with String (deprecated)" begin
-            MCPRepl.start!(; verbose = false, port = test_port + 1)
+            MCPRepl.start!(;
+                verbose = false,
+                port = test_port + 1,
+                register_with_proxy = false,
+            )
 
             try
                 # Test string-based call (should warn)
@@ -62,7 +66,11 @@ using MCPRepl: MCPTool
         end
 
         @testset "call_tool Handler Signatures" begin
-            MCPRepl.start!(; verbose = false, port = test_port + 2)
+            MCPRepl.start!(;
+                verbose = false,
+                port = test_port + 2,
+                register_with_proxy = false,
+            )
 
             try
                 # Test tool with args signature
@@ -82,7 +90,11 @@ using MCPRepl: MCPTool
             # Test without server running
             @test_throws ErrorException MCPRepl.call_tool(:ex, Dict())
 
-            MCPRepl.start!(; verbose = false, port = test_port + 3)
+            MCPRepl.start!(;
+                verbose = false,
+                port = test_port + 3,
+                register_with_proxy = false,
+            )
 
             try
                 # Test missing required parameters

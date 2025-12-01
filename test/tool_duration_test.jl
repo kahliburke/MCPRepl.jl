@@ -14,11 +14,9 @@ using UUIDs
 using DataFrames
 
 # Load modules
-include("../src/database.jl")
-using .Database
-
-include("../src/database_etl.jl")
-using .DatabaseETL
+using MCPRepl
+using MCPRepl.Database
+using MCPRepl.Database: DatabaseETL
 
 @testset "Tool Execution Duration Calculation" begin
     db_path = tempname() * ".db"

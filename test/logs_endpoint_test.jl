@@ -12,8 +12,8 @@ using DBInterface
 using UUIDs
 
 # Load modules
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 @testset "Logs Endpoint Session Lookup" begin
     db_path = tempname() * ".db"

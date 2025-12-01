@@ -16,8 +16,8 @@ using DBInterface
 using UUIDs
 
 # Load modules directly
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 @testset "Session ID and Name Field Integrity" begin
     db_path = tempname() * ".db"

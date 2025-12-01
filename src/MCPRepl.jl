@@ -758,6 +758,7 @@ function start!(;
     julia_session_name::String = "",
     workspace_dir::String = pwd(),
     session_uuid::Union{String,Nothing} = nothing,
+    register_with_proxy::Bool = true,
 )
     SERVER[] !== nothing && stop!() # Stop existing server if running
 
@@ -943,8 +944,8 @@ function start!(;
         session_uuid = session_uuid,
     )
 
-    # Register this REPL with the proxy if proxy is running
-    if Proxy.is_server_running(proxy_port)
+    # Register this REPL with the proxy if proxy is running and registration is enabled
+    if register_with_proxy && Proxy.is_server_running(proxy_port)
         try
             # Determine REPL ID
             # Priority: MCPREPL_ID env var > julia_session_name > workspace basename

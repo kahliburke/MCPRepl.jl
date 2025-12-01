@@ -32,7 +32,6 @@ export init_db!,
     get_global_stats,
     get_recent_session_events,
     close_db!,
-    save_mcp_session!,
     update_mcp_session_protocol!
 
 # Global database connection
@@ -762,14 +761,17 @@ function update_mcp_session_protocol!(
     now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
     protocol_data_json = JSON.json(protocol_data)
 
+    # Extract target_julia_session_id from protocol_data if present
+    target_julia_session_id = get(protocol_data, "target_julia_session_id", nothing)
+
     DBInterface.execute(
         db,
         """
         UPDATE mcp_sessions
-        SET state = ?, session_data = ?, last_activity = ?
+        SET state = ?, session_data = ?, last_activity = ?, target_julia_session_id = ?
         WHERE id = ?
         """,
-        (state, protocol_data_json, now_str, session_id),
+        (state, protocol_data_json, now_str, target_julia_session_id, session_id),
     )
 end
 
@@ -935,7 +937,7 @@ function get_mcp_sessions_by_target(target_julia_session_id::String)
     result = DBInterface.execute(
         db,
         """
-        SELECT id, name, session_type, start_time, last_activity, status, target_julia_session_id, metadata
+        SELECT id, name, session_type, start_time, last_activity, status, target_julia_session_id, session_data
         FROM mcp_sessions
         WHERE target_julia_session_id = ?
         """,
@@ -952,7 +954,7 @@ function get_mcp_sessions_by_target(target_julia_session_id::String)
             last_activity = row.last_activity,
             status = row.status,
             target_julia_session_id = row.target_julia_session_id,
-            metadata = row.metadata,
+            session_data = row.session_data,
         ) for row in result
     ]
 end
@@ -1546,14 +1548,15 @@ function get_all_sessions(; limit::Int = 100)
 
     # Return all sessions from both julia_sessions and mcp_sessions tables
     # Add a session_type field to distinguish them
+    # Note: julia_sessions has 'metadata' column, mcp_sessions has 'session_data' column
     result =
         DBInterface.execute(
             db,
             """
-        SELECT id, name, 'julia' as session_type, status, start_time, last_activity, port, pid, metadata
+        SELECT id, name, 'julia' as session_type, status, start_time, last_activity, port, pid, metadata as session_data
         FROM julia_sessions
         UNION ALL
-        SELECT id, name, session_type, status, start_time, last_activity, NULL as port, NULL as pid, metadata
+        SELECT id, name, session_type, status, start_time, last_activity, NULL as port, NULL as pid, session_data
         FROM mcp_sessions
         ORDER BY last_activity DESC
         LIMIT ?

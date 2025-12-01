@@ -12,8 +12,8 @@ using DBInterface
 using UUIDs
 
 # Load modules
-include("../src/database.jl")
-using .Database
+using MCPRepl
+using MCPRepl.Database
 
 @testset "Proxy MCP Session Identification" begin
     db_path = tempname() * ".db"
@@ -158,11 +158,8 @@ using .Database
             )
 
             # Run ETL
-            include("../src/database_etl.jl")
-            using .DatabaseETL
-
             db = Database.DB[]
-            DatabaseETL.run_etl_pipeline(db)
+            Database.DatabaseETL.run_etl_pipeline(db)
 
             # Verify tool_executions has mcp_session_id
             result = DBInterface.execute(
