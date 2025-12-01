@@ -931,8 +931,8 @@ h1 {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 12px;
-    max-width: 800px;
-    width: 90%;
+    width: 800px;
+    max-width: 90%;
     max-height: 85vh;
     display: flex;
     flex-direction: column;
@@ -981,6 +981,13 @@ h1 {
     padding: 1.5rem;
     overflow-y: auto;
     flex: 1;
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
 }
 
 .detail-row {
@@ -1039,6 +1046,8 @@ h1 {
     font-family: 'JetBrains Mono', 'SF Mono', Monaco, monospace;
     font-size: 0.875rem;
     overflow-x: auto;
+    width: 100%;
+    box-sizing: border-box;
 }
 
 .json-tree.error-tree {
@@ -1320,10 +1329,7 @@ h1 {
 /* Tool Testing Interface */
 .tool-test-section {
     margin: 1.5rem 0;
-    padding: 1rem;
-    background: rgba(125, 211, 252, 0.05);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    padding: 0;
 }
 
 .tool-test-section h3 {
@@ -1421,6 +1427,8 @@ h1 {
     background: rgba(34, 197, 94, 0.05);
     border: 1px solid rgba(34, 197, 94, 0.2);
     border-radius: 8px;
+    width: 100%;
+    box-sizing: border-box;
 }
 
 .tool-result-section h3 {
@@ -1449,6 +1457,8 @@ h1 {
     white-space: pre-wrap;
     word-wrap: break-word;
     margin: 0;
+    width: 100%;
+    box-sizing: border-box;
 }
 
 .raw-response {

@@ -42,8 +42,15 @@ export const ToolDetailsModal: React.FC<ToolDetailsModalProps> = ({
         }
     };
 
+    const handleKeyDown = (e: React.KeyboardEvent) => {
+        if (e.shiftKey && e.key === 'Enter' && !toolExecuting) {
+            e.preventDefault();
+            handleExecute();
+        }
+    };
+
     return (
-        <div className="modal-overlay" onClick={handleClose}>
+        <div className="modal-overlay" onClick={handleClose} onKeyDown={handleKeyDown}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
                 <div className="modal-header">
                     <h2>Tool Details: {tool.name}</h2>
@@ -189,6 +196,7 @@ export const ToolDetailsModal: React.FC<ToolDetailsModalProps> = ({
                                 className="tool-execute-btn"
                                 disabled={toolExecuting}
                                 onClick={handleExecute}
+                                title="Shift+Enter"
                             >
                                 {toolExecuting ? 'Executing...' : '▶ Try it'}
                             </button>
@@ -203,6 +211,7 @@ export const ToolDetailsModal: React.FC<ToolDetailsModalProps> = ({
                                 className="tool-execute-btn"
                                 disabled={toolExecuting}
                                 onClick={handleExecute}
+                                title="Shift+Enter"
                             >
                                 {toolExecuting ? 'Executing...' : '▶ Try it'}
                             </button>
