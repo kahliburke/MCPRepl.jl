@@ -35,7 +35,7 @@ export const App: React.FC = () => {
     const [proxyVersion, setProxyVersion] = useState<string>('loading...');
     const [tools, setTools] = useState<ToolsResponse | null>(null);
     const [selectedToolSession, setSelectedToolSession] = useState<string | null>(null);
-    const [selectedTool, setSelectedTool] = useState<ToolSchema | null>(null);
+    const [selectedTool, setSelectedTool] = useState<{ tool: ToolSchema; sessionId: string | null } | null>(null);
     const [logContent, setLogContent] = useState<string>('');
     const [logSessionId, setLogSessionId] = useState<string | null>(null);
     const [autoRefreshLogs, setAutoRefreshLogs] = useState(false);
@@ -699,8 +699,8 @@ export const App: React.FC = () => {
 
             {selectedTool && (
                 <ToolDetailsModal
-                    tool={selectedTool}
-                    selectedToolSession={selectedToolSession}
+                    tool={selectedTool.tool}
+                    selectedToolSession={selectedTool.sessionId}
                     onClose={() => setSelectedTool(null)}
                 />
             )}

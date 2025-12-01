@@ -108,14 +108,27 @@ export async function callTool(request: ToolCallRequest): Promise<ToolCallRespon
         body: JSON.stringify(mcpRequest)
     });
 
-    if (!response.ok) throw new Error('Failed to call tool');
+    // Always try to parse the response body - even error responses may have useful info
+    let data;
+    try {
+        data = await response.json();
+    } catch {
+        // If we can't parse JSON, throw a generic error
+        if (!response.ok) {
+            throw new Error(`Failed to call tool: HTTP ${response.status}`);
+        }
+        throw new Error('Failed to parse response');
+    }
 
-    const data = await response.json();
-
-    // Throw if JSON-RPC error is present
+    // Throw if JSON-RPC error is present (check this first since proxy returns errors with non-200 status)
     if (data.error) {
         const errorMsg = data.error.message || JSON.stringify(data.error);
         throw new Error(errorMsg);
+    }
+
+    // Also check HTTP status in case there's no JSON-RPC error object
+    if (!response.ok) {
+        throw new Error(`Tool call failed: HTTP ${response.status}`);
     }
 
     return {

@@ -11,7 +11,7 @@ interface ToolsViewProps {
     selectedToolSession: string | null;
     setSelectedToolSession: (sessionId: string | null) => void;
     setTools: (tools: any) => void;
-    setSelectedTool: (tool: ToolSchema | null) => void;
+    setSelectedTool: (selection: { tool: ToolSchema; sessionId: string | null } | null) => void;
     fetchTools: (sessionId?: string) => Promise<any>;
 }
 
@@ -81,8 +81,8 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                 <div className="tools-grid">
                     {selectedToolSession === null ? (
                         // Show proxy tools
-                        tools.proxy_tools?.length > 0 ? tools.proxy_tools.map((tool: ToolSchema) => (
-                            <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
+                        tools.proxy_tools?.length > 0 ? [...tools.proxy_tools].sort((a, b) => a.name.localeCompare(b.name)).map((tool: ToolSchema) => (
+                            <div key={tool.name} className="tool-card" onClick={() => setSelectedTool({ tool, sessionId: null })}>
                                 <div className="tool-header">
                                     <h3 className="tool-name">🔧 {tool.name}</h3>
                                     <span className="tool-badge proxy-badge">Proxy</span>
@@ -107,9 +107,9 @@ export const ToolsView: React.FC<ToolsViewProps> = ({
                             </div>
                         )) : <p>No proxy tools available</p>
                     ) : (
-                        // Show agent tools
-                        tools.session_tools[selectedToolSession]?.length > 0 ? tools.session_tools[selectedToolSession].map((tool: ToolSchema) => (
-                            <div key={tool.name} className="tool-card" onClick={() => setSelectedTool(tool)}>
+                        // Show session tools
+                        tools.session_tools[selectedToolSession]?.length > 0 ? [...tools.session_tools[selectedToolSession]].sort((a, b) => a.name.localeCompare(b.name)).map((tool: ToolSchema) => (
+                            <div key={tool.name} className="tool-card" onClick={() => setSelectedTool({ tool, sessionId: selectedToolSession })}>
                                 <div className="tool-header">
                                     <h3 className="tool-name">⚡ {tool.name}</h3>
                                     <span className="tool-badge agent-badge">Julia</span>

@@ -386,7 +386,7 @@ function route_to_session_streaming(
         end
 
         # Parse response to extract result/error for dashboard
-        response_data = Dict("status" => response_status[], "method" => method)
+        response_data = Dict("status" => response_status, "method" => method)
         try
             response_json = JSON.parse(response_body)
             # Include the actual result or error in the event log
@@ -409,7 +409,7 @@ function route_to_session_streaming(
         )
 
         # Update last heartbeat
-        update_julia_session_status(target_id, :ready)
+        update_julia_session_status(target_id, "ready")
 
         # Forward response to client with proper headers
         HTTP.setstatus(http, response_status)

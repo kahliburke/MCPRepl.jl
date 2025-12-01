@@ -56,24 +56,40 @@ try
         end
     end
 
-    # Analyze each changed file
-    for file in julia_files
-        println("\n📄 Analyzing: $file")
+    # Quick JET checks on critical methods (fast - only checks signatures)
+    println("\n🔬 Checking critical method signatures...")
 
+    critical_checks = [
+        (
+            MCPRepl.Proxy.update_julia_session_status,
+            ("uuid", "ready"),
+            "update_julia_session_status(String, String)",
+        ),
+        (
+            MCPRepl.Database.update_session_status!,
+            ("uuid", "ready"),
+            "Database.update_session_status!(String, String)",
+        ),
+        (
+            MCPRepl.Proxy.register_julia_session,
+            ("uuid", "name", 3000),
+            "register_julia_session(String, String, Int)",
+        ),
+        (MCPRepl.Proxy.get_julia_session, ("uuid",), "get_julia_session(String)"),
+        (
+            MCPRepl.Proxy.log_db_event,
+            ("event", Dict{String,Any}()),
+            "log_db_event(String, Dict)",
+        ),
+    ]
+
+    for (func, args, desc) in critical_checks
         try
-            # Just try to include the file to catch syntax and basic errors
-            # Full JET analysis is too slow for pre-commit
-            # (run full analysis in CI with test/static_analysis_tests.jl)
-
-            # Skip analysis - just verify module loads which catches export issues
-            println("  ⏭️  Skipping detailed analysis (run tests for full JET scan)")
+            @report_call func(args...)
+            println("   ✅ $desc")
         catch e
-            if e isa UndefVarError
-                errors_found = true
-                println("❌ UndefVarError in $file: ", e)
-            else
-                @warn "Issue in $file" exception = e
-            end
+            errors_found = true
+            println("   ❌ $desc - $(e.msg)")
         end
     end
 
