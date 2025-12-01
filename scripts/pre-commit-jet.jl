@@ -60,26 +60,64 @@ try
     println("\n🔬 Checking critical method signatures...")
 
     critical_checks = [
+        # Proxy module - session management
         (
             MCPRepl.Proxy.update_julia_session_status,
             ("uuid", "ready"),
-            "update_julia_session_status(String, String)",
+            "Proxy.update_julia_session_status(String, String)",
         ),
+        (
+            MCPRepl.Proxy.register_julia_session,
+            ("uuid", "name", 3000),
+            "Proxy.register_julia_session(String, String, Int)",
+        ),
+        (MCPRepl.Proxy.get_julia_session, ("uuid",), "Proxy.get_julia_session(String)"),
+        (
+            MCPRepl.Proxy.log_db_event,
+            ("event", Dict{String,Any}()),
+            "Proxy.log_db_event(String, Dict)",
+        ),
+        # Database module - session operations
         (
             MCPRepl.Database.update_session_status!,
             ("uuid", "ready"),
             "Database.update_session_status!(String, String)",
         ),
         (
-            MCPRepl.Proxy.register_julia_session,
-            ("uuid", "name", 3000),
-            "register_julia_session(String, String, Int)",
+            MCPRepl.Database.register_julia_session!,
+            ("uuid", "name", "active"),
+            "Database.register_julia_session!(String, String, String)",
         ),
-        (MCPRepl.Proxy.get_julia_session, ("uuid",), "get_julia_session(String)"),
         (
-            MCPRepl.Proxy.log_db_event,
-            ("event", Dict{String,Any}()),
-            "log_db_event(String, Dict)",
+            MCPRepl.Database.get_julia_session,
+            ("uuid",),
+            "Database.get_julia_session(String)",
+        ),
+        (
+            MCPRepl.Database.get_mcp_session,
+            ("session_id",),
+            "Database.get_mcp_session(String)",
+        ),
+        (
+            MCPRepl.Database.update_mcp_session_status!,
+            ("session_id", "connected"),
+            "Database.update_mcp_session_status!(String, String)",
+        ),
+        (
+            MCPRepl.Database.update_mcp_session_target!,
+            ("session_id", "target_id"),
+            "Database.update_mcp_session_target!(String, String)",
+        ),
+        # Database module - event logging
+        (
+            MCPRepl.Database.log_event!,
+            ("tool_call", Dict{String,Any}()),
+            "Database.log_event!(String, Dict)",
+        ),
+        (
+            MCPRepl.Database.log_event_safe!,
+            ("tool_call", Dict{String,Any}()),
+            "Database.log_event_safe!(String, Dict)",
         ),
     ]
 
