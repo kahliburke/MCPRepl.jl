@@ -547,6 +547,28 @@ function init_db!(db_path::String = ".mcprepl/events.db")
 """,
     )
 
+    # Indexed files table - track Qdrant vector index state
+    DBInterface.execute(
+        db,
+        """
+    CREATE TABLE IF NOT EXISTS indexed_files (
+        file_path TEXT PRIMARY KEY,
+        collection TEXT NOT NULL,
+        mtime REAL NOT NULL,
+        indexed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        chunk_count INTEGER DEFAULT 0
+    )
+""",
+    )
+
+    DBInterface.execute(
+        db,
+        """
+    CREATE INDEX IF NOT EXISTS idx_indexed_files_collection
+    ON indexed_files(collection)
+""",
+    )
+
     # ============================================================================
     # Analytics Views
     # ============================================================================
@@ -2189,6 +2211,148 @@ function get_etl_status()
         "last_run_status" => result[1, :last_run_status],
         "last_error" => result[1, :last_error],
     )
+end
+
+# ============================================================================
+# Indexed Files Tracking (for Qdrant vector index sync)
+# ============================================================================
+
+"""
+    record_indexed_file(file_path::String, collection::String, mtime::Float64, chunk_count::Int)
+
+Record that a file has been indexed into Qdrant.
+"""
+function record_indexed_file(
+    file_path::String,
+    collection::String,
+    file_mtime::Float64,
+    chunk_count::Int,
+)
+    db = DB[]
+    DBInterface.execute(
+        db,
+        """
+        INSERT OR REPLACE INTO indexed_files (file_path, collection, mtime, indexed_at, chunk_count)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+        """,
+        [file_path, collection, file_mtime, chunk_count],
+    )
+end
+
+"""
+    get_indexed_file(file_path::String) -> Union{NamedTuple, Nothing}
+
+Get indexing info for a file, or nothing if not indexed.
+"""
+function get_indexed_file(file_path::String)
+    db = DB[]
+    result =
+        DBInterface.execute(
+            db,
+            "SELECT file_path, collection, mtime, indexed_at, chunk_count FROM indexed_files WHERE file_path = ?",
+            [file_path],
+        ) |> DataFrame
+
+    if nrow(result) == 0
+        return nothing
+    end
+
+    return (
+        file_path = result[1, :file_path],
+        collection = result[1, :collection],
+        mtime = result[1, :mtime],
+        indexed_at = result[1, :indexed_at],
+        chunk_count = result[1, :chunk_count],
+    )
+end
+
+"""
+    get_indexed_files(collection::String) -> DataFrame
+
+Get all indexed files for a collection.
+"""
+function get_indexed_files(collection::String)
+    db = DB[]
+    return DBInterface.execute(
+        db,
+        "SELECT file_path, mtime, indexed_at, chunk_count FROM indexed_files WHERE collection = ?",
+        [collection],
+    ) |> DataFrame
+end
+
+"""
+    remove_indexed_file(file_path::String)
+
+Remove a file from the indexed files tracking.
+"""
+function remove_indexed_file(file_path::String)
+    db = DB[]
+    DBInterface.execute(db, "DELETE FROM indexed_files WHERE file_path = ?", [file_path])
+end
+
+"""
+    file_needs_reindex(file_path::String) -> Bool
+
+Check if a file needs to be re-indexed (file changed or not indexed).
+Returns true if file should be (re-)indexed.
+"""
+function file_needs_reindex(file_path::String)
+    if !isfile(file_path)
+        return false  # File doesn't exist, can't index
+    end
+
+    indexed = get_indexed_file(file_path)
+    if indexed === nothing
+        return true  # Not indexed yet
+    end
+
+    current_mtime = mtime(file_path)
+    return current_mtime > indexed.mtime  # File was modified
+end
+
+"""
+    get_stale_files(project_dir::String) -> Vector{String}
+
+Get list of files that need re-indexing.
+Checks all .jl files in project_dir against indexed state.
+"""
+function get_stale_files(project_dir::String)
+    stale = String[]
+
+    # Find all .jl files
+    for (root, dirs, files) in walkdir(project_dir)
+        # Skip hidden directories and node_modules
+        filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
+
+        for file in files
+            if endswith(file, ".jl")
+                file_path = joinpath(root, file)
+                if file_needs_reindex(file_path)
+                    push!(stale, file_path)
+                end
+            end
+        end
+    end
+
+    return stale
+end
+
+"""
+    get_deleted_files(collection::String) -> Vector{String}
+
+Get list of indexed files that no longer exist on disk.
+"""
+function get_deleted_files(collection::String)
+    deleted = String[]
+    indexed = get_indexed_files(collection)
+
+    for row in eachrow(indexed)
+        if !isfile(row.file_path)
+            push!(deleted, row.file_path)
+        end
+    end
+
+    return deleted
 end
 
 """

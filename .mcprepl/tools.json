@@ -114,6 +114,17 @@
       "tools": [
         "usage_quiz"
       ]
+    },
+    "qdrant": {
+      "enabled": true,
+      "description": "Semantic code search using Qdrant vector database",
+      "tokens": "~400",
+      "tools": [
+        "qdrant_list_collections",
+        "qdrant_collection_info",
+        "qdrant_search_code",
+        "qdrant_browse_collection"
+      ]
     }
   },
   "individual_overrides": {

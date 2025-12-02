@@ -444,7 +444,26 @@ function index_file(file_path::String, collection::String; verbose::Bool = true)
         QdrantClient.upsert_points(collection, points)
     end
 
+    # Record in database for change tracking
+    Database.record_indexed_file(file_path, collection, mtime(file_path), length(chunks))
+
     return length(chunks)
+end
+
+"""
+    reindex_file(file_path::String, collection::String; verbose::Bool=true) -> Int
+
+Re-index a single file: delete old chunks, then index fresh.
+Returns number of chunks indexed.
+"""
+function reindex_file(file_path::String, collection::String; verbose::Bool = true)
+    verbose && println("  Re-indexing: $(basename(file_path))")
+
+    # Delete old chunks for this file
+    QdrantClient.delete_by_file(collection, file_path)
+
+    # Index fresh
+    return index_file(file_path, collection; verbose = verbose)
 end
 
 """
@@ -515,4 +534,212 @@ function index_project(
 
     println("Indexing project into collection '$col_name'...")
     return index_directory(src_dir, col_name)
+end
+
+"""
+    sync_index(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, verbose::Bool=true) -> NamedTuple
+
+Sync the Qdrant index with the current state of files on disk.
+- Re-indexes files that have been modified since last index
+- Removes index entries for deleted files
+- Skips unchanged files
+
+Returns a named tuple with counts: (reindexed, deleted, skipped)
+"""
+function sync_index(
+    project_path::String = pwd();
+    collection::Union{String,Nothing} = nothing,
+    verbose::Bool = true,
+)
+    col_name = String(
+        collection === nothing ? get_project_collection_name(project_path) : collection,
+    )
+
+    # Find src directory
+    src_dir = joinpath(project_path, "src")
+    if !isdir(src_dir)
+        src_dir = project_path
+    end
+
+    verbose && println("🔄 Syncing index for collection '$col_name'...")
+
+    # Get files that need re-indexing
+    stale_files = Database.get_stale_files(src_dir)
+    deleted_files = Database.get_deleted_files(col_name)
+
+    reindexed = 0
+    deleted = 0
+    total_chunks = 0
+
+    # Handle deleted files
+    for file_path in deleted_files
+        verbose && println("  Removing deleted: $(basename(file_path))")
+        QdrantClient.delete_by_file(col_name, file_path)
+        Database.remove_indexed_file(file_path)
+        deleted += 1
+    end
+
+    # Re-index stale files
+    for file_path in stale_files
+        chunks = reindex_file(file_path, col_name; verbose = verbose)
+        total_chunks += chunks
+        reindexed += 1
+    end
+
+    if verbose
+        if reindexed == 0 && deleted == 0
+            println("✓ Index is up to date")
+        else
+            println(
+                "✓ Sync complete: $reindexed files re-indexed ($total_chunks chunks), $deleted files removed",
+            )
+        end
+    end
+
+    return (reindexed = reindexed, deleted = deleted, chunks = total_chunks)
+end
+
+"""
+    setup_revise_hook(project_path::String=pwd(); collection::Union{String,Nothing}=nothing)
+
+Set up a Revise.jl callback to automatically re-index files when they change.
+Only works if Revise is loaded in Main.
+"""
+function setup_revise_hook(
+    project_path::String = pwd();
+    collection::Union{String,Nothing} = nothing,
+)
+    if !isdefined(Main, :Revise)
+        @warn "Revise.jl not loaded - automatic re-indexing disabled"
+        return nothing
+    end
+
+    col_name = String(
+        collection === nothing ? get_project_collection_name(project_path) : collection,
+    )
+
+    src_dir = joinpath(project_path, "src")
+    if !isdir(src_dir)
+        src_dir = project_path
+    end
+
+    # Create callback function
+    callback = function (files_changed)
+        for file_path in files_changed
+            # Only index .jl files in our project
+            if endswith(file_path, ".jl") && startswith(file_path, src_dir)
+                @info "Auto-reindexing changed file" file = basename(file_path)
+                try
+                    reindex_file(file_path, col_name; verbose = false)
+                catch e
+                    @warn "Failed to reindex file" file = file_path exception = e
+                end
+            end
+        end
+    end
+
+    # Register with Revise
+    # Note: Revise.add_callback expects (callback, files) but we want all files
+    # We'll use the revision callback approach
+    try
+        Main.Revise.add_callback(callback)
+        @info "Revise hook installed for automatic index updates"
+        return callback
+    catch e
+        @warn "Failed to set up Revise hook" exception = e
+        return nothing
+    end
+end
+
+# Global refs for the scheduler
+const INDEX_SYNC_TASK = Ref{Union{Task,Nothing}}(nothing)
+const INDEX_SYNC_STOP = Ref{Bool}(false)
+
+"""
+    start_index_sync_scheduler(; project_path::String=pwd(), collection::Union{String,Nothing}=nothing, interval_seconds::Int=300)
+
+Start a background task that periodically syncs the Qdrant index with file changes.
+Default interval is 5 minutes (300 seconds).
+
+Returns the Task, or nothing if already running.
+"""
+function start_index_sync_scheduler(;
+    project_path::String = pwd(),
+    collection::Union{String,Nothing} = nothing,
+    interval_seconds::Int = 300,
+)
+    # Check if already running
+    if INDEX_SYNC_TASK[] !== nothing && !istaskdone(INDEX_SYNC_TASK[])
+        @warn "Index sync scheduler already running"
+        return nothing
+    end
+
+    col_name = String(
+        collection === nothing ? get_project_collection_name(project_path) : collection,
+    )
+
+    INDEX_SYNC_STOP[] = false
+    @info "Starting index sync scheduler" collection = col_name interval_seconds =
+        interval_seconds
+
+    task = @async begin
+        while !INDEX_SYNC_STOP[]
+            try
+                # Sleep in small increments to check stop flag
+                for _ = 1:interval_seconds
+                    INDEX_SYNC_STOP[] && break
+                    sleep(1)
+                end
+                INDEX_SYNC_STOP[] && break
+
+                result =
+                    sync_index(project_path; collection = col_name, verbose = false)
+                if result.reindexed > 0 || result.deleted > 0
+                    @info "Index sync completed" reindexed = result.reindexed deleted =
+                        result.deleted chunks = result.chunks
+                end
+            catch e
+                if !INDEX_SYNC_STOP[]
+                    @error "Index sync scheduler error" exception = (e, catch_backtrace())
+                end
+                # Continue running despite errors
+            end
+        end
+        @info "Index sync scheduler stopped"
+    end
+
+    INDEX_SYNC_TASK[] = task
+    return task
+end
+
+"""
+    stop_index_sync_scheduler()
+
+Stop the background index sync scheduler if running.
+"""
+function stop_index_sync_scheduler()
+    if INDEX_SYNC_TASK[] === nothing || istaskdone(INDEX_SYNC_TASK[])
+        @info "Index sync scheduler not running"
+        return false
+    end
+
+    INDEX_SYNC_STOP[] = true
+    @info "Stopping index sync scheduler (will stop within 1 second)..."
+    return true
+end
+
+"""
+    index_sync_status() -> NamedTuple
+
+Get the current status of the index sync scheduler.
+"""
+function index_sync_status()
+    task = INDEX_SYNC_TASK[]
+    if task === nothing
+        return (running = false, state = :not_started)
+    elseif istaskdone(task)
+        return (running = false, state = :finished, failed = istaskfailed(task))
+    else
+        return (running = true, state = task.state)
+    end
 end

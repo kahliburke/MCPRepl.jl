@@ -254,4 +254,79 @@ function create_collection(
     end
 end
 
+"""
+    delete_by_filter(collection::String, filter::Dict) -> Bool
+
+Delete points matching a filter condition.
+
+# Arguments
+- `collection::String`: Name of the collection
+- `filter::Dict`: Qdrant filter condition (e.g., Dict("must" => [Dict("key" => "file", "match" => Dict("value" => "/path/to/file.jl"))]))
+
+# Returns
+true on success, false on failure.
+"""
+function delete_by_filter(collection::String, filter::Dict)
+    try
+        body = Dict("filter" => filter)
+
+        response = HTTP.post(
+            "$(QDRANT_URL[])/collections/$(collection)/points/delete",
+            ["Content-Type" => "application/json"],
+            JSON.json(body),
+        )
+
+        data = JSON.parse(String(response.body))
+        return get(data, "status", "") == "ok"
+    catch e
+        @error "Delete by filter failed" collection = collection exception = e
+        return false
+    end
+end
+
+"""
+    delete_by_file(collection::String, file_path::String) -> Bool
+
+Delete all points from a specific file.
+
+# Arguments
+- `collection::String`: Name of the collection
+- `file_path::String`: Path to the file whose chunks should be deleted
+
+# Returns
+true on success, false on failure.
+"""
+function delete_by_file(collection::String, file_path::String)
+    filter = Dict("must" => [Dict("key" => "file", "match" => Dict("value" => file_path))])
+    return delete_by_filter(collection, filter)
+end
+
+"""
+    count_by_file(collection::String, file_path::String) -> Int
+
+Count points from a specific file.
+
+# Returns
+Number of points from the file, or -1 on error.
+"""
+function count_by_file(collection::String, file_path::String)
+    try
+        filter =
+            Dict("must" => [Dict("key" => "file", "match" => Dict("value" => file_path))])
+        body = Dict("filter" => filter, "exact" => true)
+
+        response = HTTP.post(
+            "$(QDRANT_URL[])/collections/$(collection)/points/count",
+            ["Content-Type" => "application/json"],
+            JSON.json(body),
+        )
+
+        data = JSON.parse(String(response.body))
+        return get(get(data, "result", Dict()), "count", 0)
+    catch e
+        @error "Count by file failed" collection = collection exception = e
+        return -1
+    end
+end
+
 end # module
