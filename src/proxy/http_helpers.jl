@@ -10,12 +10,16 @@ These functions integrate with the Database module to log all interactions.
 
 Send a JSON response with proper headers and log to database.
 
+For MCP Streamable HTTP: if there are pending notifications for the session,
+the response will be sent as `text/event-stream` with proper SSE event format
+to include both the response and notifications.
+
 # Arguments
 - `http::HTTP.Stream`: The HTTP stream to write to
 - `data`: The data to serialize as JSON
 - `status::Int=200`: HTTP status code
 - `mcp_session_id::Union{String,Nothing}=nothing`: MCP client session ID for logging
-- `julia_session_id::Union{String,Nothing}=nothing`: Julia REPL session ID for logging  
+- `julia_session_id::Union{String,Nothing}=nothing`: Julia REPL session ID for logging
 - `request_id=nothing`: Request ID for correlation
 
 # Example
@@ -50,8 +54,13 @@ function send_json_response(
         @debug "Failed to log response to database" exception = e
     end
 
+    # Check if we have pending notifications for this MCP session
+    # If so, use SSE format (text/event-stream) to send both response and notifications
+    # Note: Claude Code doesn't open a GET SSE channel, so we embed in POST responses
+    use_sse = mcp_session_id !== nothing && has_pending_notifications(mcp_session_id)
+
     HTTP.setstatus(http, status)
-    HTTP.setheader(http, "Content-Type" => "application/json")
+
     # Add CORS headers for dashboard API access
     HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
     HTTP.setheader(
@@ -62,8 +71,30 @@ function send_json_response(
         http,
         "Access-Control-Allow-Headers" => "Content-Type, Authorization, X-Agent-Id",
     )
-    HTTP.startwrite(http)
-    write(http, json_str)
+
+    if use_sse
+        # Use SSE format for streaming response + notifications
+        # Per MCP Streamable HTTP spec:
+        # "the server SHOULD first send any JSON-RPC responses to requests that it
+        #  has received, and then any JSON-RPC requests or notifications"
+        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+        HTTP.setheader(http, "Cache-Control" => "no-cache")
+        HTTP.startwrite(http)
+
+        # 1. Send the JSON-RPC response FIRST (per spec)
+        write_sse_event(http, data)
+
+        # 2. Then flush pending notifications AFTER the response
+        flush_pending_notifications_sse(mcp_session_id, http)
+
+        # Stream terminates when function returns
+    else
+        # Regular JSON response
+        HTTP.setheader(http, "Content-Type" => "application/json")
+        HTTP.startwrite(http)
+        write(http, json_str)
+    end
+
     return nothing
 end
 

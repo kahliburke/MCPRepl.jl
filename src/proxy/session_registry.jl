@@ -178,8 +178,9 @@ function register_julia_session(
         @async flush_pending_requests(uuid, pending_requests)
     end
 
-    # Notify all connected MCP clients that tools list has changed
-    notify_tools_list_changed()
+    # Notify relevant MCP clients that tools list has changed
+    # Only notifies sessions targeting this Julia session or with no target
+    notify_tools_list_changed(uuid)
 
     return (true, nothing)
 end
@@ -248,18 +249,33 @@ function list_julia_sessions()
     )
 
     # Convert to NamedTuples to avoid SQLite.Row forward-only iterator issues
-    return [
-        (
-            id = row.id,
-            name = row.name,
-            port = row.port,
-            pid = row.pid,
-            start_time = row.start_time,
-            last_activity = row.last_activity,
-            status = row.status,
-            metadata = row.metadata,
-        ) for row in result
-    ]
+    # Materialize each row's data into local variables before creating NamedTuple
+    sessions = NamedTuple[]
+    for row in result
+        # Extract all values first to avoid iterator issues
+        _id = row.id
+        _name = row.name
+        _port = row.port
+        _pid = row.pid
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _metadata = row.metadata
+        push!(
+            sessions,
+            (
+                id = _id,
+                name = _name,
+                port = _port,
+                pid = _pid,
+                start_time = _start_time,
+                last_activity = _last_activity,
+                status = _status,
+                metadata = _metadata,
+            ),
+        )
+    end
+    return sessions
 end
 
 """

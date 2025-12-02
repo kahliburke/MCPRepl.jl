@@ -803,21 +803,39 @@ function get_active_mcp_sessions()
         """,
     )
 
-    return collect(result)
+    # Convert to NamedTuples - extract all values first to avoid iterator issues
+    sessions = NamedTuple[]
+    for row in result
+        _id = row.id
+        _target = row.target_julia_session_id
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        push!(
+            sessions,
+            (
+                id = _id,
+                target_julia_session_id = _target,
+                start_time = _start_time,
+                last_activity = _last_activity,
+            ),
+        )
+    end
+    return sessions
 end
 
 """
-    get_julia_session(uuid::String) -> Union{NamedTuple, Nothing}
+    get_julia_session(id_or_name::String) -> Union{NamedTuple, Nothing}
 
-Get a single Julia session by UUID from the database.
-Returns a NamedTuple with session data or nothing if not found.
+Get a Julia session by UUID or by name.
+Returns a NamedTuple with session data, or nothing if not found.
 """
-function get_julia_session(uuid::String)
+function get_julia_session(id_or_name::String)
     db = DB[]
     if db === nothing
         return nothing
     end
 
+    # Try lookup by UUID first
     result = DBInterface.execute(
         db,
         """
@@ -825,22 +843,63 @@ function get_julia_session(uuid::String)
         FROM julia_sessions
         WHERE id = ?
         """,
-        (uuid,),
+        (id_or_name,),
     )
 
-    # Convert SQLite.Row to NamedTuple to avoid forward-only iterator issues
+    # Extract all values first to avoid iterator issues
     for row in result
+        _id = row.id
+        _name = row.name
+        _port = row.port
+        _pid = row.pid
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _metadata = row.metadata
         return (
-            id = row.id,
-            name = row.name,
-            port = row.port,
-            pid = row.pid,
-            start_time = row.start_time,
-            last_activity = row.last_activity,
-            status = row.status,
-            metadata = row.metadata,
+            id = _id,
+            name = _name,
+            port = _port,
+            pid = _pid,
+            start_time = _start_time,
+            last_activity = _last_activity,
+            status = _status,
+            metadata = _metadata,
         )
     end
+
+    # If not found by UUID, try by name
+    result2 = DBInterface.execute(
+        db,
+        """
+        SELECT id, name, port, pid, start_time, last_activity, status, metadata
+        FROM julia_sessions
+        WHERE name = ?
+        """,
+        (id_or_name,),
+    )
+
+    for row in result2
+        _id = row.id
+        _name = row.name
+        _port = row.port
+        _pid = row.pid
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _metadata = row.metadata
+        return (
+            id = _id,
+            name = _name,
+            port = _port,
+            pid = _pid,
+            start_time = _start_time,
+            last_activity = _last_activity,
+            status = _status,
+            metadata = _metadata,
+        )
+    end
+
     return nothing
 end
 
@@ -867,18 +926,27 @@ function get_mcp_session(session_id::String)
         (session_id,),
     )
 
-    # Convert SQLite.Row to NamedTuple to avoid forward-only iterator issues
+    # Extract all values first to avoid iterator issues
     for row in result
+        _id = row.id
+        _name = row.name
+        _session_type = row.session_type
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _state = row.state
+        _target = row.target_julia_session_id
+        _session_data = row.session_data
         return (
-            id = row.id,
-            name = row.name,
-            session_type = row.session_type,
-            start_time = row.start_time,
-            last_activity = row.last_activity,
-            status = row.status,
-            state = row.state,
-            target_julia_session_id = row.target_julia_session_id,
-            session_data = row.session_data,
+            id = _id,
+            name = _name,
+            session_type = _session_type,
+            start_time = _start_time,
+            last_activity = _last_activity,
+            status = _status,
+            state = _state,
+            target_julia_session_id = _target,
+            session_data = _session_data,
         )
     end
     return nothing
@@ -907,19 +975,32 @@ function get_julia_sessions_by_name(name::String)
         (name,),
     )
 
-    # Convert to NamedTuples to avoid SQLite.Row forward-only iterator issues
-    return [
-        (
-            id = row.id,
-            name = row.name,
-            port = row.port,
-            pid = row.pid,
-            start_time = row.start_time,
-            last_activity = row.last_activity,
-            status = row.status,
-            metadata = row.metadata,
-        ) for row in result
-    ]
+    # Convert to NamedTuples - extract all values first to avoid iterator issues
+    sessions = NamedTuple[]
+    for row in result
+        _id = row.id
+        _name = row.name
+        _port = row.port
+        _pid = row.pid
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _metadata = row.metadata
+        push!(
+            sessions,
+            (
+                id = _id,
+                name = _name,
+                port = _port,
+                pid = _pid,
+                start_time = _start_time,
+                last_activity = _last_activity,
+                status = _status,
+                metadata = _metadata,
+            ),
+        )
+    end
+    return sessions
 end
 
 """
@@ -944,19 +1025,32 @@ function get_mcp_sessions_by_target(target_julia_session_id::String)
         (target_julia_session_id,),
     )
 
-    # Convert to NamedTuples to avoid SQLite.Row forward-only iterator issues
-    return [
-        (
-            id = row.id,
-            name = row.name,
-            session_type = row.session_type,
-            start_time = row.start_time,
-            last_activity = row.last_activity,
-            status = row.status,
-            target_julia_session_id = row.target_julia_session_id,
-            session_data = row.session_data,
-        ) for row in result
-    ]
+    # Convert to NamedTuples - extract all values first to avoid iterator issues
+    sessions = NamedTuple[]
+    for row in result
+        _id = row.id
+        _name = row.name
+        _session_type = row.session_type
+        _start_time = row.start_time
+        _last_activity = row.last_activity
+        _status = row.status
+        _target = row.target_julia_session_id
+        _session_data = row.session_data
+        push!(
+            sessions,
+            (
+                id = _id,
+                name = _name,
+                session_type = _session_type,
+                start_time = _start_time,
+                last_activity = _last_activity,
+                status = _status,
+                target_julia_session_id = _target,
+                session_data = _session_data,
+            ),
+        )
+    end
+    return sessions
 end
 
 """

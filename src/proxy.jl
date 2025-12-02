@@ -109,6 +109,22 @@ function unregister_client_connection(session_id::String)
 end
 
 """
+    ensure_client_connection(session_id::String)
+
+Ensure a client connection exists for the given session.
+Creates a new channel if one doesn't exist (e.g., after proxy restart).
+"""
+function ensure_client_connection(session_id::String)
+    lock(CLIENT_CONNECTIONS_LOCK) do
+        if !haskey(CLIENT_CONNECTIONS, session_id)
+            channel = Channel{Dict}(32)
+            CLIENT_CONNECTIONS[session_id] = channel
+            @debug "Created client connection on demand" session_id = session_id
+        end
+    end
+end
+
+"""
     monitor_heartbeats()
 
 Background task that monitors Julia session heartbeats and marks Julia sessions as disconnected if they stop responding.
@@ -660,24 +676,84 @@ function handle_request(http::HTTP.Stream)
                 return nothing
             end
 
-            # Handle GET requests - SSE not supported
-            # Per MCP spec 2.2: "The server MUST either return Content-Type: text/event-stream
-            # in response to this HTTP GET, or else return HTTP 405 Method Not Allowed"
+            # Handle GET requests - SSE announcement channel
+            # Per MCP spec 2.2: "Servers that support SSE SHOULD also support GET requests to
+            # the MCP endpoint. An HTTP GET initializes an SSE stream for server-to-client messages."
             if req.method == "GET"
-                # Return a valid JSON-RPC error message
-                error_body = JSON.json(
-                    Dict(
-                        "jsonrpc" => "2.0",
-                        "error" => Dict(
-                            "code" => -32601,
-                            "message" => "SSE transport not supported. Use POST for requests.",
-                        ),
-                        "id" => nothing,
-                    ),
-                )
-                HTTP.setheader(http, "Content-Length" => string(length(error_body)))
+                # Get or create MCP session for this connection
+                session_id_header = HTTP.header(req, "Mcp-Session-Id")
+                mcp_session_id = if !isempty(session_id_header)
+                    String(session_id_header)
+                else
+                    # Generate a new session ID for this SSE connection
+                    string(uuid4())
+                end
+
+                @info "SSE announcement channel opened" mcp_session_id = mcp_session_id
+
+                # Ensure client connection channel exists
+                ensure_client_connection(mcp_session_id)
+
+                # Set up SSE response headers
+                HTTP.setstatus(http, 200)
+                HTTP.setheader(http, "Content-Type" => "text/event-stream")
+                HTTP.setheader(http, "Cache-Control" => "no-cache")
+                HTTP.setheader(http, "Connection" => "keep-alive")
+                HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
                 HTTP.startwrite(http)
-                write(http, error_body)
+
+                # Send initial event to prime the connection
+                write(http, "id: $(mcp_session_id)-$(time_ns())\n")
+                write(http, "data: \n\n")
+
+                # Keep connection alive and send notifications as they arrive
+                channel = lock(CLIENT_CONNECTIONS_LOCK) do
+                    get(CLIENT_CONNECTIONS, mcp_session_id, nothing)
+                end
+
+                if channel !== nothing
+                    try
+                        heartbeat_interval = 30.0  # Send heartbeat every 30 seconds
+                        last_heartbeat = time()
+
+                        # Keep checking for notifications and send heartbeats
+                        while isopen(http) && isopen(channel)
+                            # Check if there's a pending notification (non-blocking)
+                            if isready(channel)
+                                notification = try
+                                    take!(channel)
+                                catch e
+                                    if isa(e, InvalidStateException)
+                                        break  # Channel closed
+                                    end
+                                    nothing
+                                end
+
+                                if notification !== nothing
+                                    @info "Sending notification via SSE channel" method =
+                                        get(notification, "method", "unknown")
+                                    write_sse_event(http, notification)
+                                    flush(http)
+                                end
+                            end
+
+                            # Send heartbeat comment to keep connection alive
+                            if time() - last_heartbeat > heartbeat_interval
+                                write(http, ": heartbeat\n\n")
+                                flush(http)
+                                last_heartbeat = time()
+                            end
+
+                            # Small sleep to prevent busy waiting
+                            sleep(0.1)
+                        end
+                    catch e
+                        if !isa(e, Base.IOError)
+                            @warn "SSE channel error" exception = e
+                        end
+                    end
+                    @info "SSE announcement channel closed" mcp_session_id = mcp_session_id
+                end
                 return nothing
             end
             # Empty POST body - invalid request
@@ -1154,6 +1230,14 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
+            # Check for X-MCPRepl-Target header (allows specifying target in MCP config)
+            target_header = HTTP.header(req, "X-MCPRepl-Target")
+            if !isempty(target_header)
+                target_julia_session_id = String(target_header)
+                @debug "tools/list target from X-MCPRepl-Target header" target_julia_session_id =
+                    target_julia_session_id
+            end
+
             # Check for per-request target override in params (highest priority)
             params = get(request, "params", Dict())
             target_override = get(params, "target", nothing)
@@ -1349,7 +1433,12 @@ function handle_request(http::HTTP.Stream)
                         mcp_session_id
                     # Create session with the client's session ID
                     mcp_session = create_mcp_session(nothing; session_id = mcp_session_id)
+                    # Also register client connection for notifications
+                    register_client_connection(mcp_session_id)
                     @info "Created MCP session on demand" session_id = mcp_session_id
+                else
+                    # Ensure client connection exists (might be missing after proxy restart)
+                    ensure_client_connection(mcp_session_id)
                 end
 
                 # Find the Julia session by UUID
@@ -1391,7 +1480,12 @@ function handle_request(http::HTTP.Stream)
                 Your MCP client now has access to this session's tools. Refreshing tools list...
                 """
 
-                send_mcp_tool_result(http, get(request, "id", nothing), result_text)
+                send_mcp_tool_result(
+                    http,
+                    get(request, "id", nothing),
+                    result_text;
+                    session_id = mcp_session_id,
+                )
                 return nothing
             end
 

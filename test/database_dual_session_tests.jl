@@ -410,6 +410,39 @@ using MCPRepl
         @test !ismissing(updated_julia[1, :last_activity])
     end
 
+    @testset "get_julia_session by UUID or Name" begin
+        # Create a session with unique UUID and name
+        test_uuid = "test-julia-uuid-lookup-$(rand(1000:9999))"
+        test_name = "TestJuliaLookup"
+
+        register_julia_session!(
+            test_uuid,
+            test_name,
+            "active";
+            port = 7001,
+            pid = 99999,
+            metadata = Dict("lookup_test" => true),
+        )
+
+        # Test lookup by UUID
+        session_by_uuid = get_julia_session(test_uuid)
+        @test session_by_uuid !== nothing
+        @test session_by_uuid.id == test_uuid
+        @test session_by_uuid.name == test_name
+        @test session_by_uuid.port == 7001
+
+        # Test lookup by name
+        session_by_name = get_julia_session(test_name)
+        @test session_by_name !== nothing
+        @test session_by_name.id == test_uuid
+        @test session_by_name.name == test_name
+        @test session_by_name.port == 7001
+
+        # Test lookup by non-existent identifier
+        nonexistent = get_julia_session("nonexistent-session-xyz")
+        @test nonexistent === nothing
+    end
+
     # Cleanup
     @testset "Cleanup" begin
         close_db!()

@@ -27,17 +27,26 @@ catch
     using JET
 end
 
-# Get list of staged Julia files
+# Check if running standalone (--all flag) or as pre-commit hook
+run_all = "--all" in ARGS || get(ENV, "JET_RUN_ALL", "") == "1"
+
+# Get list of staged Julia files (unless running all)
 try
-    staged_files = readlines(`git diff --cached --name-only --diff-filter=ACM`)
-    julia_files = filter(f -> endswith(f, ".jl") && !startswith(f, "test/"), staged_files)
+    if !run_all
+        staged_files = readlines(`git diff --cached --name-only --diff-filter=ACM`)
+        julia_files =
+            filter(f -> endswith(f, ".jl") && !startswith(f, "test/"), staged_files)
 
-    if isempty(julia_files)
-        println("✅ No source Julia files changed")
-        exit(0)
+        if isempty(julia_files)
+            println("✅ No source Julia files changed")
+            println("   (Run with --all to check all signatures)")
+            exit(0)
+        end
+
+        println("🔍 Running JET static analysis on $(length(julia_files)) file(s)...")
+    else
+        println("🔍 Running full JET static analysis...")
     end
-
-    println("🔍 Running JET static analysis on $(length(julia_files)) file(s)...")
 
     errors_found = false
 

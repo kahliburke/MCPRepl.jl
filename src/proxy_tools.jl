@@ -151,7 +151,7 @@ const LIST_JULIA_SESSIONS_TOOL =
                 agent_text *= "  - Port: $(repl.port)\n"
                 agent_text *= "  - PID: $pid_str\n"
                 agent_text *= "  - Status: $(repl.status)\n"
-                agent_text *= "  - Last heartbeat: $(repl.last_heartbeat)\n\n"
+                agent_text *= "  - Last activity: $(repl.last_activity)\n\n"
             end
             agent_text
         end
