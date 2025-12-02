@@ -187,6 +187,7 @@ include("vscode.jl")
 include("lsp.jl")
 include("lsp_tool_definitions.jl")
 include("qdrant_tools.jl")
+include("qdrant_indexer.jl")
 
 # ============================================================================
 # VS Code Response Storage for Bidirectional Communication

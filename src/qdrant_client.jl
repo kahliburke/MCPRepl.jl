@@ -178,4 +178,80 @@ function get_point(collection::String, point_id)
     end
 end
 
+"""
+    upsert_points(collection::String, points::Vector{Dict}) -> Bool
+
+Upsert points into a collection.
+
+# Arguments
+- `collection::String`: Name of the collection
+- `points::Vector{Dict}`: Vector of point dictionaries with keys:
+  - `id`: Point ID (string UUID or integer)
+  - `vector`: Vector{Float64} embedding
+  - `payload`: Dict with metadata
+
+# Returns
+true on success, false on failure.
+"""
+function upsert_points(collection::String, points::Vector{Dict})
+    try
+        body = Dict("points" => points)
+
+        response = HTTP.put(
+            "$(QDRANT_URL[])/collections/$(collection)/points",
+            ["Content-Type" => "application/json"],
+            JSON.json(body),
+        )
+
+        data = JSON.parse(String(response.body))
+        return get(data, "status", "") == "ok"
+    catch e
+        @error "Upsert failed" collection = collection exception = e
+        return false
+    end
+end
+
+"""
+    delete_collection(collection::String) -> Bool
+
+Delete a collection.
+"""
+function delete_collection(collection::String)
+    try
+        response = HTTP.delete("$(QDRANT_URL[])/collections/$(collection)")
+        data = JSON.parse(String(response.body))
+        return get(data, "result", false) == true
+    catch e
+        @error "Delete collection failed" collection = collection exception = e
+        return false
+    end
+end
+
+"""
+    create_collection(collection::String; vector_size::Int=768, distance::String="Cosine") -> Bool
+
+Create a new collection.
+"""
+function create_collection(
+    collection::String;
+    vector_size::Int = 768,
+    distance::String = "Cosine",
+)
+    try
+        body = Dict("vectors" => Dict("size" => vector_size, "distance" => distance))
+
+        response = HTTP.put(
+            "$(QDRANT_URL[])/collections/$(collection)",
+            ["Content-Type" => "application/json"],
+            JSON.json(body),
+        )
+
+        data = JSON.parse(String(response.body))
+        return get(data, "result", false) == true
+    catch e
+        @error "Create collection failed" collection = collection exception = e
+        return false
+    end
+end
+
 end # module
