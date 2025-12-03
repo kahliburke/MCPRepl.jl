@@ -563,21 +563,28 @@ function route_to_session_streaming(
             end
 
             # Buffer the request for replay when session reconnects
-            buffer_request!(target_id, request, http)
+            # Use the actual UUID (current_session.id) not the target_id which might be a name
+            session_uuid = current_session.id
+            buffer_request!(session_uuid, request, http)
 
             # Mark as down/restarting
             if current_status == "ready"
-                update_julia_session_status(target_id, "down"; error = error_summary)
-                @info "Julia session down, buffering requests for replay on reconnection" id =
-                    target_id
+                update_julia_session_status(session_uuid, "down"; error = error_summary)
+                @info "Julia session down, buffering requests for replay on reconnection" uuid =
+                    session_uuid
             elseif current_status in ("down", "unknown")
-                update_julia_session_status(target_id, "restarting"; error = error_summary)
-                @info "Request buffered, will replay when session reconnects" id = target_id
+                update_julia_session_status(
+                    session_uuid,
+                    "restarting";
+                    error = error_summary,
+                )
+                @info "Request buffered, will replay when session reconnects" uuid =
+                    session_uuid
             end
 
             # Log error event
             Dashboard.log_event(
-                target_id,
+                session_uuid,
                 Dashboard.ERROR,
                 Dict(
                     "message" => sprint(showerror, e),
@@ -588,7 +595,7 @@ function route_to_session_streaming(
 
             # Block until session reconnects or timeout expires
             # Response will be written by flush_pending_requests or timeout error
-            send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+            send_reconnection_updates(session_uuid, request, http; timeout_seconds = 60)
             return nothing
         else
             # Session not in database - buffer anyway in case it restarts with same UUID

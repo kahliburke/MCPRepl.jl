@@ -131,7 +131,7 @@ function register_julia_session(
 
     # Get pending requests from buffer
     pending_requests = lock(PENDING_REQUESTS_LOCK) do
-        # Check for pending requests under this UUID or any old UUIDs (restart case)
+        # Check for pending requests under this UUID, old UUIDs, or the session name
         all_pending = Tuple{Dict,HTTP.Stream}[]
         if haskey(PENDING_REQUESTS, uuid)
             append!(all_pending, PENDING_REQUESTS[uuid])
@@ -142,6 +142,11 @@ function register_julia_session(
                 append!(all_pending, PENDING_REQUESTS[old_uuid])
                 delete!(PENDING_REQUESTS, old_uuid)
             end
+        end
+        # Also check for requests buffered under the session name (fallback case)
+        if haskey(PENDING_REQUESTS, name)
+            append!(all_pending, PENDING_REQUESTS[name])
+            delete!(PENDING_REQUESTS, name)
         end
         all_pending
     end
