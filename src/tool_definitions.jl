@@ -340,8 +340,35 @@ The REPL will exit and stay stopped until manually restarted.""",
                     # Create flag file
                     touch(flag_file)
                 end
-                # Get the PID of the current process
-                pid = getpid()
+
+                # Notify proxy of status change BEFORE exiting
+                # This allows requests to be properly buffered during restart
+                if SERVER[] !== nothing
+                    proxy_port = get(ENV, "MCPREPL_PROXY_PORT", "3000")
+                    new_status = command == "shutdown" ? "stopped" : "restarting"
+                    try
+                        HTTP.post(
+                            "http://127.0.0.1:$(proxy_port)/",
+                            ["Content-Type" => "application/json"],
+                            JSON.json(
+                                Dict(
+                                    "jsonrpc" => "2.0",
+                                    "id" => 999,
+                                    "method" => "proxy/update_status",
+                                    "params" => Dict(
+                                        "uuid" => SERVER[].uuid,
+                                        "status" => new_status,
+                                    ),
+                                ),
+                            );
+                            connect_timeout = 2,
+                            readtimeout = 2,
+                        )
+                        @info "Notified proxy of $new_status status"
+                    catch e
+                        @debug "Failed to notify proxy of status change" exception = e
+                    end
+                end
 
                 @async begin
                     # Small delay to allow response to be sent back

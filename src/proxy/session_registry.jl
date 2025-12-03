@@ -62,23 +62,22 @@ function register_julia_session(
     # Check if this is a re-registration or restart
     existing_sessions = Database.get_julia_sessions_by_name(name)
     is_reconnection = any(s -> s.id == uuid, existing_sessions)
-    old_session_uuid = nothing
+    old_session_uuids = String[]
 
-    # Check for restart case (same name, different UUID)
+    # Check for restart case (same name, different UUID) - collect ALL old sessions
     for session in existing_sessions
         if session.id != uuid
-            old_session_uuid = session.id
+            push!(old_session_uuids, session.id)
             @info "Detected session restart: same name, different UUID" name = name old_uuid =
                 session.id new_uuid = uuid
-            break
         end
     end
 
     if is_reconnection
         @info "Julia session re-registering (same UUID)" uuid = uuid name = name port = port pid =
             pid
-    elseif old_session_uuid !== nothing
-        @info "Julia session restarting (new UUID)" old_uuid = old_session_uuid new_uuid =
+    elseif !isempty(old_session_uuids)
+        @info "Julia session restarting (new UUID)" old_uuids = old_session_uuids new_uuid =
             uuid name = name port = port pid = pid
     else
         @info "Julia session registering (new)" uuid = uuid name = name port = port pid =
@@ -132,18 +131,19 @@ function register_julia_session(
 
     # Get pending requests from buffer
     pending_requests = lock(PENDING_REQUESTS_LOCK) do
-        # Check for pending requests under this UUID or the old UUID (restart case)
+        # Check for pending requests under this UUID or any old UUIDs (restart case)
+        all_pending = Tuple{Dict,HTTP.Stream}[]
         if haskey(PENDING_REQUESTS, uuid)
-            reqs = PENDING_REQUESTS[uuid]
+            append!(all_pending, PENDING_REQUESTS[uuid])
             delete!(PENDING_REQUESTS, uuid)
-            reqs
-        elseif old_session_uuid !== nothing && haskey(PENDING_REQUESTS, old_session_uuid)
-            reqs = PENDING_REQUESTS[old_session_uuid]
-            delete!(PENDING_REQUESTS, old_session_uuid)
-            reqs
-        else
-            Tuple{Dict,HTTP.Stream}[]
         end
+        for old_uuid in old_session_uuids
+            if haskey(PENDING_REQUESTS, old_uuid)
+                append!(all_pending, PENDING_REQUESTS[old_uuid])
+                delete!(PENDING_REQUESTS, old_uuid)
+            end
+        end
+        all_pending
     end
 
     if !isempty(pending_requests)
@@ -151,26 +151,25 @@ function register_julia_session(
             length(pending_requests)
     end
 
-    # If this was a restart, update MCP sessions targeting the old UUID
-    if old_session_uuid !== nothing
-        mcp_sessions = Database.get_mcp_sessions_by_target(old_session_uuid)
-        for mcp_session in mcp_sessions
-            Database.update_mcp_session_target!(mcp_session.id, uuid)
-            @info "Updated MCP session target after restart" mcp_session_id = mcp_session.id old_uuid =
-                old_session_uuid new_uuid = uuid
-            @async notify_client_tools_changed(mcp_session.id)
-        end
-        if !isempty(mcp_sessions)
-            @info "Updated MCP session targets after restart" count = length(mcp_sessions) old_uuid =
-                old_session_uuid new_uuid = uuid
-        end
+    # If this was a restart, update MCP sessions targeting any old UUIDs
+    if !isempty(old_session_uuids)
+        for old_session_uuid in old_session_uuids
+            mcp_sessions = Database.get_mcp_sessions_by_target(old_session_uuid)
+            for mcp_session in mcp_sessions
+                Database.update_mcp_session_target!(mcp_session.id, uuid)
+                @info "Updated MCP session target after restart" mcp_session_id =
+                    mcp_session.id old_uuid = old_session_uuid new_uuid = uuid
+                @async notify_client_tools_changed(mcp_session.id)
+            end
 
-        # Clean up old session from database
-        try
-            Database.update_session_status!(old_session_uuid, "replaced")
-        catch e
-            @debug "Could not mark old session as replaced" exception = e
+            # Clean up old session from database
+            try
+                Database.update_session_status!(old_session_uuid, "replaced")
+            catch e
+                @debug "Could not mark old session as replaced" exception = e
+            end
         end
+        @info "Marked old sessions as replaced" count = length(old_session_uuids)
     end
 
     # Flush pending requests if any
@@ -238,12 +237,14 @@ function list_julia_sessions()
         return NamedTuple[]
     end
 
+    # Include sessions that are potentially recoverable (ready, down, restarting)
+    # but exclude terminal states (stopped, replaced) which won't come back
     result = DBInterface.execute(
         db,
         """
         SELECT id, name, port, pid, start_time, last_activity, status, metadata
         FROM julia_sessions
-        WHERE status IN ('active', 'ready')
+        WHERE status IN ('active', 'ready', 'down', 'restarting')
         ORDER BY start_time DESC
         """,
     )

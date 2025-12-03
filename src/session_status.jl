@@ -18,17 +18,21 @@ const READY = "ready"              # Session connected, accepting requests
 const DOWN = "down"                # Lost heartbeat, buffering requests
 const RESTARTING = "restarting"    # Restart command sent, buffering requests
 const STOPPED = "stopped"          # Permanently stopped, reject requests
+const REPLACED = "replaced"        # Session superseded by newer session, reject requests
 
 # MCP session statuses
 const ACTIVE = "active"            # Agent currently connected
 const INACTIVE = "inactive"        # Agent disconnected >1hr (historical record)
 
 # Valid status sets
-const VALID_JULIA_STATUSES = Set([READY, DOWN, RESTARTING, STOPPED])
+const VALID_JULIA_STATUSES = Set([READY, DOWN, RESTARTING, STOPPED, REPLACED])
 const VALID_MCP_STATUSES = Set([ACTIVE, INACTIVE])
 
 # Statuses that should buffer requests (instead of rejecting)
 const BUFFERING_STATUSES = Set([DOWN, RESTARTING])
+
+# Terminal statuses - session won't come back, don't buffer
+const TERMINAL_STATUSES = Set([STOPPED, REPLACED])
 
 # ============================================================================
 # Validation
@@ -67,6 +71,15 @@ Returns true if requests should be buffered for this status.
 """
 function should_buffer(status::String)
     return status in BUFFERING_STATUSES
+end
+
+"""
+    is_terminal(status::String) -> Bool
+
+Returns true if session is in a terminal state (won't recover).
+"""
+function is_terminal(status::String)
+    return status in TERMINAL_STATUSES
 end
 
 """
@@ -130,14 +143,17 @@ export READY,
     DOWN,
     RESTARTING,
     STOPPED,
+    REPLACED,
     ACTIVE,
     INACTIVE,
     VALID_JULIA_STATUSES,
     VALID_MCP_STATUSES,
     BUFFERING_STATUSES,
+    TERMINAL_STATUSES,
     validate_julia_status,
     validate_mcp_status,
     should_buffer,
+    is_terminal,
     is_active,
     update_julia_session_status!,
     update_mcp_session_status!

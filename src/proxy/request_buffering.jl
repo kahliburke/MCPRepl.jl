@@ -8,18 +8,81 @@ triggering the reconnection flow. No active polling is needed.
 """
 
 """
-    send_reconnection_updates(target_id::String, request::Dict, http::HTTP.Stream)
+    send_reconnection_updates(target_id::String, request::Dict, http::HTTP.Stream; timeout_seconds::Int=30)
 
-Placeholder for sending status updates to the client while waiting for reconnection.
-Currently just logs the buffering. The HTTP stream is kept open and will receive
-the response when the Julia session reconnects and the request is replayed.
+Wait for session reconnection with a timeout. If session doesn't reconnect within timeout,
+send an error response to the client.
+
+The request is already buffered when this function is called. If the session reconnects,
+flush_pending_requests() will replay the request. If timeout expires, we send an error.
 """
-function send_reconnection_updates(target_id::String, request::Dict, http::HTTP.Stream)
-    # The request is already buffered and the HTTP stream is stored
-    # When the session reconnects and re-registers, flush_pending_requests() will
-    # replay the request and send the response through this stream
-    @debug "Request buffered, waiting for automatic reconnection" target_id = target_id request_id =
-        get(request, "id", nothing)
+function send_reconnection_updates(
+    target_id::String,
+    request::Dict,
+    http::HTTP.Stream;
+    timeout_seconds::Int = 30,
+)
+    request_id = get(request, "id", nothing)
+    @info "Request buffered, waiting for reconnection" target_id = target_id request_id =
+        request_id timeout = timeout_seconds
+
+    # Wait for reconnection with timeout, checking status periodically
+    start_time = time()
+    while (time() - start_time) < timeout_seconds
+        # Check if session has reconnected
+        session = get_julia_session(target_id)
+        if session !== nothing && session.status == "ready"
+            # Session is back - the buffered request will be replayed by flush_pending_requests
+            @debug "Session reconnected, request will be replayed" target_id = target_id request_id =
+                request_id
+            return
+        end
+
+        # Check if request was already handled (removed from buffer)
+        still_buffered = lock(PENDING_REQUESTS_LOCK) do
+            if haskey(PENDING_REQUESTS, target_id)
+                any(r -> get(r[1], "id", nothing) == request_id, PENDING_REQUESTS[target_id])
+            else
+                false
+            end
+        end
+
+        if !still_buffered
+            # Request was already handled by flush_pending_requests
+            @debug "Buffered request was handled" target_id = target_id request_id =
+                request_id
+            return
+        end
+
+        sleep(1)
+    end
+
+    # Timeout expired - remove this specific request from buffer and send error
+    @warn "Reconnection timeout expired" target_id = target_id request_id = request_id timeout =
+        timeout_seconds
+
+    # Remove only this request from the buffer
+    lock(PENDING_REQUESTS_LOCK) do
+        if haskey(PENDING_REQUESTS, target_id)
+            filter!(
+                r -> get(r[1], "id", nothing) != request_id,
+                PENDING_REQUESTS[target_id],
+            )
+        end
+    end
+
+    # Send error response
+    try
+        send_jsonrpc_error(
+            http,
+            request_id,
+            -32003,
+            "Julia session did not reconnect within $(timeout_seconds) seconds. Please restart the session.";
+            status = 503,
+        )
+    catch e
+        @error "Failed to send timeout error response" exception = e
+    end
 end
 
 """

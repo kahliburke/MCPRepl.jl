@@ -8,6 +8,36 @@ using MCPRepl
 using MCPRepl.Proxy
 using MCPRepl.Database
 
+@testset "DateTime Parsing for Database Timestamps" begin
+    # The database stores timestamps in format "yyyy-mm-dd HH:MM:SS.sss"
+    # This must be parsed correctly by the heartbeat monitor
+
+    timestamp_str = "2025-12-02 20:13:17.004"
+
+    # This is the format used in the proxy heartbeat monitor
+    dt = DateTime(timestamp_str, dateformat"yyyy-mm-dd HH:MM:SS.sss")
+
+    @test dt isa DateTime
+    @test year(dt) == 2025
+    @test month(dt) == 12
+    @test day(dt) == 2
+    @test hour(dt) == 20
+    @test minute(dt) == 13
+    @test second(dt) == 17
+    @test millisecond(dt) == 4
+
+    # Test that we can compute time differences
+    now_time = now()
+    diff = now_time - dt
+    @test diff isa Dates.Millisecond
+
+    # Test edge cases
+    @test DateTime("2025-01-01 00:00:00.000", dateformat"yyyy-mm-dd HH:MM:SS.sss") ==
+          DateTime(2025, 1, 1, 0, 0, 0, 0)
+    @test DateTime("2025-12-31 23:59:59.999", dateformat"yyyy-mm-dd HH:MM:SS.sss") ==
+          DateTime(2025, 12, 31, 23, 59, 59, 999)
+end
+
 @testset "Proxy State Management" begin
     # Initialize temp database for these tests
     test_db = tempname() * ".db"
@@ -34,10 +64,15 @@ using MCPRepl.Database
         success, _ = Proxy.register_julia_session(uuid, "status-test", 3002; pid = 12346)
         @test success
 
-        # Update status to disconnected
-        Proxy.update_julia_session_status(uuid, "disconnected")
+        # Update status to down (lost heartbeat)
+        Proxy.update_julia_session_status(uuid, "down")
         session = Proxy.get_julia_session(uuid)
-        @test session.status == "disconnected"
+        @test session.status == "down"
+
+        # Update status to restarting
+        Proxy.update_julia_session_status(uuid, "restarting")
+        session = Proxy.get_julia_session(uuid)
+        @test session.status == "restarting"
 
         # Update status back to ready
         Proxy.update_julia_session_status(uuid, "ready")

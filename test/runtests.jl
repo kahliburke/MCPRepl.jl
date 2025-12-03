@@ -20,6 +20,7 @@ include("logs_endpoint_test.jl")
 include("tool_duration_test.jl")
 include("proxy_mcp_session_test.jl")
 include("qdrant_indexer_tests.jl")
+include("session_status_tests.jl")
 
 # Run all tests with ReTest
 retest()
