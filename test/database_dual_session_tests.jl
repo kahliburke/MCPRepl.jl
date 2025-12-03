@@ -5,6 +5,7 @@ using DataFrames
 using Dates
 using DBInterface
 using MCPRepl
+using MCPRepl.Database: get_julia_session
 
 @testset "Dual-Session Database Model" begin
     # Use temporary database for testing

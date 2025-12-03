@@ -31,8 +31,8 @@ using MCPRepl: MCPTool
                 @test result isa String
                 @test !isempty(result)
 
-                # Test with parameters
-                result2 = MCPRepl.call_tool(:search_methods, Dict("query" => "println"))
+                # Test with parameters - use a function with few methods to avoid long output
+                result2 = MCPRepl.call_tool(:search_methods, Dict("query" => "iseven"))
                 @test result2 isa String
                 @test contains(result2, "Methods") || contains(result2, "methods")
 

@@ -99,7 +99,7 @@ function send_json_response(
 end
 
 """
-    send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int=200, session_id::String="proxy")
+    send_jsonrpc_result(http::HTTP.Stream, id, result; status::Int=200, session_id=nothing)
 
 Send a JSON-RPC success response and log to database.
 
@@ -108,11 +108,11 @@ Send a JSON-RPC success response and log to database.
 - `id`: Request ID from the JSON-RPC request
 - `result`: The result data to return
 - `status::Int=200`: HTTP status code
-- `session_id::String="proxy"`: Session ID for logging (deprecated, use mcp_session_id)
+- `session_id::Union{String,Nothing}=nothing`: MCP session ID for logging
 
 # Example
 ```julia
-send_jsonrpc_result(http, 123, Dict("value" => 42))
+send_jsonrpc_result(http, 123, Dict("value" => 42); session_id="client-123")
 ```
 """
 function send_jsonrpc_result(
@@ -120,7 +120,7 @@ function send_jsonrpc_result(
     id,
     result;
     status::Int = 200,
-    session_id::String = "proxy",
+    session_id::Union{String,Nothing} = nothing,
 )
     # Convert id to string for logging (JSON-RPC ids can be strings or numbers)
     request_id_str = id === nothing ? nothing : string(id)
@@ -134,7 +134,7 @@ function send_jsonrpc_result(
 end
 
 """
-    send_jsonrpc_error(http::HTTP.Stream, id, code::Int, message::String; status::Int=200, data=nothing, session_id::String="proxy")
+    send_jsonrpc_error(http::HTTP.Stream, id, code::Int, message::String; status::Int=200, data=nothing, session_id=nothing)
 
 Send a JSON-RPC error response and log to database.
 
@@ -145,7 +145,7 @@ Send a JSON-RPC error response and log to database.
 - `message::String`: Human-readable error message
 - `status::Int=200`: HTTP status code (200 for JSON-RPC errors, 400+ for HTTP errors)
 - `data=nothing`: Optional additional error data
-- `session_id::String="proxy"`: Session ID for logging
+- `session_id::Union{String,Nothing}=nothing`: MCP session ID for logging
 
 # Standard JSON-RPC Error Codes
 - `-32700`: Parse error
@@ -157,7 +157,7 @@ Send a JSON-RPC error response and log to database.
 
 # Example
 ```julia
-send_jsonrpc_error(http, 123, -32602, "Invalid params"; data=Dict("missing" => ["id"]))
+send_jsonrpc_error(http, 123, -32602, "Invalid params"; data=Dict("missing" => ["id"]), session_id="client-123")
 ```
 """
 function send_jsonrpc_error(
@@ -167,7 +167,7 @@ function send_jsonrpc_error(
     message::String;
     status::Int = 200,
     data = nothing,
-    session_id::String = "proxy",
+    session_id::Union{String,Nothing} = nothing,
 )
     error_dict = Dict("code" => code, "message" => message)
     if data !== nothing
@@ -185,7 +185,7 @@ function send_jsonrpc_error(
 end
 
 """
-    send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int=200, session_id::String="proxy")
+    send_mcp_tool_result(http::HTTP.Stream, id, text::String; status::Int=200, session_id=nothing)
 
 Send an MCP tool call result with text content and log to database.
 
@@ -196,11 +196,11 @@ This is a convenience function for the common case of returning text content fro
 - `id`: Request ID from the tool call
 - `text::String`: The text content to return
 - `status::Int=200`: HTTP status code
-- `session_id::String="proxy"`: Session ID for logging
+- `session_id::Union{String,Nothing}=nothing`: MCP session ID for logging
 
 # Example
 ```julia
-send_mcp_tool_result(http, 123, "Command executed successfully")
+send_mcp_tool_result(http, 123, "Command executed successfully"; session_id="client-123")
 ```
 """
 function send_mcp_tool_result(
@@ -208,7 +208,7 @@ function send_mcp_tool_result(
     id,
     text::String;
     status::Int = 200,
-    session_id::String = "proxy",
+    session_id::Union{String,Nothing} = nothing,
 )
     send_jsonrpc_result(
         http,

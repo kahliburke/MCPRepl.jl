@@ -12,6 +12,7 @@ using JSON
 using DataFrames
 
 export init_db!,
+    get_default_db_path,
     log_event!,
     log_event_safe!,
     log_interaction!,
@@ -25,6 +26,7 @@ export init_db!,
     register_session!,
     register_mcp_session!,
     register_julia_session!,
+    get_julia_session,
     get_active_sessions,
     get_all_sessions,
     update_session_status!,
@@ -38,11 +40,27 @@ export init_db!,
 const DB = Ref{Union{SQLite.DB,Nothing}}(nothing)
 
 """
+    get_default_db_path() -> String
+
+Get the default database path in the user's cache directory.
+"""
+function get_default_db_path()
+    cache_dir = get(ENV, "XDG_CACHE_HOME") do
+        if Sys.iswindows()
+            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
+        else
+            joinpath(homedir(), ".cache", "mcprepl")
+        end
+    end
+    return joinpath(cache_dir, "mcprepl.db")
+end
+
+"""
 Initialize the SQLite database with schema.
 Creates tables if they don't exist.
 """
-function init_db!(db_path::String = ".mcprepl/events.db")
-    # Create .mcprepl directory if it doesn't exist
+function init_db!(db_path::String = get_default_db_path())
+    # Create directory if it doesn't exist
     mkpath(dirname(db_path))
 
     db = SQLite.DB(db_path)
@@ -891,12 +909,22 @@ function get_julia_session(id_or_name::String)
     end
 
     # If not found by UUID, try by name
+    # Prefer "ready" sessions over other statuses when looking up by name
     result2 = DBInterface.execute(
         db,
         """
         SELECT id, name, port, pid, start_time, last_activity, status, metadata
         FROM julia_sessions
         WHERE name = ?
+        ORDER BY
+            CASE status
+                WHEN 'ready' THEN 0
+                WHEN 'restarting' THEN 1
+                WHEN 'down' THEN 2
+                ELSE 3
+            END,
+            start_time DESC
+        LIMIT 1
         """,
         (id_or_name,),
     )

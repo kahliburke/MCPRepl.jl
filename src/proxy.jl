@@ -127,7 +127,7 @@ end
 """
     monitor_heartbeats()
 
-Background task that monitors Julia session heartbeats and marks Julia sessions as disconnected if they stop responding.
+Background task that monitors Julia session heartbeats and marks Julia sessions as down if they stop responding.
 Runs every 1 second and checks for Julia sessions that haven't sent a heartbeat in 30 seconds.
 """
 function monitor_heartbeats()
@@ -143,7 +143,7 @@ function monitor_heartbeats()
             julia_sessions = list_julia_sessions()
 
             for session in julia_sessions
-                # Skip if already disconnected/reconnecting/stopped
+                # Skip if already down/restarting/stopped
                 # Handle missing status from database
                 session_status = ismissing(session.status) ? "unknown" : session.status
                 if session_status != "ready"
@@ -151,17 +151,20 @@ function monitor_heartbeats()
                 end
 
                 # Check if heartbeat is stale (>30 seconds old)
-                last_heartbeat = Dates.DateTime(session.last_activity)
+                last_heartbeat = Dates.DateTime(
+                    session.last_activity,
+                    dateformat"yyyy-mm-dd HH:MM:SS.sss",
+                )
                 time_since_heartbeat = now() - last_heartbeat
                 if time_since_heartbeat > Second(30)
-                    @warn "Julia session heartbeat timeout, marking as disconnected" id =
-                        session.id last_heartbeat = last_heartbeat time_since =
-                        time_since_heartbeat status_before = session_status
+                    @warn "Julia session heartbeat timeout, marking as down" id = session.id last_heartbeat =
+                        last_heartbeat time_since = time_since_heartbeat status_before =
+                        session_status
 
-                    # Mark as disconnected in database
+                    # Mark as down in database
                     update_julia_session_status(
                         session.id,
-                        "disconnected";
+                        "down";
                         error = "Heartbeat timeout after $time_since_heartbeat",
                     )
 
@@ -198,18 +201,19 @@ function route_to_session_streaming(
 )
     # Check for MCP session ID first (standard MCP mechanism)
     session_id_header = HTTP.header(original_req, "Mcp-Session-Id")
+    # Extract session_id for logging (available throughout function)
+    mcp_session_id = isempty(session_id_header) ? nothing : String(session_id_header)
     target_id = nothing
 
-    if !isempty(session_id_header)
-        session_id = String(session_id_header)
-        session = get_mcp_session(session_id)
+    if mcp_session_id !== nothing
+        session = get_mcp_session(mcp_session_id)
 
         if session !== nothing
             # Update session activity
             update_activity!(session)
             save_mcp_session!(session)
             target_id = session.target_julia_session_id
-            @debug "Routing via session" session_id = session_id target_id = target_id
+            @debug "Routing via session" session_id = mcp_session_id target_id = target_id
         else
             # Session not found - client needs to re-initialize
             send_jsonrpc_error(
@@ -218,6 +222,7 @@ function route_to_session_streaming(
                 -32001,
                 "Session not found. Please send a new initialize request.";
                 status = 404,
+                session_id = mcp_session_id,
             )
             return nothing
         end
@@ -247,6 +252,7 @@ function route_to_session_streaming(
                 -32001,
                 "No Julia sessions available. Use proxy tools to list or start sessions: list_julia_sessions, start_julia_session.";
                 status = 503,
+                session_id = mcp_session_id,
             )
             return nothing
         else
@@ -258,6 +264,7 @@ function route_to_session_streaming(
                 -32001,
                 "No target Julia session specified. Available sessions: $julia_session_ids. Re-initialize with X-MCPRepl-Target header to specify a target.";
                 status = 400,
+                session_id = mcp_session_id,
             )
             return nothing
         end
@@ -273,6 +280,7 @@ function route_to_session_streaming(
             -32002,
             "Julia session not found: $target_id";
             status = 404,
+            session_id = mcp_session_id,
         )
         return nothing
     end
@@ -285,6 +293,7 @@ function route_to_session_streaming(
             -32003,
             "Julia session $target_id has no port registered";
             status = 500,
+            session_id = mcp_session_id,
         )
         return nothing
     end
@@ -293,40 +302,93 @@ function route_to_session_streaming(
     # Handle missing status from database
     session_status = ismissing(session.status) ? "unknown" : session.status
 
-    if session_status in ("disconnected", "reconnecting")
+    if session_status == "stopped"
+        # "stopped" means explicitly shutdown - don't buffer, user must manually restart
+        send_jsonrpc_error(
+            http,
+            get(request, "id", nothing),
+            -32003,
+            "Julia session permanently stopped: $target_id. Use ./repl to restart manually.";
+            status = 503,
+            session_id = mcp_session_id,
+        )
+        return nothing
+
+    elseif session_status == "replaced"
+        # "replaced" means a newer session exists - try to auto-redirect
+        # Look up the replaced session to get its name
+        replaced_session = get_julia_session(target_id)
+        if replaced_session !== nothing
+            # Find a "ready" session with the same name
+            new_session = Database.get_julia_session(replaced_session.name)
+            if new_session !== nothing && new_session.status == "ready"
+                @info "Auto-redirecting from replaced session to new session" old_uuid =
+                    target_id new_uuid = new_session.id name = replaced_session.name
+
+                # Update MCP session target if we have one
+                session_id_header = HTTP.header(original_req, "Mcp-Session-Id")
+                if !isempty(session_id_header)
+                    try
+                        Database.update_mcp_session_target!(
+                            String(session_id_header),
+                            new_session.id,
+                        )
+                    catch e
+                        @warn "Failed to update MCP session target during auto-redirect" exception =
+                            e
+                    end
+                end
+
+                # Retry routing with the new target by injecting it into params
+                # This ensures the new target is used regardless of headers
+                redirected_request = copy(request)
+                params = get(redirected_request, "params", Dict())
+                redirected_params =
+                    params isa Dict ? copy(params) :
+                    Dict(String(k) => v for (k, v) in pairs(params))
+                redirected_params["target"] = new_session.id
+                redirected_request["params"] = redirected_params
+                return route_to_session_streaming(redirected_request, original_req, http)
+            end
+        end
+
+        # Fallback: send error if auto-redirect failed
+        send_jsonrpc_error(
+            http,
+            get(request, "id", nothing),
+            -32003,
+            "Julia session was replaced by a newer session. Please reconnect.";
+            status = 503,
+            session_id = mcp_session_id,
+        )
+        return nothing
+
+    elseif session_status in ("down", "restarting", "unknown")
         # Buffer the request for replay when session reconnects
         buffer_request!(target_id, request, http)
 
-        # Mark as reconnecting if not already
-        if session_status == "disconnected"
-            update_julia_session_status(target_id, "reconnecting")
-            @info "Julia session disconnected, buffering requests for automatic replay on reconnection" id =
-                target_id
+        # Mark as restarting if not already
+        if session_status in ("down", "unknown")
+            update_julia_session_status(target_id, "restarting")
+            @info "Julia session not ready, buffering requests for automatic replay on reconnection" id =
+                target_id status = session_status
         end
 
-        # Start async task to send status updates while waiting for reconnection
-        @async send_reconnection_updates(target_id, request, http)
-        return nothing
-
-    elseif session_status == "stopped"
-        # Julia session is permanently stopped, return error
-        send_jsonrpc_error(
-            http,
-            get(request, "id", nothing),
-            -32003,
-            "Julia session permanently stopped: $target_id. Restart required.";
-            status = 503,
-        )
+        # Block until session reconnects or timeout expires
+        # The request is buffered; flush_pending_requests will replay it when session reconnects
+        send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
         return nothing
 
     elseif session_status != "ready"
-        send_jsonrpc_error(
-            http,
-            get(request, "id", nothing),
-            -32003,
-            "Julia session not ready: $(session_status)";
-            status = 503,
-        )
+        # For any other non-ready status, also buffer instead of erroring
+        # This is more resilient to temporary issues
+        buffer_request!(target_id, request, http)
+        update_julia_session_status(target_id, "restarting")
+        @info "Julia session in unexpected state, buffering request" id = target_id status =
+            session_status
+
+        # Block until session reconnects or timeout expires
+        send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
         return nothing
     end
 
@@ -464,46 +526,93 @@ function route_to_session_streaming(
         # Note: Error is already logged via Dashboard.log_event as ERROR event below
         # No need to duplicate as a separate event here
 
-        # Store the error and mark as disconnected
+        # Store the error and mark as down
         error_summary = length(error_msg) > 500 ? error_msg[1:500] * "..." : error_msg
 
         # Check current session status from database
         current_session = get_julia_session(target_id)
         if current_session !== nothing
-            # Buffer this request for replay when session reconnects
-            buffer_request!(target_id, request, http)
-
-            # Mark as disconnected/reconnecting
             # Handle missing status from database
             current_status =
                 ismissing(current_session.status) ? "unknown" : current_session.status
+
+            # Check for terminal statuses first - don't buffer, send error
+            if current_status in ("stopped", "replaced")
+                error_msg =
+                    current_status == "stopped" ?
+                    "Julia session permanently stopped. Use ./repl to restart manually." :
+                    "Julia session was replaced by a newer session. Please reconnect."
+                send_jsonrpc_error(
+                    http,
+                    get(request, "id", nothing),
+                    -32003,
+                    error_msg;
+                    status = 503,
+                    session_id = mcp_session_id,
+                )
+                Dashboard.log_event(
+                    target_id,
+                    Dashboard.ERROR,
+                    Dict(
+                        "message" => "Session $current_status, cannot process request",
+                        "method" => get(request, "method", ""),
+                        "buffered" => false,
+                    ),
+                )
+                return nothing
+            end
+
+            # Buffer the request for replay when session reconnects
+            buffer_request!(target_id, request, http)
+
+            # Mark as down/restarting
             if current_status == "ready"
-                update_julia_session_status(
-                    target_id,
-                    "disconnected";
-                    error = error_summary,
-                )
-                @info "Julia session disconnected, buffering requests for replay on reconnection" id =
+                update_julia_session_status(target_id, "down"; error = error_summary)
+                @info "Julia session down, buffering requests for replay on reconnection" id =
                     target_id
-            elseif current_status == "disconnected"
-                update_julia_session_status(
-                    target_id,
-                    "reconnecting";
-                    error = error_summary,
-                )
+            elseif current_status in ("down", "unknown")
+                update_julia_session_status(target_id, "restarting"; error = error_summary)
                 @info "Request buffered, will replay when session reconnects" id = target_id
             end
+
+            # Log error event
+            Dashboard.log_event(
+                target_id,
+                Dashboard.ERROR,
+                Dict(
+                    "message" => sprint(showerror, e),
+                    "method" => get(request, "method", ""),
+                    "buffered" => true,
+                ),
+            )
+
+            # Block until session reconnects or timeout expires
+            # Response will be written by flush_pending_requests or timeout error
+            send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+            return nothing
+        else
+            # Session not in database - buffer anyway in case it restarts with same UUID
+            # This handles race conditions during restart
+            buffer_request!(target_id, request, http)
+
+            @info "Julia session not found in database, buffering request optimistically" id =
+                target_id
+
+            # Log error event
+            Dashboard.log_event(
+                target_id,
+                Dashboard.ERROR,
+                Dict(
+                    "message" => "Session not found, buffering optimistically",
+                    "method" => get(request, "method", ""),
+                    "buffered" => true,
+                ),
+            )
+
+            # Block until session reconnects or timeout expires
+            send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+            return nothing
         end
-
-        # Log error event
-        Dashboard.log_event(
-            target_id,
-            Dashboard.ERROR,
-            Dict("message" => sprint(showerror, e), "method" => get(request, "method", "")),
-        )
-
-        # Don't send response - will be handled by reconnection logic
-        return nothing
     end
 end
 
@@ -663,7 +772,7 @@ function handle_request(http::HTTP.Stream)
 
             # Handle DELETE requests - session cleanup
             if req.method == "DELETE"
-                # VS Code sends DELETE to clean up sessions before reconnecting
+                # VS Code sends DELETE to clean up sessions before restarting
                 @debug "Handling DELETE request" target = req.target
                 response = JSON.json(Dict("status" => "ok"))
                 send_json_response(
@@ -817,11 +926,11 @@ function handle_request(http::HTTP.Stream)
                             "port" => s.port,
                             "status" => string(s.status),
                             "pid" => s.pid,
-                            "last_error" => s.last_error,
                         ) for s in sessions
                     ],
                     "uptime" => time(),
-                ),
+                );
+                session_id = log_session_id,
             )
             return nothing
         elseif method == "proxy/register"
@@ -845,6 +954,7 @@ function handle_request(http::HTTP.Stream)
                     -32602,
                     "Invalid params: 'uuid', 'name', and 'port' are required";
                     status = 400,
+                    session_id = log_session_id,
                 )
                 return nothing
             end
@@ -884,6 +994,7 @@ function handle_request(http::HTTP.Stream)
                             "requested_pid" => pid,
                             "requested_port" => port,
                         ),
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -899,6 +1010,7 @@ function handle_request(http::HTTP.Stream)
                     -32602,
                     "Registration failed: $error_msg";
                     status = 400,
+                    session_id = log_session_id,
                 )
                 return nothing
             end
@@ -906,7 +1018,8 @@ function handle_request(http::HTTP.Stream)
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
-                Dict("status" => "registered", "uuid" => uuid, "name" => name),
+                Dict("status" => "registered", "uuid" => uuid, "name" => name);
+                session_id = log_session_id,
             )
             return nothing
         elseif method == "proxy/unregister"
@@ -921,6 +1034,7 @@ function handle_request(http::HTTP.Stream)
                     -32602,
                     "Invalid params: 'uuid' is required";
                     status = 400,
+                    session_id = log_session_id,
                 )
                 return nothing
             end
@@ -930,8 +1044,64 @@ function handle_request(http::HTTP.Stream)
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
-                Dict("status" => "unregistered", "uuid" => uuid),
+                Dict("status" => "unregistered", "uuid" => uuid);
+                session_id = log_session_id,
             )
+            return nothing
+        elseif method == "proxy/update_status"
+            # Update Julia session status (used before restart/shutdown)
+            params = get(request, "params", Dict())
+            uuid = get(params, "uuid", nothing)
+            new_status = get(params, "status", nothing)
+
+            if uuid === nothing || new_status === nothing
+                send_jsonrpc_error(
+                    http,
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid params: 'uuid' and 'status' are required";
+                    status = 400,
+                    session_id = log_session_id,
+                )
+                return nothing
+            end
+
+            # Validate status
+            valid_statuses = Set(["ready", "down", "restarting", "stopped", "replaced"])
+            if !(new_status in valid_statuses)
+                send_jsonrpc_error(
+                    http,
+                    get(request, "id", nothing),
+                    -32602,
+                    "Invalid status: '$new_status'. Valid: $(join(valid_statuses, ", "))";
+                    status = 400,
+                    session_id = log_session_id,
+                )
+                return nothing
+            end
+
+            # Update the session status
+            existing_session = get_julia_session(uuid)
+            if existing_session !== nothing
+                update_julia_session_status(uuid, new_status)
+                @info "Julia session status updated" uuid = uuid status = new_status
+
+                send_jsonrpc_result(
+                    http,
+                    get(request, "id", nothing),
+                    Dict("status" => "updated", "uuid" => uuid, "new_status" => new_status);
+                    session_id = log_session_id,
+                )
+            else
+                send_jsonrpc_error(
+                    http,
+                    get(request, "id", nothing),
+                    -32000,
+                    "Session not found: $uuid";
+                    status = 404,
+                    session_id = log_session_id,
+                )
+            end
             return nothing
         elseif method == "proxy/heartbeat"
             # Julia session sends heartbeat to indicate it's alive
@@ -945,11 +1115,12 @@ function handle_request(http::HTTP.Stream)
                     -32602,
                     "Invalid params: 'uuid' is required";
                     status = 400,
+                    session_id = log_session_id,
                 )
                 return nothing
             end
 
-            # Update heartbeat and recover from disconnected/stopped state
+            # Update heartbeat and recover from down/stopped state
             existing_session = get_julia_session(uuid)
 
             if existing_session !== nothing
@@ -971,6 +1142,7 @@ function handle_request(http::HTTP.Stream)
                         -32000,
                         "Duplicate session detected with different PID";
                         status = 409,
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -978,11 +1150,11 @@ function handle_request(http::HTTP.Stream)
                 # Update heartbeat timestamp
                 Database.update_session_status!(uuid, "ready")
 
-                # Automatically recover from disconnected or stopped state on heartbeat
+                # Automatically recover from down or stopped state on heartbeat
                 # Handle missing status from database
                 session_status =
                     ismissing(existing_session.status) ? "unknown" : existing_session.status
-                if session_status in ("stopped", "disconnected", "reconnecting")
+                if session_status in ("stopped", "down", "restarting")
                     update_julia_session_status(uuid, "ready")
                     @info "Julia session recovered via heartbeat" uuid = uuid old_status =
                         session_status
@@ -1027,7 +1199,12 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            send_jsonrpc_result(http, get(request, "id", nothing), Dict("status" => "ok"))
+            send_jsonrpc_result(
+                http,
+                get(request, "id", nothing),
+                Dict("status" => "ok");
+                session_id = log_session_id,
+            )
             return nothing
         elseif method == "initialize"
             # Handle MCP initialize request according to spec
@@ -1174,7 +1351,8 @@ function handle_request(http::HTTP.Stream)
                     http,
                     get(request, "id", nothing),
                     -32602,
-                    "Invalid params: level must be one of $(join(valid_levels, ", "))",
+                    "Invalid params: level must be one of $(join(valid_levels, ", "))";
+                    session_id = log_session_id,
                 )
                 return nothing
             end
@@ -1202,13 +1380,19 @@ function handle_request(http::HTTP.Stream)
                     http,
                     get(request, "id", nothing),
                     -32603,
-                    "Internal error: $(string(e))",
+                    "Internal error: $(string(e))";
+                    session_id = log_session_id,
                 )
                 return nothing
             end
 
             # Success response (empty result as per spec)
-            send_jsonrpc_result(http, get(request, "id", nothing), Dict())
+            send_jsonrpc_result(
+                http,
+                get(request, "id", nothing),
+                Dict();
+                session_id = log_session_id,
+            )
             return nothing
         elseif method == "tools/list"
             # Get proxy tools (always available)
@@ -1335,16 +1519,27 @@ function handle_request(http::HTTP.Stream)
             send_jsonrpc_result(
                 http,
                 get(request, "id", nothing),
-                Dict("tools" => all_tools),
+                Dict("tools" => all_tools);
+                session_id = log_session_id,
             )
             return nothing
         elseif method == "prompts/list"
             # Return empty prompts list (proxy doesn't provide prompts)
-            send_jsonrpc_result(http, get(request, "id", nothing), Dict("prompts" => []))
+            send_jsonrpc_result(
+                http,
+                get(request, "id", nothing),
+                Dict("prompts" => []);
+                session_id = log_session_id,
+            )
             return nothing
         elseif method == "resources/list"
             # Return empty resources list (proxy doesn't provide resources)
-            send_jsonrpc_result(http, get(request, "id", nothing), Dict("resources" => []))
+            send_jsonrpc_result(
+                http,
+                get(request, "id", nothing),
+                Dict("resources" => []);
+                session_id = log_session_id,
+            )
             return nothing
         elseif method == "tools/call"
             # Handle proxy-level tools (always available)
@@ -1403,7 +1598,12 @@ function handle_request(http::HTTP.Stream)
                         duration_ms = duration_ms,
                     )
                     # Return result for other tools
-                    send_mcp_tool_result(http, get(request, "id", nothing), result_text)
+                    send_mcp_tool_result(
+                        http,
+                        get(request, "id", nothing),
+                        result_text;
+                        session_id = log_session_id,
+                    )
                     return nothing
                 end
             end
@@ -1419,7 +1619,8 @@ function handle_request(http::HTTP.Stream)
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
-                        "❌ Error: No MCP session ID found. This tool must be called from an MCP client.",
+                        "❌ Error: No MCP session ID found. This tool must be called from an MCP client.";
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -1451,7 +1652,8 @@ function handle_request(http::HTTP.Stream)
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
-                        "❌ Error: Julia session not found: $session_id_arg\n\nAvailable sessions:\n$sessions_list",
+                        "❌ Error: Julia session not found: $session_id_arg\n\nAvailable sessions:\n$sessions_list";
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -1501,7 +1703,7 @@ function handle_request(http::HTTP.Stream)
                     if Sys.iswindows()
                         result_text = "❌ kill_stale_sessions is not yet supported on Windows"
                     else
-                        # Fast approach: only check disconnected sessions from database
+                        # Fast approach: only check down sessions from database
                         # Avoid any process scanning which is slow
                         stale_processes = []
 
@@ -1526,8 +1728,8 @@ function handle_request(http::HTTP.Stream)
                                 continue
                             end
 
-                            # Only flag disconnected sessions as stale
-                            if session_status == "disconnected"
+                            # Only flag down sessions as stale
+                            if session_status == "down"
                                 is_stale = true
                                 if force || is_stale
                                     push!(stale_processes, (pid, session.name, is_stale))
@@ -1581,7 +1783,12 @@ function handle_request(http::HTTP.Stream)
                     result_text = "❌ Error scanning for stale sessions: $e"
                 end
 
-                send_mcp_tool_result(http, get(request, "id", nothing), result_text)
+                send_mcp_tool_result(
+                    http,
+                    get(request, "id", nothing),
+                    result_text;
+                    session_id = log_session_id,
+                )
                 return nothing
             end
 
@@ -1604,7 +1811,8 @@ function handle_request(http::HTTP.Stream)
                         http,
                         get(request, "id", nothing),
                         -32602,
-                        "project_path is required",
+                        "project_path is required";
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -1615,7 +1823,8 @@ function handle_request(http::HTTP.Stream)
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
-                        "Julia session '$session_name' is already running on port $(julia_sessions[existing].port)",
+                        "Julia session '$session_name' is already running on port $(julia_sessions[existing].port)";
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -1685,7 +1894,8 @@ function handle_request(http::HTTP.Stream)
                             send_mcp_tool_result(
                                 http,
                                 get(request, "id", nothing),
-                                "✅ Successfully started Julia session '$(new_session.name)' on port $port_str\n\nProject: $project_path\nPID: $pid_str\nStatus: $status_str\nLog: $log_file",
+                                "✅ Successfully started Julia session '$(new_session.name)' on port $port_str\n\nProject: $project_path\nPID: $pid_str\nStatus: $status_str\nLog: $log_file";
+                                session_id = log_session_id,
                             )
                             return nothing
                         end
@@ -1709,7 +1919,8 @@ function handle_request(http::HTTP.Stream)
                         http,
                         get(request, "id", nothing),
                         -32603,
-                        "Julia session process started but did not register within 60 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents",
+                        "Julia session process started but did not register within 60 seconds.\n\nLog file: $log_file\n\nRecent output:\n$log_contents";
+                        session_id = log_session_id,
                     )
                     return nothing
                 catch e
@@ -1719,7 +1930,8 @@ function handle_request(http::HTTP.Stream)
                         http,
                         get(request, "id", nothing),
                         -32603,
-                        "Failed to start Julia session backend: $(sprint(showerror, e))",
+                        "Failed to start Julia session backend: $(sprint(showerror, e))";
+                        session_id = log_session_id,
                     )
                     return nothing
                 end
@@ -1729,7 +1941,8 @@ function handle_request(http::HTTP.Stream)
                     send_mcp_tool_result(
                         http,
                         get(request, "id", nothing),
-                        "⚠️ Tool '$tool_name' requires a Julia session.\n\nNo Julia sessions are currently connected to the proxy.\n\nTo enable Julia tools:\n1. Start a Julia session\n2. Run: using MCPRepl; MCPRepl.start!()\n3. The session will automatically register with this proxy\n\nAvailable proxy tools: help, proxy_status, list_julia_sessions, dashboard_url, start_julia_session",
+                        "⚠️ Tool '$tool_name' requires a Julia session.\n\nNo Julia sessions are currently connected to the proxy.\n\nTo enable Julia tools:\n1. Start a Julia session\n2. Run: using MCPRepl; MCPRepl.start!()\n3. The session will automatically register with this proxy\n\nAvailable proxy tools: help, proxy_status, list_julia_sessions, dashboard_url, start_julia_session";
+                        session_id = log_session_id,
                     )
                     return nothing
                 else
@@ -1750,7 +1963,8 @@ function handle_request(http::HTTP.Stream)
                 send_jsonrpc_result(
                     http,
                     get(request, "id", nothing),
-                    nothing,  # Many MCP methods (like notifications) expect null result
+                    nothing;  # Many MCP methods (like notifications) expect null result
+                    session_id = log_session_id,
                 )
                 return nothing
             else
@@ -1767,12 +1981,13 @@ function handle_request(http::HTTP.Stream)
         # Don't log connection reset/broken pipe errors - these are normal when clients disconnect
         if e isa Base.IOError &&
            (occursin("connection reset", e.msg) || occursin("broken pipe", e.msg))
-            @debug "Client disconnected during response" exception = e
+            @debug "Client down during response" exception = e
         else
             @error "Error handling request" exception = (e, catch_backtrace())
         end
 
         # Try to send error response if stream is still open
+        # Note: log_session_id may not be defined if error occurred early, so don't use it here
         try
             if isopen(http)
                 send_jsonrpc_error(
@@ -1841,8 +2056,8 @@ function start_foreground_server(port::Int = 3000)
     log_file = setup_proxy_logging(port)
     println("Proxy log file: $log_file")
 
-    # Initialize database (lazy initialization on server start)
-    # Use XDG_CACHE_HOME for persistent storage across proxy restarts
+    # Initialize database in user cache directory
+    # This provides a single database shared across all MCPRepl usage
     cache_dir = get(ENV, "XDG_CACHE_HOME") do
         if Sys.iswindows()
             joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
