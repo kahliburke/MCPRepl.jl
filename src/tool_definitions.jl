@@ -1459,35 +1459,39 @@ Test results summary including:
     function (args)
         pattern = get(args, "pattern", ".*")
         coverage_enabled = get(args, "coverage", false)
-        verbose = parse(Int, get(args, "verbose", "1"))
+        verbose_arg = get(args, "verbose", 1)
+        verbose = verbose_arg isa Int ? verbose_arg : parse(Int, verbose_arg)
 
         out_buf = IOBuffer()
         try
+            hasReTest = "ReTest" in [p.name for p in values(Pkg.dependencies())]
+            project_path = dirname(Pkg.project().path)
+            project_name = Pkg.project().name
+
             if coverage_enabled
                 println(out_buf, "🧪 Running tests with coverage collection...\n")
                 # Clear any previous coverage data
                 Coverage.clean_folder("src")
                 Coverage.clean_folder("test")
-            else
-                println(out_buf, "🧪 Running tests...\n")
-            end
 
-            hasReTest = "ReTest" in [p.name for p in values(Pkg.dependencies())]
-
-            try
+                # Coverage requires --code-coverage flag, so spawn a subprocess
                 if hasReTest
-                    ReTest.hijack(Pkg.project().name)
-                    output = retest(Regex(pattern); verbose = verbose)
+                    # Build ReTest command with pattern filtering
+                    test_script = """
+                    using ReTest
+                    include(joinpath("test", "$(project_name)Tests.jl"))
+                    retest(Main.$(project_name)Tests, r"$pattern"; verbose=$verbose)
+                    """
+                    cmd = `julia --project=$project_path --code-coverage=user -e $test_script`
                 else
-                    output = Pkg.test(coverage = coverage_enabled)
+                    # Fall back to running runtests.jl directly
+                    cmd = `julia --project=$project_path --code-coverage=user test/runtests.jl`
                 end
-                test_ran = true
-                print(out_buf, output)
-            catch e
-                print(out_buf, "Error running tests: $e")
-            end
 
-            if coverage_enabled
+                # Run the subprocess and capture output
+                test_output = read(cmd, String)
+                print(out_buf, test_output)
+
                 println(out_buf, "\n📊 Processing coverage data...\n")
 
                 coverage = process_folder("src")
@@ -1497,12 +1501,41 @@ Test results summary including:
                     round(100 * covered_lines / total_lines, digits = 2) : 0.0
 
                 println(out_buf, "Coverage Summary:")
-                println(out_buf, "  Lines covered: \$covered_lines / \$total_lines")
-                println(out_buf, "  Coverage: \$(coverage_pct)%")
+                println(out_buf, "  Lines covered: $covered_lines / $total_lines")
+                println(out_buf, "  Coverage: $(coverage_pct)%")
 
                 # Generate LCOV report
                 LCOV.writefile("coverage-lcov.info", coverage)
                 println(out_buf, "\n✅ Coverage report written to: coverage-lcov.info")
+            else
+                println(out_buf, "🧪 Running tests...\n")
+
+                try
+                    if hasReTest
+                        # Get the current project as a module
+                        project_mod = Base.root_module(
+                            Base.PkgId(Base.UUID(Pkg.project().uuid), project_name),
+                        )
+
+                        # Use ReTest's load=true to automatically find and load ProjectNameTests.jl
+                        # Capture stdout since retest() prints output but returns nothing
+                        (rd, wr) = redirect_stdout()
+                        reader_task = @async read(rd, String)
+                        try
+                            retest(project_mod, Regex(pattern); load = true, verbose = verbose)
+                        finally
+                            redirect_stdout()  # Restore stdout
+                            close(wr)
+                        end
+                        test_output = fetch(reader_task)
+                        close(rd)
+                        print(out_buf, test_output)
+                    else
+                        Pkg.test()
+                    end
+                catch e
+                    print(out_buf, "Error running tests: $e")
+                end
             end
             return String(take!(out_buf))
         catch e
