@@ -178,8 +178,12 @@ function register_julia_session(
     end
 
     # Flush pending requests if any
+    # Add small delay to ensure backend HTTP server is fully ready
     if !isempty(pending_requests)
-        @async flush_pending_requests(uuid, pending_requests)
+        @async begin
+            sleep(0.5)  # Give backend server time to start listening
+            flush_pending_requests(uuid, pending_requests)
+        end
     end
 
     # Notify relevant MCP clients that tools list has changed
@@ -490,16 +494,42 @@ function flush_pending_requests(
             @debug "Flushing buffered request to backend" url = backend_url request_id =
                 get(request, "id", nothing)
 
-            # Forward to backend
-            backend_response = HTTP.request(
-                "POST",
-                backend_url,
-                ["Content-Type" => "application/json"],
-                body_str;
-                readtimeout = 30,
-                connect_timeout = 5,
-                status_exception = false,
-            )
+            # Retry logic for connection errors (backend might still be starting)
+            max_retries = 3
+            retry_delay = 0.5
+            backend_response = nothing
+            last_error = nothing
+
+            for attempt = 1:max_retries
+                try
+                    # Forward to backend
+                    backend_response = HTTP.request(
+                        "POST",
+                        backend_url,
+                        ["Content-Type" => "application/json"],
+                        body_str;
+                        readtimeout = 30,
+                        connect_timeout = 5,
+                        status_exception = false,
+                    )
+                    break  # Success, exit retry loop
+                catch e
+                    last_error = e
+                    if attempt < max_retries &&
+                       (e isa HTTP.ConnectError || e isa Base.IOError)
+                        @debug "Backend connection attempt failed, retrying" attempt =
+                            attempt url = backend_url
+                        sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else
+                        rethrow()  # Out of retries or non-retryable error
+                    end
+                end
+            end
+
+            if backend_response === nothing
+                throw(last_error)
+            end
 
             response_body = String(backend_response.body)
             response_status = backend_response.status
