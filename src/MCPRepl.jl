@@ -959,14 +959,20 @@ function start!(;
                 sock = Sockets.connect(actual_port)
                 close(sock)
                 server_ready = true
+                @debug "Backend server ready after attempt $attempt"
                 break
-            catch
+            catch e
+                if attempt == max_attempts
+                    @debug "Backend server connection failed" attempt = attempt error = e
+                end
                 sleep(0.1)
             end
         end
 
         if !server_ready
             @warn "Backend server not ready after 5 seconds, skipping proxy registration"
+        else
+            @debug "Proceeding with proxy registration" port = actual_port
         end
 
         if server_ready
