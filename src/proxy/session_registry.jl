@@ -178,12 +178,8 @@ function register_julia_session(
     end
 
     # Flush pending requests if any
-    # Add small delay to ensure backend HTTP server is fully ready
     if !isempty(pending_requests)
-        @async begin
-            sleep(0.5)  # Give backend server time to start listening
-            flush_pending_requests(uuid, pending_requests)
-        end
+        @async flush_pending_requests(uuid, pending_requests)
     end
 
     # Notify relevant MCP clients that tools list has changed

@@ -947,162 +947,190 @@ function start!(;
 
     # Register this REPL with the proxy if proxy is running and registration is enabled
     if register_with_proxy && Proxy.is_server_running(proxy_port)
-        try
-            # Determine REPL ID
-            # Priority: MCPREPL_ID env var > julia_session_name > workspace basename
-            repl_id = if haskey(ENV, "MCPREPL_ID") && !isempty(ENV["MCPREPL_ID"])
-                ENV["MCPREPL_ID"]
-            elseif !isempty(julia_session_name)
-                julia_session_name  # Use julia_session_name directly without prefix
-            else
-                basename(workspace_dir)
+        # Wait for the backend HTTP server to be ready to accept connections
+        # This prevents race conditions where the proxy flushes buffered requests
+        # before the backend can handle them
+        max_attempts = 50  # 5 seconds total (50 * 0.1s)
+        server_ready = false
+
+        for attempt = 1:max_attempts
+            try
+                # Try a simple TCP connection to verify the server is listening
+                sock = Sockets.connect(actual_port)
+                close(sock)
+                server_ready = true
+                break
+            catch
+                sleep(0.1)
             end
+        end
 
-            # Register with proxy
-            registration = Dict(
-                "jsonrpc" => "2.0",
-                "id" => 1,
-                "method" => "proxy/register",
-                "params" => Dict(
-                    "uuid" => SERVER[].uuid,
-                    "name" => repl_id,
-                    "port" => actual_port,
-                    "pid" => getpid(),
-                    "metadata" => Dict(
-                        "workspace" => workspace_dir,
-                        "julia_session_name" => julia_session_name,
-                    ),
-                ),
-            )
+        if !server_ready
+            @warn "Backend server not ready after 5 seconds, skipping proxy registration"
+        end
 
-            response = HTTP.post(
-                "http://127.0.0.1:$proxy_port/",
-                ["Content-Type" => "application/json"],
-                JSON.json(registration);
-                readtimeout = 5,
-                status_exception = false,
-            )
-
-            if response.status == 200
-                if verbose
-                    printstyled(
-                        "📝 Registered with proxy as '$repl_id'\n",
-                        color = :green,
-                        bold = true,
-                    )
+        if server_ready
+            try
+                # Determine REPL ID
+                # Priority: MCPREPL_ID env var > julia_session_name > workspace basename
+                repl_id = if haskey(ENV, "MCPREPL_ID") && !isempty(ENV["MCPREPL_ID"])
+                    ENV["MCPREPL_ID"]
+                elseif !isempty(julia_session_name)
+                    julia_session_name  # Use julia_session_name directly without prefix
+                else
+                    basename(workspace_dir)
                 end
-            elseif response.status == 409
-                # Duplicate registration - parse error message and show to user
-                response_data = JSON.parse(String(response.body))
-                error_msg = get(
-                    get(response_data, "error", Dict()),
-                    "message",
-                    "Session ID already in use",
+
+                # Register with proxy
+                registration = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => 1,
+                    "method" => "proxy/register",
+                    "params" => Dict(
+                        "uuid" => SERVER[].uuid,
+                        "name" => repl_id,
+                        "port" => actual_port,
+                        "pid" => getpid(),
+                        "metadata" => Dict(
+                            "workspace" => workspace_dir,
+                            "julia_session_name" => julia_session_name,
+                        ),
+                    ),
                 )
 
-                # Stop spinner before showing error
-                spinner_active[] = false
-                wait(spinner_task)
-                global_logger(old_logger)
+                response = HTTP.post(
+                    "http://127.0.0.1:$proxy_port/",
+                    ["Content-Type" => "application/json"],
+                    JSON.json(registration);
+                    readtimeout = 5,
+                    status_exception = false,
+                )
 
-                print("\r\033[K")  # Clear spinner line
-                printstyled("❌ Registration failed: ", color = :red, bold = true)
-                println(error_msg)
-                printstyled("💡 Tip: ", color = :yellow, bold = true)
-                println("Use a different julia_session_name or stop the existing session")
-                # Don't start heartbeat if registration failed
-                return nothing
-            else
-                # Try to parse error response for details
-                error_details = ""
-                try
-                    response_data = JSON.parse(String(response.body))
-                    if haskey(response_data, "error")
-                        error_details = get(response_data["error"], "message", "")
+                if response.status == 200
+                    if verbose
+                        printstyled(
+                            "📝 Registered with proxy as '$repl_id'\n",
+                            color = :green,
+                            bold = true,
+                        )
                     end
-                catch
-                    # If parsing fails, show raw body (truncated)
-                    body_str = String(response.body)
-                    error_details =
-                        length(body_str) > 200 ? body_str[1:200] * "..." : body_str
-                end
-
-                # Stop spinner before showing error
-                spinner_active[] = false
-                wait(spinner_task)
-                global_logger(old_logger)
-
-                # Show user-friendly error message
-                print("\r\033[K")  # Clear spinner line
-                printstyled("❌ Registration failed: ", color = :red, bold = true)
-                if !isempty(error_details)
-                    println(error_details)
-                else
-                    println("HTTP $(response.status)")
-                end
-
-                # Also log as warning for debugging
-                @warn "Failed to register with proxy" status = response.status error =
-                    error_details
-                return nothing
-            end
-
-            # Only start heartbeat if registration succeeded
-            if response.status == 200
-
-                # Start heartbeat task to keep proxy updated
-                @async begin
-                    @debug "Heartbeat task started" repl_id = repl_id proxy_port =
-                        proxy_port
-                    # Capture metadata in closure for heartbeat
-                    heartbeat_metadata = Dict(
-                        "workspace" => workspace_dir,
-                        "julia_session_name" => julia_session_name,
+                elseif response.status == 409
+                    # Duplicate registration - parse error message and show to user
+                    response_data = JSON.parse(String(response.body))
+                    error_msg = get(
+                        get(response_data, "error", Dict()),
+                        "message",
+                        "Session ID already in use",
                     )
-                    while SERVER[] !== nothing
-                        try
-                            sleep(5)  # Send heartbeat every 5 seconds
-                            @debug "Heartbeat check" server_active = (SERVER[] !== nothing) proxy_running =
-                                Proxy.is_server_running(proxy_port)
-                            if SERVER[] !== nothing && Proxy.is_server_running(proxy_port)
-                                heartbeat = Dict(
-                                    "jsonrpc" => "2.0",
-                                    "id" => rand(1:1000000),
-                                    "method" => "proxy/heartbeat",
-                                    "params" => Dict(
-                                        "uuid" => SERVER[].uuid,
-                                        "name" => repl_id,
-                                        "port" => actual_port,
-                                        "pid" => getpid(),
-                                        "metadata" => heartbeat_metadata,
-                                    ),
-                                )
-                                @debug "Sending heartbeat" repl_id = repl_id
-                                HTTP.post(
-                                    "http://127.0.0.1:$proxy_port/",
-                                    ["Content-Type" => "application/json"],
-                                    JSON.json(heartbeat);
-                                    readtimeout = 5,
-                                    connect_timeout = 2,
-                                )
-                                @debug "Heartbeat sent successfully" repl_id = repl_id
-                            else
-                                @warn "Heartbeat skipped" server_active =
+
+                    # Stop spinner before showing error
+                    spinner_active[] = false
+                    wait(spinner_task)
+                    global_logger(old_logger)
+
+                    print("\r\033[K")  # Clear spinner line
+                    printstyled("❌ Registration failed: ", color = :red, bold = true)
+                    println(error_msg)
+                    printstyled("💡 Tip: ", color = :yellow, bold = true)
+                    println(
+                        "Use a different julia_session_name or stop the existing session",
+                    )
+                    # Don't start heartbeat if registration failed
+                    return nothing
+                else
+                    # Try to parse error response for details
+                    error_details = ""
+                    try
+                        response_data = JSON.parse(String(response.body))
+                        if haskey(response_data, "error")
+                            error_details = get(response_data["error"], "message", "")
+                        end
+                    catch
+                        # If parsing fails, show raw body (truncated)
+                        body_str = String(response.body)
+                        error_details =
+                            length(body_str) > 200 ? body_str[1:200] * "..." : body_str
+                    end
+
+                    # Stop spinner before showing error
+                    spinner_active[] = false
+                    wait(spinner_task)
+                    global_logger(old_logger)
+
+                    # Show user-friendly error message
+                    print("\r\033[K")  # Clear spinner line
+                    printstyled("❌ Registration failed: ", color = :red, bold = true)
+                    if !isempty(error_details)
+                        println(error_details)
+                    else
+                        println("HTTP $(response.status)")
+                    end
+
+                    # Also log as warning for debugging
+                    @warn "Failed to register with proxy" status = response.status error =
+                        error_details
+                    return nothing
+                end
+
+                # Only start heartbeat if registration succeeded
+                if response.status == 200
+
+                    # Start heartbeat task to keep proxy updated
+                    @async begin
+                        @debug "Heartbeat task started" repl_id = repl_id proxy_port =
+                            proxy_port
+                        # Capture metadata in closure for heartbeat
+                        heartbeat_metadata = Dict(
+                            "workspace" => workspace_dir,
+                            "julia_session_name" => julia_session_name,
+                        )
+                        while SERVER[] !== nothing
+                            try
+                                sleep(5)  # Send heartbeat every 5 seconds
+                                @debug "Heartbeat check" server_active =
                                     (SERVER[] !== nothing) proxy_running =
                                     Proxy.is_server_running(proxy_port)
+                                if SERVER[] !== nothing &&
+                                   Proxy.is_server_running(proxy_port)
+                                    heartbeat = Dict(
+                                        "jsonrpc" => "2.0",
+                                        "id" => rand(1:1000000),
+                                        "method" => "proxy/heartbeat",
+                                        "params" => Dict(
+                                            "uuid" => SERVER[].uuid,
+                                            "name" => repl_id,
+                                            "port" => actual_port,
+                                            "pid" => getpid(),
+                                            "metadata" => heartbeat_metadata,
+                                        ),
+                                    )
+                                    @debug "Sending heartbeat" repl_id = repl_id
+                                    HTTP.post(
+                                        "http://127.0.0.1:$proxy_port/",
+                                        ["Content-Type" => "application/json"],
+                                        JSON.json(heartbeat);
+                                        readtimeout = 5,
+                                        connect_timeout = 2,
+                                    )
+                                    @debug "Heartbeat sent successfully" repl_id = repl_id
+                                else
+                                    @warn "Heartbeat skipped" server_active =
+                                        (SERVER[] !== nothing) proxy_running =
+                                        Proxy.is_server_running(proxy_port)
+                                end
+                            catch e
+                                # Ignore heartbeat errors, they're not critical
+                                @warn "Heartbeat failed" repl_id = repl_id exception = e
                             end
-                        catch e
-                            # Ignore heartbeat errors, they're not critical
-                            @warn "Heartbeat failed" repl_id = repl_id exception = e
                         end
+                        @info "Heartbeat task ended" repl_id = repl_id
                     end
-                    @info "Heartbeat task ended" repl_id = repl_id
-                end
-            end  # if response.status == 200
-        catch e
-            @warn "Failed to register with proxy" exception = e
-        end
-    end
+                end  # if response.status == 200
+            catch e
+                @warn "Failed to register with proxy" exception = e
+            end
+        end  # if server_ready
+    end  # if register_with_proxy
 
     # Stop the spinner and show completion
     spinner_active[] = false
