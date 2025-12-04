@@ -504,7 +504,9 @@ export async function fetchErrorHotspots(): Promise<ErrorHotspot[]> {
 }
 
 export async function runETL(): Promise<any> {
-    const response = await fetch(`${API_BASE}/analytics/run-etl`);
+    const response = await fetch(`${API_BASE}/analytics/run-etl`, {
+        method: 'POST'
+    });
     if (!response.ok) throw new Error('Failed to run ETL');
     return response.json();
 }

@@ -28,6 +28,7 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
     const [activeView, setActiveView] = useState<'overview' | 'tools' | 'errors' | 'executions'>('overview');
     const [selectedTool, setSelectedTool] = useState<string | null>(null);
     const [etlRunning, setEtlRunning] = useState(false);
+    const [etlMessage, setEtlMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
     const loadData = async () => {
         setLoading(true);
@@ -60,14 +61,19 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
 
     const handleRunETL = async () => {
         setEtlRunning(true);
+        setEtlMessage(null);
         try {
             const result = await runETL();
             console.log('ETL result:', result);
+            setEtlMessage({ type: 'success', text: 'ETL completed successfully!' });
             await loadData(); // Reload data after ETL
         } catch (error) {
             console.error('Failed to run ETL:', error);
+            setEtlMessage({ type: 'error', text: `ETL failed: ${error instanceof Error ? error.message : 'Unknown error'}` });
         } finally {
             setEtlRunning(false);
+            // Clear message after 5 seconds
+            setTimeout(() => setEtlMessage(null), 5000);
         }
     };
 
@@ -96,19 +102,26 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
                 <h2>📊 Analytics Dashboard</h2>
                 {sessionId && <div className="session-filter">Session: {sessionId}</div>}
                 {etlStatus && (
-                    <div className="etl-status">
-                        <span>Last ETL: {etlStatus.last_run_time ? formatTimestamp(etlStatus.last_run_time) : 'Never'}</span>
-                        <span className={`status-badge ${etlStatus.last_run_status}`}>
-                            {etlStatus.last_run_status || 'unknown'}
-                        </span>
-                        <button
-                            onClick={handleRunETL}
-                            disabled={etlRunning}
-                            className="run-etl-button"
-                        >
-                            {etlRunning ? '⏳ Running...' : '🔄 Run ETL Now'}
-                        </button>
-                    </div>
+                    <>
+                        <div className="etl-status">
+                            <span>Last ETL: {etlStatus.last_run_time ? formatTimestamp(etlStatus.last_run_time) : 'Never'}</span>
+                            <span className={`status-badge ${etlStatus.last_run_status}`}>
+                                {etlStatus.last_run_status || 'unknown'}
+                            </span>
+                            <button
+                                onClick={handleRunETL}
+                                disabled={etlRunning}
+                                className="run-etl-button"
+                            >
+                                {etlRunning ? '⏳ Running...' : '🔄 Run ETL Now'}
+                            </button>
+                        </div>
+                        {etlMessage && (
+                            <div className={`etl-message ${etlMessage.type}`}>
+                                {etlMessage.type === 'success' ? '✓' : '✗'} {etlMessage.text}
+                            </div>
+                        )}
+                    </>
                 )}
             </div>
 
@@ -155,7 +168,7 @@ export const Analytics: React.FC<AnalyticsProps> = ({ sessionId }) => {
                         <div className="metric-card">
                             <div className="metric-label">Total Errors</div>
                             <div className="metric-value error">
-                                {toolSummary.reduce((sum, t) => sum + t.total_errors, 0)}
+                                {errorHotspots.reduce((sum, e) => sum + e.error_count, 0)}
                             </div>
                         </div>
                         <div className="metric-card">

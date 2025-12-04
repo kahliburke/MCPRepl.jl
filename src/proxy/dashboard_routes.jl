@@ -505,15 +505,44 @@ end
 
 function handle_analytics_run_etl(http::HTTP.Stream)
     try
-        # Import ETL module and run transformation
-        include(joinpath(@__DIR__, "..", "database_etl.jl"))
-        DatabaseETL.run_etl_pipeline()
-        send_json_response(
-            http,
-            Dict("status" => "success", "message" => "ETL pipeline completed"),
-        )
+        db = Database.DB[]
+        if db === nothing
+            send_json_response(
+                http,
+                Dict("status" => "error", "message" => "Database not initialized");
+                status = 500,
+            )
+            return nothing
+        end
+
+        # Run ETL pipeline
+        result = Database.run_etl_pipeline(db; mode = :incremental)
+
+        if result.success
+            send_json_response(
+                http,
+                Dict(
+                    "status" => "success",
+                    "message" => "ETL pipeline completed",
+                    "tool_executions" => result.tool_executions,
+                    "errors" => result.errors,
+                    "client_sessions" => result.client_sessions,
+                    "metrics" => result.metrics,
+                    "duration_seconds" => result.duration_seconds,
+                ),
+            )
+        else
+            send_json_response(
+                http,
+                Dict(
+                    "status" => "error",
+                    "message" => get(result, :error, "Unknown error"),
+                );
+                status = 500,
+            )
+        end
     catch e
-        @error "ETL pipeline failed" exception = e
+        @error "ETL pipeline failed" exception = (e, catch_backtrace())
         send_json_response(
             http,
             Dict("status" => "error", "message" => string(e));
