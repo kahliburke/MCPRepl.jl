@@ -71,6 +71,22 @@ function start!(backend::MockBackend)
             JSON.json(response),
         )
     end
+
+    # Wait for server to be listening and responding to HTTP requests
+    for i = 1:20
+        try
+            test_response =
+                HTTP.get("http://127.0.0.1:$(backend.port)/"; status_exception = false)
+            # Server is responding (even if 404, it's listening)
+            break
+        catch e
+            if i == 20
+                error("Backend server failed to start on port $(backend.port): $e")
+            end
+            sleep(0.05)
+        end
+    end
+
     return backend
 end
 
@@ -110,7 +126,8 @@ end
             # Buffer a request BEFORE registration
             request = Dict("jsonrpc" => "2.0", "id" => 200, "method" => "test/method")
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(request, mock_http_stream())]
+                Proxy.PENDING_REQUESTS[uuid] =
+                    [(request, mock_http_stream(), Channel{Bool}(1))]
             end
 
             # Verify it's buffered
@@ -125,7 +142,7 @@ end
             @test success
 
             # Give async flush time to complete
-            sleep(0.5)
+            sleep(1.0)
 
             # Verify buffer was cleared
             buffered_after = lock(Proxy.PENDING_REQUESTS_LOCK) do
@@ -166,7 +183,8 @@ end
             # Buffer a request under old UUID
             request = Dict("jsonrpc" => "2.0", "id" => 300, "method" => "restart/test")
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[old_uuid] = [(request, mock_http_stream())]
+                Proxy.PENDING_REQUESTS[old_uuid] =
+                    [(request, mock_http_stream(), Channel{Bool}(1))]
             end
 
             # Register NEW session with same name (simulates restart)
@@ -210,7 +228,8 @@ end
             # Buffer a request BEFORE registration
             request = Dict("jsonrpc" => "2.0", "id" => 400, "method" => "error/test")
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(request, mock_http_stream())]
+                Proxy.PENDING_REQUESTS[uuid] =
+                    [(request, mock_http_stream(), Channel{Bool}(1))]
             end
 
             # Register session pointing to non-existent backend
@@ -335,8 +354,9 @@ end
             # Buffer a request
             request = Dict("jsonrpc" => "2.0", "id" => 500, "method" => "timeout/test")
             http_stream = mock_http_stream()
+            completion_channel = Channel{Bool}(1)
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(request, http_stream)]
+                Proxy.PENDING_REQUESTS[uuid] = [(request, http_stream, completion_channel)]
             end
 
             # Verify it's buffered
@@ -350,7 +370,8 @@ end
             @async Proxy.send_reconnection_updates(
                 uuid,
                 request,
-                http_stream;
+                http_stream,
+                completion_channel;
                 timeout_seconds = 2,
             )
 
@@ -386,15 +407,17 @@ end
             # Buffer a request
             request = Dict("jsonrpc" => "2.0", "id" => 600, "method" => "reconnect/test")
             http_stream = mock_http_stream()
+            completion_channel = Channel{Bool}(1)
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(request, http_stream)]
+                Proxy.PENDING_REQUESTS[uuid] = [(request, http_stream, completion_channel)]
             end
 
             # Start the wait task with a long timeout
             wait_task = @async Proxy.send_reconnection_updates(
                 uuid,
                 request,
-                http_stream;
+                http_stream,
+                completion_channel;
                 timeout_seconds = 10,
             )
 
@@ -433,7 +456,8 @@ end
             # Buffer a request under the SESSION NAME (not UUID) before registration
             request = Dict("jsonrpc" => "2.0", "id" => 700, "method" => "name/buffer/test")
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[session_name] = [(request, mock_http_stream())]
+                Proxy.PENDING_REQUESTS[session_name] =
+                    [(request, mock_http_stream(), Channel{Bool}(1))]
             end
 
             # Verify it's buffered under name
@@ -484,7 +508,8 @@ end
                 Dict("jsonrpc" => "2.0", "id" => 803, "method" => "multi/test3"),
             ]
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(r, mock_http_stream()) for r in requests]
+                Proxy.PENDING_REQUESTS[uuid] =
+                    [(r, mock_http_stream(), Channel{Bool}(1)) for r in requests]
             end
 
             # Verify all are buffered
@@ -572,7 +597,8 @@ end
                 Dict("jsonrpc" => "2.0", "id" => 1002, "method" => "error/test2"),
             ]
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(r, mock_http_stream()) for r in requests]
+                Proxy.PENDING_REQUESTS[uuid] =
+                    [(r, mock_http_stream(), Channel{Bool}(1)) for r in requests]
             end
 
             # Verify buffered
@@ -618,7 +644,8 @@ end
             request =
                 Dict("jsonrpc" => "2.0", "id" => 1100, "method" => "status/flush/test")
             lock(Proxy.PENDING_REQUESTS_LOCK) do
-                Proxy.PENDING_REQUESTS[uuid] = [(request, mock_http_stream())]
+                Proxy.PENDING_REQUESTS[uuid] =
+                    [(request, mock_http_stream(), Channel{Bool}(1))]
             end
 
             # Verify buffered

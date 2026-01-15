@@ -294,16 +294,16 @@ manage_repl_tool = @mcp_tool(
     """Manage the Julia REPL (restart or shutdown).
 
 **Commands:**
-- `restart`: Restart the Julia REPL (auto-restart will continue)
+- `restart`: Restart the Julia REPL - proxy will automatically spawn a new session with the same project
 - `shutdown`: Shutdown the Julia REPL and disable auto-restart
 
 **Restart Behavior:**
-After restart, the REPL will automatically restart again unless a shutdown was requested.
+The proxy will automatically spawn a new Julia session with the same project path and settings.
+Requests are buffered during restart and replayed when the new session is ready.
 Returns immediately, then server restarts (wait 5s, retry every 2s).
 
 **Shutdown Behavior:**
-Creates a flag file that prevents auto-restart, then triggers a clean shutdown.
-The REPL will exit and stay stopped until manually restarted.""",
+Marks the session as stopped. The session will NOT automatically restart.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -323,48 +323,43 @@ The REPL will exit and stay stopped until manually restarted.""",
                 return "Error: command parameter is required (must be 'restart' or 'shutdown')"
             end
 
-            # Get the current server port (before restart)
+            # Get the current server info
             server_port = SERVER[] !== nothing ? SERVER[].port : 3000
+            server_uuid = SERVER[] !== nothing ? SERVER[].uuid : nothing
 
             if command == "shutdown" || command == "restart"
-                if command == "shutdown"
-                    # Create the no-restart flag file
-                    mcprepl_dir = joinpath(pwd(), ".mcprepl")
-                    flag_file = joinpath(mcprepl_dir, ".no-restart")
-
-                    # Ensure .mcprepl directory exists
-                    if !isdir(mcprepl_dir)
-                        mkdir(mcprepl_dir)
-                    end
-
-                    # Create flag file
-                    touch(flag_file)
-                end
-
                 # Notify proxy of status change BEFORE exiting
                 # This allows requests to be properly buffered during restart
                 if SERVER[] !== nothing
                     proxy_port = get(ENV, "MCPREPL_PROXY_PORT", "3000")
                     new_status = command == "shutdown" ? "stopped" : "restarting"
+
+                    # For restart, tell proxy to spawn a new session after this one exits
                     try
+                        request_body = Dict(
+                            "jsonrpc" => "2.0",
+                            "id" => 999,
+                            "method" => "proxy/update_status",
+                            "params" => Dict(
+                                "uuid" => SERVER[].uuid,
+                                "status" => new_status,
+                            ),
+                        )
+
+                        # If restarting, add restart request
+                        if command == "restart"
+                            request_body["params"]["restart_requested"] = true
+                        end
+
                         HTTP.post(
                             "http://127.0.0.1:$(proxy_port)/",
                             ["Content-Type" => "application/json"],
-                            JSON.json(
-                                Dict(
-                                    "jsonrpc" => "2.0",
-                                    "id" => 999,
-                                    "method" => "proxy/update_status",
-                                    "params" => Dict(
-                                        "uuid" => SERVER[].uuid,
-                                        "status" => new_status,
-                                    ),
-                                ),
-                            );
+                            JSON.json(request_body);
                             connect_timeout = 2,
                             readtimeout = 2,
                         )
-                        @info "Notified proxy of $new_status status"
+                        @info "Notified proxy of $new_status status" restart =
+                            (command == "restart")
                     catch e
                         @debug "Failed to notify proxy of status change" exception = e
                     end
@@ -375,19 +370,19 @@ The REPL will exit and stay stopped until manually restarted.""",
                     sleep(0.5)
                     exit()
                 end
+
                 if command == "shutdown"
                     return """✓ Julia REPL shutdown initiated.
 
-🛑 Auto-restart has been disabled.
+🛑 The session will be marked as stopped.
 
 **What happens next:**
 1. The Julia REPL will exit cleanly
-2. The repl script will detect the shutdown flag and exit
-3. The REPL will NOT automatically restart
+2. The session will remain stopped until manually restarted
+3. Use the proxy's `start_julia_session` tool to start a new session
 
-**To restart manually:**
-Run the `./repl` script again from your terminal.
-Auto-restart will be re-enabled on the next start."""
+**To restart from terminal:**
+Run the `./repl` script again from your terminal."""
                 else
                     return """✓ Julia REPL restart initiated on port $server_port.
 
@@ -398,7 +393,8 @@ Auto-restart will be re-enabled on the next start."""
 2. Then retry every 2 seconds until connection is reestablished
 3. Typical restart time: 5-10 seconds (may be longer if packages need recompilation)
 
-The server will automatically restart and be ready when the Julia REPL finishes loading."""
+The proxy will automatically spawn a new Julia session with the same project.
+Buffered requests will be replayed when the new session is ready."""
                 end
             else
                 return "Error: Invalid command '$command'. Must be 'restart' or 'shutdown'"
@@ -1482,10 +1478,12 @@ Test results summary including:
                     include(joinpath("test", "$(project_name)Tests.jl"))
                     retest(Main.$(project_name)Tests, r"$pattern"; verbose=$verbose)
                     """
-                    cmd = `julia --project=$project_path --code-coverage=user -e $test_script`
+                    cmd =
+                        `julia --project=$project_path --code-coverage=user -e $test_script`
                 else
                     # Fall back to running runtests.jl directly
-                    cmd = `julia --project=$project_path --code-coverage=user test/runtests.jl`
+                    cmd =
+                        `julia --project=$project_path --code-coverage=user test/runtests.jl`
                 end
 
                 # Run the subprocess and capture output

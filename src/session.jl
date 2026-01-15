@@ -226,15 +226,36 @@ function initialize_session!(session::MCPSession, params::Dict)
         error("Missing required parameter: protocolVersion")
     end
 
-    # Validate protocol version (we support 2024-11-05 and 2025-06-18)
-    supported_versions = ["2024-11-05", "2025-06-18"]
-    if !(protocol_version in supported_versions)
+    # Validate protocol version (supported and future-friendly)
+    supported_versions = ["2024-11-05", "2025-06-18", "2025-11-25"]
+    fmt = Dates.DateFormat("yyyy-mm-dd")
+
+    # Helper to parse date strings safely
+    date_or_nothing(s) =
+        try
+            Dates.Date(s, fmt)
+        catch
+            nothing
+        end
+
+    parsed_supported = filter(!isnothing, date_or_nothing.(supported_versions))
+    max_supported_date = maximum(parsed_supported)
+
+    parsed_requested = date_or_nothing(String(protocol_version))
+
+    if protocol_version in supported_versions
+        supported_version = protocol_version
+    elseif parsed_requested !== nothing && parsed_requested > max_supported_date
+        # Optimistically accept newer client versions but reply with our latest supported
+        supported_version = Dates.format(max_supported_date, fmt)
+        @warn "Client requested newer protocol version; using latest supported" requested =
+            protocol_version supported = supported_version
+    else
         session.state = UNINITIALIZED
         error(
             "Unsupported protocol version: $protocol_version. Server supports: $(join(supported_versions, ", "))",
         )
     end
-    supported_version = protocol_version  # Use the client's requested version
 
     # Store client capabilities
     session.client_capabilities = get(params, "capabilities", Dict{String,Any}())

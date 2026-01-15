@@ -25,5 +25,6 @@ include("qdrant_indexer_tests.jl")
 include("session_status_tests.jl")
 include("request_buffering_tests.jl")
 include("request_buffering_integration_tests.jl")
+include("resources_prompts_tests.jl")
 
 end # module

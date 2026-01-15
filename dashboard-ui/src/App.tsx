@@ -53,6 +53,26 @@ export const App: React.FC = () => {
     const [activeProgress, setActiveProgress] = useState<Record<string, { token: string, progress: number, total?: number, message: string }>>({});
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+    // Normalize event payloads so the UI never sees undefined/null data
+    const normalizeEvent = React.useCallback((evt: SessionEvent): SessionEvent => {
+        const raw = evt?.data;
+        let data: any = {};
+
+        if (raw === null || raw === undefined) {
+            data = {};
+        } else if (typeof raw === 'string') {
+            try {
+                data = JSON.parse(raw);
+            } catch {
+                data = { value: raw };
+            }
+        } else {
+            data = raw;
+        }
+
+        return { ...evt, data };
+    }, []);
+
     useEffect(() => {
         if (autoRefreshLogs && activeTab === 'logs' && logSessionId) {
             const interval = setInterval(() => {
@@ -112,7 +132,7 @@ export const App: React.FC = () => {
                     fetchEvents(undefined, 1000)
                 ]);
                 setSessions(sessionsData);
-                setEvents(eventsData);
+                setEvents(eventsData.map(normalizeEvent));
 
                 // Fetch proxy info
                 const proxyInfoRes = await fetch('/dashboard/api/proxy-info');
@@ -150,9 +170,10 @@ export const App: React.FC = () => {
 
         // Subscribe to event stream
         const unsubscribe = subscribeToEvents((newEvent) => {
+            const normalized = normalizeEvent(newEvent);
             // Handle progress events separately
-            if (newEvent.type === 'PROGRESS' && newEvent.data.notification?.params) {
-                const params = newEvent.data.notification.params;
+            if (normalized.type === 'PROGRESS' && normalized.data.notification?.params) {
+                const params = normalized.data.notification.params;
                 const token = params.progressToken;
                 const progress = params.progress;
                 const total = params.total;
@@ -177,14 +198,14 @@ export const App: React.FC = () => {
             setEvents(prev => {
                 // Check if event already exists
                 const exists = prev.some(e =>
-                    e.timestamp === newEvent.timestamp &&
-                    e.id === newEvent.id &&
-                    e.type === newEvent.type
+                    e.timestamp === normalized.timestamp &&
+                    e.id === normalized.id &&
+                    e.type === normalized.type
                 );
                 if (exists) return prev;
 
                 // Add new event and keep last 1000
-                return [...prev, newEvent].slice(-1000);
+                return [...prev, normalized].slice(-1000);
             });
         });
 

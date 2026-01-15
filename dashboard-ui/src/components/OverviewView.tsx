@@ -31,7 +31,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <div className="metrics-grid">
                 <MetricCard
                     icon="👥"
-                    label="Total Sessions"
+                    label="Total Sessions Running"
                     value={sessionCount}
                 />
                 <MetricCard

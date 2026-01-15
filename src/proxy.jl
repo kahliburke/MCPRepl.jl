@@ -57,7 +57,7 @@ CLIENT_CONNECTIONS_LOCK = ReentrantLock()
 # (pending HTTP streams) is kept in memory in session_registry.jl
 function __init__()
     # Re-initialize pending requests buffer (defined in session_registry.jl)
-    global PENDING_REQUESTS = Dict{String,Vector{Tuple{Dict,HTTP.Stream}}}()
+    global PENDING_REQUESTS = Dict{String,Vector{Tuple{Dict,HTTP.Stream,Channel{Bool}}}}()
     global PENDING_REQUESTS_LOCK = ReentrantLock()
     # Initialize client connections
     global CLIENT_CONNECTIONS = Dict{String,Channel{Dict}}()
@@ -365,7 +365,7 @@ function route_to_session_streaming(
 
     elseif session_status in ("down", "restarting", "unknown")
         # Buffer the request for replay when session reconnects
-        buffer_request!(target_id, request, http)
+        completion_channel = buffer_request!(target_id, request, http)
 
         # Mark as restarting if not already
         if session_status in ("down", "unknown")
@@ -374,21 +374,33 @@ function route_to_session_streaming(
                 target_id status = session_status
         end
 
-        # Block until session reconnects or timeout expires
+        # Block until session reconnects and request is replayed, or timeout expires
         # The request is buffered; flush_pending_requests will replay it when session reconnects
-        send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+        send_reconnection_updates(
+            target_id,
+            request,
+            http,
+            completion_channel;
+            timeout_seconds = 60,
+        )
         return nothing
 
     elseif session_status != "ready"
         # For any other non-ready status, also buffer instead of erroring
         # This is more resilient to temporary issues
-        buffer_request!(target_id, request, http)
+        completion_channel = buffer_request!(target_id, request, http)
         update_julia_session_status(target_id, "restarting")
         @info "Julia session in unexpected state, buffering request" id = target_id status =
             session_status
 
-        # Block until session reconnects or timeout expires
-        send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+        # Block until session reconnects and request is replayed, or timeout expires
+        send_reconnection_updates(
+            target_id,
+            request,
+            http,
+            completion_channel;
+            timeout_seconds = 60,
+        )
         return nothing
     end
 
@@ -565,7 +577,7 @@ function route_to_session_streaming(
             # Buffer the request for replay when session reconnects
             # Use the actual UUID (current_session.id) not the target_id which might be a name
             session_uuid = current_session.id
-            buffer_request!(session_uuid, request, http)
+            completion_channel = buffer_request!(session_uuid, request, http)
 
             # Mark as down/restarting
             if current_status == "ready"
@@ -593,14 +605,20 @@ function route_to_session_streaming(
                 ),
             )
 
-            # Block until session reconnects or timeout expires
+            # Block until session reconnects and request is replayed, or timeout expires
             # Response will be written by flush_pending_requests or timeout error
-            send_reconnection_updates(session_uuid, request, http; timeout_seconds = 60)
+            send_reconnection_updates(
+                session_uuid,
+                request,
+                http,
+                completion_channel;
+                timeout_seconds = 60,
+            )
             return nothing
         else
             # Session not in database - buffer anyway in case it restarts with same UUID
             # This handles race conditions during restart
-            buffer_request!(target_id, request, http)
+            completion_channel = buffer_request!(target_id, request, http)
 
             @info "Julia session not found in database, buffering request optimistically" id =
                 target_id
@@ -616,8 +634,14 @@ function route_to_session_streaming(
                 ),
             )
 
-            # Block until session reconnects or timeout expires
-            send_reconnection_updates(target_id, request, http; timeout_seconds = 60)
+            # Block until session reconnects and request is replayed, or timeout expires
+            send_reconnection_updates(
+                target_id,
+                request,
+                http,
+                completion_channel;
+                timeout_seconds = 60,
+            )
             return nothing
         end
     end
@@ -1060,6 +1084,7 @@ function handle_request(http::HTTP.Stream)
             params = get(request, "params", Dict())
             uuid = get(params, "uuid", nothing)
             new_status = get(params, "status", nothing)
+            restart_requested = get(params, "restart_requested", false)
 
             if uuid === nothing || new_status === nothing
                 send_jsonrpc_error(
@@ -1090,8 +1115,102 @@ function handle_request(http::HTTP.Stream)
             # Update the session status
             existing_session = get_julia_session(uuid)
             if existing_session !== nothing
+                old_status =
+                    ismissing(existing_session.status) ? "unknown" : existing_session.status
+
                 update_julia_session_status(uuid, new_status)
-                @info "Julia session status updated" uuid = uuid status = new_status
+                @info "Julia session status updated" uuid = uuid status = new_status restart =
+                    restart_requested
+
+                # Persist event so the dashboard/history shows the restart/shutdown request instead of an empty payload
+                log_db_event(
+                    "julia_session.status_updated",
+                    Dict(
+                        "from_status" => old_status,
+                        "to_status" => new_status,
+                        "restart_requested" => restart_requested,
+                    );
+                    julia_session_id = uuid,
+                )
+
+                # If restart was requested, spawn a new session after a delay
+                if restart_requested && new_status == "restarting"
+                    @async begin
+                        # Wait for old session to fully exit
+                        sleep(2.0)
+
+                        # Get session metadata to extract project path
+                        session = get_julia_session(uuid)
+                        if session !== nothing
+                            metadata_str = session.metadata
+                            if !ismissing(metadata_str) && metadata_str !== nothing
+                                try
+                                    metadata = JSON.parse(metadata_str)
+                                    project_path = get(metadata, "workspace", nothing)
+                                    session_name = session.name
+
+                                    if project_path !== nothing && !isempty(project_path)
+                                        @info "Auto-restarting Julia session" name =
+                                            session_name project = project_path
+
+                                        # Use the same startup logic as start_julia_session tool
+                                        session_uuid = string(uuid4())
+                                        log_dir = joinpath(dirname(@__DIR__), "logs")
+                                        if !isdir(log_dir)
+                                            mkpath(log_dir)
+                                        end
+                                        log_file =
+                                            joinpath(log_dir, "session_$(session_uuid).log")
+
+                                        # Startup code to register with proxy
+                                        proxy_port =
+                                            string(get(ENV, "MCPREPL_PROXY_PORT", "3000"))
+                                        startup_code = """
+                                        ENV["MCPREPL_PROXY_PORT"] = "$proxy_port"
+                                        ENV["MCPREPL_SESSION"] = "$session_name"
+                                        ENV["MCPREPL_SESSION_UUID"] = "$session_uuid"
+                                        using MCPRepl
+                                        MCPRepl.start!(; julia_session_name="$session_name")
+                                        """
+
+                                        julia_cmd =
+                                            `julia --project=$project_path -e $startup_code`
+
+                                        # Add environment variables
+                                        env = copy(ENV)
+                                        env["MCPREPL_SESSION"] = session_name
+                                        env["MCPREPL_SESSION_UUID"] = session_uuid
+                                        env["MCPREPL_PROXY_PORT"] = proxy_port
+
+                                        # Spawn the process
+                                        proc = run(
+                                            pipeline(
+                                                setenv(julia_cmd, env),
+                                                stdout = log_file,
+                                                stderr = log_file,
+                                            ),
+                                            wait = false,
+                                        )
+
+                                        @info "Spawned new Julia session" name =
+                                            session_name uuid = session_uuid pid =
+                                            getpid(proc) log = log_file
+                                    else
+                                        @warn "Cannot auto-restart: no project path in metadata" uuid =
+                                            uuid
+                                    end
+                                catch e
+                                    @error "Error parsing metadata for restart" uuid = uuid exception =
+                                        (e, catch_backtrace())
+                                end
+                            else
+                                @warn "Cannot auto-restart: no metadata found" uuid = uuid
+                            end
+                        else
+                            @warn "Cannot auto-restart: session not found" uuid = uuid
+                        end
+                    end
+                end
 
                 send_jsonrpc_result(
                     http,
@@ -1100,6 +1219,16 @@ function handle_request(http::HTTP.Stream)
                     session_id = log_session_id,
                 )
             else
+                log_db_event(
+                    "julia_session.status_update_failed",
+                    Dict(
+                        "uuid" => uuid,
+                        "requested_status" => new_status,
+                        "restart_requested" => restart_requested,
+                        "reason" => "session_not_found",
+                    );
+                    julia_session_id = uuid,
+                )
                 send_jsonrpc_error(
                     http,
                     get(request, "id", nothing),
@@ -1422,11 +1551,36 @@ function handle_request(http::HTTP.Stream)
             end
 
             # Check for X-MCPRepl-Target header (allows specifying target in MCP config)
+            # When this header is present, make the proxy transparent (hide proxy tools)
             target_header = HTTP.header(req, "X-MCPRepl-Target")
+            transparent_mode = false
             if !isempty(target_header)
-                target_julia_session_id = String(target_header)
-                @debug "tools/list target from X-MCPRepl-Target header" target_julia_session_id =
-                    target_julia_session_id
+                header_target = String(target_header)
+                transparent_mode = true  # Proxy will be transparent when header is present
+
+                # Try to resolve the header value as either a name or UUID
+                # First check if it matches a session by name
+                sessions_by_name = Database.get_julia_sessions_by_name(header_target)
+                if !isempty(sessions_by_name)
+                    # Use the most recent ready session with this name
+                    ready_sessions = filter(s -> s.status == "ready", sessions_by_name)
+                    if !isempty(ready_sessions)
+                        target_julia_session_id = ready_sessions[1].id
+                        @debug "tools/list target resolved from name in X-MCPRepl-Target header (transparent mode)" name =
+                            header_target target_julia_session_id = target_julia_session_id
+                    else
+                        # No ready session, try first session regardless of status
+                        target_julia_session_id = sessions_by_name[1].id
+                        @debug "tools/list target resolved from name (not ready) in X-MCPRepl-Target header (transparent mode)" name =
+                            header_target target_julia_session_id = target_julia_session_id status =
+                            sessions_by_name[1].status
+                    end
+                else
+                    # Assume it's a UUID
+                    target_julia_session_id = header_target
+                    @debug "tools/list target from X-MCPRepl-Target header (UUID, transparent mode)" target_julia_session_id =
+                        target_julia_session_id
+                end
             end
 
             # Check for per-request target override in params (highest priority)
@@ -1476,10 +1630,30 @@ function handle_request(http::HTTP.Stream)
                 end
             end
 
-            # Fetch tools from the target Julia session and combine with proxy tools
+            # Fetch tools from the target Julia session
+            # In transparent mode (when X-MCPRepl-Target header is present), hide proxy tools
             session = get_julia_session(target_julia_session_id)
-            all_tools = copy(proxy_tools)
+            all_tools = transparent_mode ? [] : copy(proxy_tools)
 
+            # Try to get cached tools from metadata first
+            cached_tools = nothing
+            if session !== nothing &&
+               !ismissing(session.metadata) &&
+               session.metadata !== nothing
+                try
+                    metadata = JSON.parse(session.metadata)
+                    if haskey(metadata, "cached_tools") &&
+                       metadata["cached_tools"] isa Array
+                        cached_tools = metadata["cached_tools"]
+                        @debug "Found cached tools in metadata" session_id =
+                            target_julia_session_id num_tools = length(cached_tools)
+                    end
+                catch e
+                    @debug "Failed to parse metadata for cached tools" exception = e
+                end
+            end
+
+            # Try to fetch fresh tools if session is ready
             if session !== nothing &&
                session.status == "ready" &&
                !ismissing(session.port) &&
@@ -1507,19 +1681,67 @@ function handle_request(http::HTTP.Stream)
                            haskey(backend_data["result"], "tools")
                             backend_tools = backend_data["result"]["tools"]
                             append!(all_tools, backend_tools)
+
+                            # Update cached tools in metadata
+                            try
+                                db = Database.DB[]
+                                if db !== nothing
+                                    # Parse existing metadata or create new
+                                    existing_metadata =
+                                        if !ismissing(session.metadata) &&
+                                           session.metadata !== nothing
+                                            JSON.parse(session.metadata)
+                                        else
+                                            Dict{String,Any}()
+                                        end
+
+                                    # Update cached_tools field
+                                    existing_metadata["cached_tools"] = backend_tools
+                                    updated_metadata = JSON.json(existing_metadata)
+
+                                    # Save to database
+                                    DBInterface.execute(
+                                        db,
+                                        "UPDATE julia_sessions SET metadata = ? WHERE id = ?",
+                                        (updated_metadata, target_julia_session_id),
+                                    )
+                                    @debug "Updated cached tools in metadata" session_id =
+                                        target_julia_session_id num_tools =
+                                        length(backend_tools)
+                                end
+                            catch e
+                                @warn "Failed to cache tools in metadata" exception = e
+                            end
+
                             @debug "tools/list - combined tools" target_julia_session_id =
                                 target_julia_session_id proxy_tools = length(proxy_tools) backend_tools =
                                 length(backend_tools) total = length(all_tools)
                         end
                     end
                 catch e
-                    @warn "Failed to fetch tools from target Julia session, returning proxy tools only" julia_session_id =
+                    @warn "Failed to fetch tools from target Julia session" julia_session_id =
                         target_julia_session_id exception = e
+
+                    # Fall back to cached tools if available
+                    if cached_tools !== nothing
+                        append!(all_tools, cached_tools)
+                        @info "Using cached tools from metadata" session_id =
+                            target_julia_session_id num_tools = length(cached_tools)
+                    end
                 end
             else
-                @debug "Target Julia session not ready, returning proxy tools only" target_julia_session_id =
-                    target_julia_session_id status =
-                    session !== nothing ? session.status : :not_found
+                # Session not ready - use cached tools if available
+                if cached_tools !== nothing
+                    append!(all_tools, cached_tools)
+                    @info "Session not ready, using cached tools" target_julia_session_id =
+                        target_julia_session_id status =
+                        session !== nothing ? session.status : :not_found num_cached_tools =
+                        length(cached_tools)
+                else
+                    @debug "Target Julia session not ready and no cached tools" target_julia_session_id =
+                        target_julia_session_id status =
+                        session !== nothing ? session.status : :not_found
+                end
             end
 
             # Return combined tools from proxy + target Julia session
@@ -1545,6 +1767,15 @@ function handle_request(http::HTTP.Stream)
                 http,
                 get(request, "id", nothing),
                 Dict("resources" => []);
+                session_id = log_session_id,
+            )
+            return nothing
+        elseif method == "resources/templates/list"
+            # Return empty resource templates list (proxy doesn't provide resource templates)
+            send_jsonrpc_result(
+                http,
+                get(request, "id", nothing),
+                Dict("resourceTemplates" => []);
                 session_id = log_session_id,
             )
             return nothing
@@ -1915,7 +2146,7 @@ function handle_request(http::HTTP.Stream)
                             log_contents = read(log_file, String)
                             # Get last 500 characters
                             if length(log_contents) > 500
-                                log_contents = "..." * log_contents[end-500:end]
+                                log_contents = "..." * log_contents[(end-500):end]
                             end
                         end
                     catch

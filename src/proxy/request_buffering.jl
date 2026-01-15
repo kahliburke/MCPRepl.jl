@@ -8,53 +8,47 @@ triggering the reconnection flow. No active polling is needed.
 """
 
 """
-    send_reconnection_updates(target_id::String, request::Dict, http::HTTP.Stream; timeout_seconds::Int=30)
+    send_reconnection_updates(target_id::String, request::Dict, http::HTTP.Stream, completion_channel::Channel{Bool}; timeout_seconds::Int=30)
 
-Wait for session reconnection with a timeout. If session doesn't reconnect within timeout,
-send an error response to the client.
+Wait for session reconnection and request replay completion. Blocks until the buffered request
+is successfully replayed or timeout expires. This keeps the HTTP stream open for the response.
 
-The request is already buffered when this function is called. If the session reconnects,
-flush_pending_requests() will replay the request. If timeout expires, we send an error.
+The request is already buffered when this function is called. This function waits for the
+completion_channel to be signaled by flush_pending_requests after writing the response.
 """
 function send_reconnection_updates(
     target_id::String,
     request::Dict,
-    http::HTTP.Stream;
+    http::HTTP.Stream,
+    completion_channel::Channel{Bool};
     timeout_seconds::Int = 30,
 )
     request_id = get(request, "id", nothing)
-    @info "Request buffered, waiting for reconnection" target_id = target_id request_id =
+    @info "Request buffered, waiting for replay completion" target_id = target_id request_id =
         request_id timeout = timeout_seconds
 
-    # Wait for reconnection with timeout, checking status periodically
+    # Wait for completion channel to be signaled or timeout
     start_time = time()
     while (time() - start_time) < timeout_seconds
-        # Check if session has reconnected
-        session = get_julia_session(target_id)
-        if session !== nothing && session.status == "ready"
-            # Session is back - the buffered request will be replayed by flush_pending_requests
-            @debug "Session reconnected, request will be replayed" target_id = target_id request_id =
-                request_id
-            return
-        end
-
-        # Check if request was already handled (removed from buffer)
-        still_buffered = lock(PENDING_REQUESTS_LOCK) do
-            if haskey(PENDING_REQUESTS, target_id)
-                any(r -> get(r[1], "id", nothing) == request_id, PENDING_REQUESTS[target_id])
-            else
+        # Check if completion signal is ready (non-blocking)
+        if isready(completion_channel)
+            success = try
+                take!(completion_channel)
+            catch
                 false
             end
-        end
 
-        if !still_buffered
-            # Request was already handled by flush_pending_requests
-            @debug "Buffered request was handled" target_id = target_id request_id =
-                request_id
+            if success
+                @info "Buffered request completed successfully" target_id = target_id request_id =
+                    request_id
+            else
+                @warn "Buffered request failed during replay" target_id = target_id request_id =
+                    request_id
+            end
             return
         end
 
-        sleep(1)
+        sleep(0.1)  # Check frequently for completion
     end
 
     # Timeout expired - remove this specific request from buffer and send error
@@ -69,6 +63,12 @@ function send_reconnection_updates(
                 PENDING_REQUESTS[target_id],
             )
         end
+    end
+
+    # Close completion channel
+    try
+        close(completion_channel)
+    catch
     end
 
     # Send error response
@@ -97,14 +97,14 @@ function flush_pending_requests_with_error(target_id::String, error_message::Str
             delete!(PENDING_REQUESTS, target_id)
             reqs
         else
-            Tuple{Dict,HTTP.Stream}[]
+            Tuple{Dict,HTTP.Stream,Channel{Bool}}[]
         end
     end
 
     @info "Failing all pending requests with error" target_id = target_id count =
         length(pending) error = error_message
 
-    for (request, http) in pending
+    for (request, http, completion_channel) in pending
         try
             send_jsonrpc_error(
                 http,
@@ -115,6 +115,13 @@ function flush_pending_requests_with_error(target_id::String, error_message::Str
             )
         catch e
             @error "Failed to send error response for buffered request" exception = e
+        end
+
+        # Signal completion and close channel
+        try
+            put!(completion_channel, false)
+            close(completion_channel)
+        catch
         end
     end
 end

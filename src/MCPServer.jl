@@ -524,6 +524,48 @@ function create_handler(
                 )
             end
 
+            # Handle resources/list request
+            if request["method"] == "resources/list"
+                response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request["id"],
+                    "result" => Dict("resources" => []),
+                )
+                return HTTP.Response(
+                    200,
+                    ["Content-Type" => "application/json"],
+                    JSON.json(response),
+                )
+            end
+
+            # Handle resources/templates/list request
+            if request["method"] == "resources/templates/list"
+                response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request["id"],
+                    "result" => Dict("resourceTemplates" => []),
+                )
+                return HTTP.Response(
+                    200,
+                    ["Content-Type" => "application/json"],
+                    JSON.json(response),
+                )
+            end
+
+            # Handle prompts/list request
+            if request["method"] == "prompts/list"
+                response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request["id"],
+                    "result" => Dict("prompts" => []),
+                )
+                return HTTP.Response(
+                    200,
+                    ["Content-Type" => "application/json"],
+                    JSON.json(response),
+                )
+            end
+
             # Handle tool calls
             if request["method"] == "tools/call"
                 tool_name_str = request["params"]["name"]
@@ -910,14 +952,38 @@ function start_mcp_server(
             for (name, value) in response.headers
                 HTTP.setheader(http, name => value)
             end
-            HTTP.startwrite(http)
-            write(http, response.body)
+            try
+                HTTP.startwrite(http)
+                write(http, response.body)
+            catch e
+                # Handle broken pipe errors gracefully (client disconnected)
+                if e isa Base.IOError &&
+                   (e.code == Base.UV_EPIPE || occursin("EPIPE", string(e)))
+                    @debug "Client disconnected before response could be sent" exception = e
+                else
+                    rethrow()
+                end
+            end
             return nothing
 
         catch e
-            HTTP.setstatus(http, 500)
-            HTTP.setheader(http, "Content-Type" => "application/json")
-            HTTP.startwrite(http)
+            try
+                HTTP.setstatus(http, 500)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.startwrite(http)
+            catch write_error
+                # Handle broken pipe in error response
+                if write_error isa Base.IOError && (
+                    write_error.code == Base.UV_EPIPE ||
+                    occursin("EPIPE", string(write_error))
+                )
+                    @debug "Client disconnected before error response could be sent" exception =
+                        write_error
+                    return nothing
+                else
+                    rethrow()
+                end
+            end
 
             request_id = try
                 parsed = JSON.parse(body; dicttype = Dict{String,Any})

@@ -5,4 +5,8 @@ include("MCPReplTests.jl")
 using .MCPReplTests
 
 # Run all tests with ReTest
-retest()
+if isempty(ARGS)
+    retest()
+else
+    retest(ARGS[1])
+end

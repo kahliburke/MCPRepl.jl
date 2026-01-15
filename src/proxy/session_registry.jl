@@ -14,7 +14,8 @@ All session metadata is stored in and retrieved from the database.
 
 # Pending requests buffer - maps session UUID to buffered requests with HTTP streams
 # This is the ONLY in-memory state; everything else comes from the database
-PENDING_REQUESTS = Dict{String,Vector{Tuple{Dict,HTTP.Stream}}}()
+# Tuple: (request_dict, http_stream, completion_channel)
+PENDING_REQUESTS = Dict{String,Vector{Tuple{Dict,HTTP.Stream,Channel{Bool}}}}()
 PENDING_REQUESTS_LOCK = ReentrantLock()
 
 # ============================================================================
@@ -132,7 +133,7 @@ function register_julia_session(
     # Get pending requests from buffer
     pending_requests = lock(PENDING_REQUESTS_LOCK) do
         # Check for pending requests under this UUID, old UUIDs, or the session name
-        all_pending = Tuple{Dict,HTTP.Stream}[]
+        all_pending = Tuple{Dict,HTTP.Stream,Channel{Bool}}[]
         if haskey(PENDING_REQUESTS, uuid)
             append!(all_pending, PENDING_REQUESTS[uuid])
             delete!(PENDING_REQUESTS, uuid)
@@ -242,14 +243,14 @@ function list_julia_sessions()
         return NamedTuple[]
     end
 
-    # Include sessions that are potentially recoverable (ready, down, restarting)
-    # but exclude terminal states (stopped, replaced) which won't come back
+    # Include sessions that are potentially recoverable (ready, restarting, active)
+    # but exclude terminal states (stopped, replaced, down) which won't come back
     result = DBInterface.execute(
         db,
         """
         SELECT id, name, port, pid, start_time, last_activity, status, metadata
         FROM julia_sessions
-        WHERE status IN ('active', 'ready', 'down', 'restarting')
+        WHERE status IN ('ready', 'restarting')
         ORDER BY start_time DESC
         """,
     )
@@ -315,7 +316,7 @@ function update_julia_session_status(
                 delete!(PENDING_REQUESTS, uuid)
                 reqs
             else
-                Tuple{Dict,HTTP.Stream}[]
+                Tuple{Dict,HTTP.Stream,Channel{Bool}}[]
             end
         end
 
@@ -446,35 +447,46 @@ end
 # ============================================================================
 
 """
-    buffer_request!(uuid::String, request::Dict, http::HTTP.Stream)
+    buffer_request!(uuid::String, request::Dict, http::HTTP.Stream) -> Channel{Bool}
 
 Buffer a request for a Julia session that is unavailable.
 The request will be replayed when the session reconnects.
+Returns a completion channel that will be signaled when replay finishes.
 """
 function buffer_request!(uuid::String, request::Dict, http::HTTP.Stream)
+    completion_channel = Channel{Bool}(1)
     lock(PENDING_REQUESTS_LOCK) do
         if !haskey(PENDING_REQUESTS, uuid)
-            PENDING_REQUESTS[uuid] = Tuple{Dict,HTTP.Stream}[]
+            PENDING_REQUESTS[uuid] = Tuple{Dict,HTTP.Stream,Channel{Bool}}[]
         end
-        push!(PENDING_REQUESTS[uuid], (request, http))
+        push!(PENDING_REQUESTS[uuid], (request, http, completion_channel))
     end
     @info "Buffered request for reconnection" uuid = uuid request_id =
         get(request, "id", nothing)
+    return completion_channel
 end
 
 """
-    flush_pending_requests(uuid::String, pending_requests::Vector{Tuple{Dict,HTTP.Stream}})
+    flush_pending_requests(uuid::String, pending_requests::Vector{Tuple{Dict,HTTP.Stream,Channel{Bool}}})
 
 Forward all buffered requests to the Julia session after it reconnects.
 Each request is forwarded with its stored HTTP stream so the response can be sent back.
+Signals completion channels when done.
 """
 function flush_pending_requests(
     uuid::String,
-    pending_requests::Vector{Tuple{Dict,HTTP.Stream}},
+    pending_requests::Vector{Tuple{Dict,HTTP.Stream,Channel{Bool}}},
 )
     session = get_julia_session(uuid)
     if session === nothing || session.status != "ready"
         @warn "Cannot flush pending requests: session not ready" uuid = uuid
+        # Signal all completion channels with failure
+        for (_, _, completion_channel) in pending_requests
+            try
+                put!(completion_channel, false)
+            catch
+            end
+        end
         return
     end
 
@@ -482,7 +494,7 @@ function flush_pending_requests(
         length(pending_requests)
 
     # Forward each buffered request to the backend
-    for (request, http) in pending_requests
+    for (request, http, completion_channel) in pending_requests
         @async try
             backend_url = "http://127.0.0.1:$(session.port)/"
             body_str = JSON.json(request)
@@ -538,6 +550,12 @@ function flush_pending_requests(
 
             @debug "Buffered request flushed successfully" request_id =
                 get(request, "id", nothing)
+
+            # Signal completion
+            try
+                put!(completion_channel, true)
+            catch
+            end
         catch e
             @error "Error flushing buffered request" request_id =
                 get(request, "id", nothing) exception = e
@@ -552,6 +570,12 @@ function flush_pending_requests(
                 )
             catch err
                 @error "Failed to send error response for buffered request" exception = err
+            end
+
+            # Signal completion with failure
+            try
+                put!(completion_channel, false)
+            catch
             end
         end
     end
