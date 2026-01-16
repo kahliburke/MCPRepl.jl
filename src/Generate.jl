@@ -354,7 +354,7 @@ function create_tools_config(project_path::String)
                 "tools" => ["execute_vscode_command", "list_vscode_commands"],
             ),
             "education" => Dict(
-                "enabled" => false,
+                "enabled" => true,
                 "description" => "Learning and quiz tools",
                 "tokens" => "~1,000",
                 "tools" => ["usage_quiz"],
