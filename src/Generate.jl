@@ -303,22 +303,20 @@ function create_tools_config(project_path::String)
                 "tools" => ["macro_expand", "code_lowered", "code_typed", "profile_code"],
             ),
             "code-quality" => Dict(
-                "enabled" => true,
+                "enabled" => false,
                 "description" => "Code formatting and linting",
                 "tokens" => "~100",
                 "tools" => ["format_code", "lint_package"],
             ),
             "lsp" => Dict(
-                "enabled" => false,
-                "description" => "Language Server Protocol integrations",
+                "enabled" => true,
+                "description" => "Language Server Protocol integrations (best-of navigation)",
                 "tokens" => "~400",
                 "tools" => [
                     "lsp_document_symbols",
                     "lsp_workspace_symbols",
                     "lsp_goto_definition",
                     "lsp_find_references",
-                    "lsp_code_actions",
-                    "lsp_rename",
                 ],
             ),
             "debugging" => Dict(
@@ -356,7 +354,7 @@ function create_tools_config(project_path::String)
                 "tools" => ["execute_vscode_command", "list_vscode_commands"],
             ),
             "education" => Dict(
-                "enabled" => true,
+                "enabled" => false,
                 "description" => "Learning and quiz tools",
                 "tokens" => "~1,000",
                 "tools" => ["usage_quiz"],

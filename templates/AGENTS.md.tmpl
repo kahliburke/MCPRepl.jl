@@ -19,46 +19,55 @@ MCPRepl provides these MCP tools:
 
 ### Core Tools
 
-- **`exec_repl`** - Execute Julia code in the shared REPL
+- **`ex`** - Execute Julia code in the shared REPL (primary tool)
 - **`usage_instructions`** - Get detailed workflow guidelines (READ THIS FIRST!)
 - **`investigate_environment`** - Inspect project setup, packages, and dev dependencies
+- **`tool_help`** - Get help for any tool
+- **`manage_repl`** - Restart or shutdown the REPL
+- **`ping`** - Check server health
 
-### Development Tools
+### Code Analysis
 
 - **`search_methods`** - Find all methods of a function
 - **`type_info`** - Get type hierarchy and field information
-- **`macro_expand`** - Expand macros to see generated code
 - **`list_names`** - List exported names in a module
-- **`profile_code`** - Profile code for performance bottlenecks
 
-### Code Quality (Optional)
+### Package Management
 
-- **`format_code`** - Format Julia code (requires JuliaFormatter.jl)
-- **`lint_package`** - Run quality checks (requires Aqua.jl)
+- **`pkg_add`** - Install Julia packages
+- **`pkg_rm`** - Remove Julia packages
 
-### VS Code Integration
+### Testing
 
-- **`execute_vscode_command`** - Trigger VS Code commands
-- **`restart_repl`** - Restart the Julia REPL
-- **`open_file_and_set_breakpoint`** - Set up debugging
-- **`start_debug_session`** - Begin debugging
+- **`run_tests`** - Run tests with optional coverage
 
-### LSP Integration
+### LSP Integration (Best-of Navigation)
 
 - **`lsp_goto_definition`** - Jump to symbol definition
 - **`lsp_find_references`** - Find all symbol references
-- **`lsp_hover_info`** - Get documentation and type info
-- **`lsp_completions`** - Get code completions
 - **`lsp_document_symbols`** - List all symbols in file
-- **`lsp_format_document`** - Format entire file
-- **`lsp_code_actions`** - Get quick fixes and refactorings
-- **`lsp_rename`** - Rename symbol workspace-wide
+- **`lsp_workspace_symbols`** - Search for symbols across workspace
+
+### Semantic Code Search (Qdrant)
+
+- **`qdrant_search_code`** - Natural language search over indexed codebase
+- **`qdrant_list_collections`** - List available code collections
+- **`qdrant_collection_info`** - Get collection statistics
+- **`qdrant_browse_collection`** - Browse indexed code chunks
+- **`qdrant_index_project`** - Index project for semantic search
+- **`qdrant_sync_index`** - Sync index with file changes
+- **`qdrant_reindex_file`** - Re-index a specific file
+
+### VS Code Integration (Optional)
+
+- **`execute_vscode_command`** - Trigger VS Code commands
+- **`restart_repl`** - Restart the Julia REPL
 
 ## Workflow Best Practices
 
 ### 1. Start with Usage Instructions
 
-**ALWAYS** call `usage_instructions` before using `exec_repl`:
+**ALWAYS** call `usage_instructions` before using `ex`:
 
 ```json
 {
@@ -66,7 +75,7 @@ MCPRepl provides these MCP tools:
 }
 ```
 
-This provides critical information about REPL etiquette and best practices.
+This provides critical information about the `ex` tool and best practices.
 
 ### 2. Understand the Environment
 
