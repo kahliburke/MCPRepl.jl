@@ -33,7 +33,7 @@
       ]
     },
     "advanced-analysis": {
-      "enabled": true,
+      "enabled": false,
       "description": "Advanced code inspection (macros, IR, profiling)",
       "tokens": "~300",
       "tools": [
@@ -44,7 +44,7 @@
       ]
     },
     "code-quality": {
-      "enabled": true,
+      "enabled": false,
       "description": "Code formatting and linting",
       "tokens": "~100",
       "tools": [
@@ -53,16 +53,14 @@
       ]
     },
     "lsp": {
-      "enabled": false,
-      "description": "Language Server Protocol integrations",
+      "enabled": true,
+      "description": "Language Server Protocol integrations (best-of navigation)",
       "tokens": "~400",
       "tools": [
         "lsp_document_symbols",
         "lsp_workspace_symbols",
         "lsp_goto_definition",
-        "lsp_find_references",
-        "lsp_code_actions",
-        "lsp_rename"
+        "lsp_find_references"
       ]
     },
     "debugging": {
@@ -108,7 +106,7 @@
       ]
     },
     "education": {
-      "enabled": true,
+      "enabled": false,
       "description": "Learning and quiz tools",
       "tokens": "~1,000",
       "tools": [
@@ -123,10 +121,12 @@
         "qdrant_list_collections",
         "qdrant_collection_info",
         "qdrant_search_code",
-        "qdrant_browse_collection"
+        "qdrant_browse_collection",
+        "qdrant_index_project",
+        "qdrant_sync_index",
+        "qdrant_reindex_file"
       ]
     }
   },
-  "individual_overrides": {
-  }
+  "individual_overrides": {}
 }

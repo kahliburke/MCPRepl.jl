@@ -9,12 +9,12 @@ test_tool =
     @mcp_tool :test_tool "Test tool" MCPRepl.text_parameter("input", "Test input") args ->
         "test output"
 
-tools = [test_tool]
+resources_tools = [test_tool]
 
 @testset "Resources and Prompts Methods" begin
     @testset "MCPServer: resources/list" begin
         test_port = 13100
-        server = MCPRepl.start_mcp_server(tools, test_port)
+        server = MCPRepl.start_mcp_server(resources_tools, test_port)
         sleep(0.1)
 
         try
@@ -50,7 +50,7 @@ tools = [test_tool]
 
     @testset "MCPServer: resources/templates/list" begin
         test_port = 13101
-        server = MCPRepl.start_mcp_server(tools, test_port)
+        server = MCPRepl.start_mcp_server(resources_tools, test_port)
         sleep(0.1)
 
         try
@@ -87,7 +87,7 @@ tools = [test_tool]
 
     @testset "MCPServer: prompts/list" begin
         test_port = 13102
-        server = MCPRepl.start_mcp_server(tools, test_port)
+        server = MCPRepl.start_mcp_server(resources_tools, test_port)
         sleep(0.1)
 
         try

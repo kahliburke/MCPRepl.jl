@@ -9,6 +9,148 @@ Uses Ollama for embeddings (nomic-embed-text model).
 
 const CHUNK_SIZE = 1500  # Target chunk size in characters
 const CHUNK_OVERLAP = 200  # Overlap between chunks
+const MAX_EMBEDDING_LENGTH = 8000  # Max characters for nomic-embed-text model
+
+# Lightweight file tracking for indexing state
+# Stores per-project index metadata in .mcprepl/.qdrant_index.json
+const INDEX_STATE_FILE = ".mcprepl/.qdrant_index.json"
+
+"""
+    load_index_state(project_path::String) -> Dict
+
+Load the index state from the project's .qdrant_index.json file.
+Returns an empty dict if file doesn't exist.
+"""
+function load_index_state(project_path::String)
+    state_file = joinpath(project_path, INDEX_STATE_FILE)
+    if !isfile(state_file)
+        return Dict("files" => Dict())
+    end
+
+    try
+        parsed = JSON.parse(read(state_file, String))
+        # Convert JSON.Object to Dict for proper type handling
+        return Dict("files" => Dict(parsed["files"]))
+    catch e
+        @warn "Failed to load index state, starting fresh" exception = e
+        return Dict("files" => Dict())
+    end
+end
+
+"""
+    save_index_state(project_path::String, state::Dict)
+
+Save the index state to the project's .qdrant_index.json file.
+"""
+function save_index_state(project_path::String, state)
+    state_file = joinpath(project_path, INDEX_STATE_FILE)
+    try
+        # Ensure .mcprepl directory exists
+        mcprepl_dir = joinpath(project_path, ".mcprepl")
+        !isdir(mcprepl_dir) && mkdir(mcprepl_dir)
+        write(state_file, JSON.json(state))
+    catch e
+        @error "Failed to save index state" exception = e
+    end
+end
+
+"""
+    record_indexed_file(project_path::String, file_path::String, collection::String, file_mtime::Float64, chunk_count::Int)
+
+Record that a file has been indexed.
+"""
+function record_indexed_file(
+    project_path::String,
+    file_path::String,
+    collection::String,
+    file_mtime::Float64,
+    chunk_count::Int,
+)
+    state = load_index_state(project_path)
+
+    state["files"][file_path] = Dict(
+        "collection" => collection,
+        "mtime" => file_mtime,
+        "indexed_at" => time(),
+        "chunk_count" => chunk_count,
+    )
+
+    save_index_state(project_path, state)
+end
+
+"""
+    remove_indexed_file(project_path::String, file_path::String)
+
+Remove a file from the indexed files tracking.
+"""
+function remove_indexed_file(project_path::String, file_path::String)
+    state = load_index_state(project_path)
+    delete!(state["files"], file_path)
+    save_index_state(project_path, state)
+end
+
+"""
+    file_needs_reindex(project_path::String, file_path::String) -> Bool
+
+Check if a file needs to be re-indexed (file changed or not indexed).
+"""
+function file_needs_reindex(project_path::String, file_path::String)
+    if !isfile(file_path)
+        return false
+    end
+
+    state = load_index_state(project_path)
+
+    if !haskey(state["files"], file_path)
+        return true  # Not indexed yet
+    end
+
+    file_info = state["files"][file_path]
+    current_mtime = mtime(file_path)
+    return current_mtime > file_info["mtime"]
+end
+
+"""
+    get_stale_files(project_path::String, src_dir::String) -> Vector{String}
+
+Get list of files that need re-indexing.
+"""
+function get_stale_files(project_path::String, src_dir::String)
+    stale = String[]
+
+    for (root, dirs, files) in walkdir(src_dir)
+        filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
+
+        for file in files
+            if endswith(file, ".jl")
+                file_path = joinpath(root, file)
+                if file_needs_reindex(project_path, file_path)
+                    push!(stale, file_path)
+                end
+            end
+        end
+    end
+
+    return stale
+end
+
+"""
+    get_deleted_files(project_path::String, collection::String) -> Vector{String}
+
+Get list of indexed files that no longer exist on disk.
+"""
+function get_deleted_files(project_path::String, collection::String)
+    deleted = String[]
+    state = load_index_state(project_path)
+
+    for (file_path, info) in state["files"]
+        if info["collection"] == collection && !isfile(file_path)
+            push!(deleted, file_path)
+        end
+    end
+
+    return deleted
+end
 
 """
     get_project_collection_name(project_path::String=pwd()) -> String
@@ -341,10 +483,14 @@ function create_window_chunks(content::String, file_path::String)
         end_line = min(start_line + chunk_lines - 1, length(lines))
         text = join(lines[start_line:end_line], "\n")
 
-        # Extend if we're in the middle of something
+        # Extend if we're in the middle of something, but respect CHUNK_SIZE limit
         while end_line < length(lines) && length(text) < CHUNK_SIZE
+            next_text = join(lines[start_line:(end_line+1)], "\n")
+            if length(next_text) > CHUNK_SIZE
+                break  # Don't exceed CHUNK_SIZE
+            end
             end_line += 1
-            text = join(lines[start_line:end_line], "\n")
+            text = next_text
         end
 
         push!(
@@ -377,11 +523,16 @@ function create_window_chunks(content::String, file_path::String)
 end
 
 """
-    index_file(file_path::String, collection::String; verbose::Bool=true) -> Int
+    index_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true) -> Int
 
 Index a single file into Qdrant. Returns number of chunks indexed.
 """
-function index_file(file_path::String, collection::String; verbose::Bool = true)
+function index_file(
+    file_path::String,
+    collection::String;
+    project_path::String = pwd(),
+    verbose::Bool = true,
+)
     if !isfile(file_path)
         @warn "File not found" file_path
         return 0
@@ -407,10 +558,20 @@ function index_file(file_path::String, collection::String; verbose::Bool = true)
             continue
         end
 
+        # Truncate text if it exceeds max embedding length
+        if length(text) > MAX_EMBEDDING_LENGTH
+            text = first(text, MAX_EMBEDDING_LENGTH)
+            @debug "Truncated chunk for embedding" file = file_path chunk = i original_length =
+                length(chunk["text"]) truncated_length = length(text)
+        end
+
         # Get embedding
-        embedding = get_ollama_embedding(text)
+        embedding_model = "nomic-embed-text"
+        embedding = get_ollama_embedding(text; model = embedding_model)
         if isempty(embedding)
-            @warn "Failed to get embedding" file = file_path chunk = i
+            @warn "Failed to get embedding" file = file_path chunk = i model =
+                embedding_model start_line = chunk["start_line"] end_line =
+                chunk["end_line"]
             continue
         end
 
@@ -444,36 +605,48 @@ function index_file(file_path::String, collection::String; verbose::Bool = true)
         QdrantClient.upsert_points(collection, points)
     end
 
-    # Record in database for change tracking
-    Database.record_indexed_file(file_path, collection, mtime(file_path), length(chunks))
+    # Record in index state for change tracking
+    record_indexed_file(
+        project_path,
+        file_path,
+        collection,
+        mtime(file_path),
+        length(chunks),
+    )
 
     return length(chunks)
 end
 
 """
-    reindex_file(file_path::String, collection::String; verbose::Bool=true) -> Int
+    reindex_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true) -> Int
 
 Re-index a single file: delete old chunks, then index fresh.
 Returns number of chunks indexed.
 """
-function reindex_file(file_path::String, collection::String; verbose::Bool = true)
+function reindex_file(
+    file_path::String,
+    collection::String;
+    project_path::String = pwd(),
+    verbose::Bool = true,
+)
     verbose && println("  Re-indexing: $(basename(file_path))")
 
     # Delete old chunks for this file
     QdrantClient.delete_by_file(collection, file_path)
 
     # Index fresh
-    return index_file(file_path, collection; verbose = verbose)
+    return index_file(file_path, collection; project_path = project_path, verbose = verbose)
 end
 
 """
-    index_directory(dir_path::String, collection::String; pattern::String="*.jl", verbose::Bool=true) -> Int
+    index_directory(dir_path::String, collection::String; project_path::String=pwd(), pattern::String="*.jl", verbose::Bool=true) -> Int
 
 Index all matching files in a directory. Returns total chunks indexed.
 """
 function index_directory(
     dir_path::String,
     collection::String;
+    project_path::String = pwd(),
     pattern::String = "*.jl",
     verbose::Bool = true,
 )
@@ -497,7 +670,12 @@ function index_directory(
     for file_path in files
         rel_path = relpath(file_path, dir_path)
         verbose && println("Indexing: $rel_path")
-        chunks = index_file(file_path, collection; verbose = verbose)
+        chunks = index_file(
+            file_path,
+            collection;
+            project_path = project_path,
+            verbose = verbose,
+        )
         total_chunks += chunks
     end
 
@@ -533,7 +711,7 @@ function index_project(
     end
 
     println("Indexing project into collection '$col_name'...")
-    return index_directory(src_dir, col_name)
+    return index_directory(src_dir, col_name; project_path = project_path)
 end
 
 """
@@ -564,8 +742,8 @@ function sync_index(
     verbose && println("🔄 Syncing index for collection '$col_name'...")
 
     # Get files that need re-indexing
-    stale_files = Database.get_stale_files(src_dir)
-    deleted_files = Database.get_deleted_files(col_name)
+    stale_files = get_stale_files(project_path, src_dir)
+    deleted_files = get_deleted_files(project_path, col_name)
 
     reindexed = 0
     deleted = 0
@@ -575,13 +753,18 @@ function sync_index(
     for file_path in deleted_files
         verbose && println("  Removing deleted: $(basename(file_path))")
         QdrantClient.delete_by_file(col_name, file_path)
-        Database.remove_indexed_file(file_path)
+        remove_indexed_file(project_path, file_path)
         deleted += 1
     end
 
     # Re-index stale files
     for file_path in stale_files
-        chunks = reindex_file(file_path, col_name; verbose = verbose)
+        chunks = reindex_file(
+            file_path,
+            col_name;
+            project_path = project_path,
+            verbose = verbose,
+        )
         total_chunks += chunks
         reindexed += 1
     end
@@ -630,7 +813,12 @@ function setup_revise_hook(
             if endswith(file_path, ".jl") && startswith(file_path, src_dir)
                 @info "Auto-reindexing changed file" file = basename(file_path)
                 try
-                    reindex_file(file_path, col_name; verbose = false)
+                    reindex_file(
+                        file_path,
+                        col_name;
+                        project_path = project_path,
+                        verbose = false,
+                    )
                 catch e
                     @warn "Failed to reindex file" file = file_path exception = e
                 end

@@ -2,10 +2,19 @@
 
 ## Overview
 
-The `ex` tool executes Julia code in a persistent REPL session. It uses short parameter names to save tokens:
+**`ex` is the primary tool.** Use it for nearly every generic task: running code, quick tests, docs, and quick checks.
+
+It uses short parameter names to save tokens:
 - `e` - expression (required)
 - `q` - quiet mode (default: true)
 - `s` - silent mode (default: false)
+
+## Other tools for specific tasks
+While `ex` is your go-to tool, some tasks are better served by specialized tools:
+- **Semantic code search:** `qdrant_search_code()` - for meaning-based searches in the codebase
+- **Method discovery:** `search_methods()` - for finding method signatures and overloads
+- **Type inspection:** `type_info()` - for detailed type information, fields, and hierarchy
+- Check out the extended help pages for these tools for more details.
 
 ## Token-Efficient Usage Patterns
 
@@ -18,9 +27,6 @@ The `ex` tool is your primary interface to Julia. Using it efficiently saves mas
 ```julia
 # ✅ DEFAULT (q=true) - Returns only printed output, no return value
 ex(e="x = 42")                              # Returns: ""
-ex(e="function test_func(x) x * 2 end")    # Returns: ""
-ex(e="using DataFrames")                    # Returns: ""
-
 # When you NEED the return value, use q=false:
 ex(e="2 + 2", q=false)                      # Returns: "4"
 ex(e="typeof([1,2,3])", q=false)            # Returns: "Vector{Int64}"
@@ -28,11 +34,8 @@ ex(e="typeof([1,2,3])", q=false)            # Returns: "Vector{Int64}"
 
 **This is equivalent to automatically adding a semicolon!**
 
-```julia
-# These are equivalent:
-ex(e="x = 42")        # Automatic semicolon
-ex(e="x = 42;")       # Manual semicolon
-ex(e="x = 42", q=true)  # Explicit quiet mode
+## Println behavior
+Printlns are removed from being executed when `s=false` (default). If you want to see printed output in real-time, set `s=true`. But don't use println to communicate with the user; they see output in real-time in their REPL already. Talk to them in the chat interface instead. If you need print information for debugging/logging, use `s=true` or consider using @show.
 ```
 
 ### 📦 Combine Multiple Operations
@@ -189,3 +192,11 @@ ex(e="Pkg.activate(\".\")")  # Never do this!
 4. **Use `let` blocks** - Keep workspace clean
 5. **Trust Revise** - File changes are picked up automatically
 6. **Errors always show** - Quiet mode doesn't suppress errors
+
+## When to Use Specialized Tools
+
+- **Semantic search:** `qdrant_search_code()` for meaning-based lookup in the codebase
+- **Method discovery:** `search_methods()` for signatures and overloads
+- **Type inspection:** `type_info()` for fields and hierarchy
+
+Use `ex()` first, then reach for specialized tools when you need structured results.

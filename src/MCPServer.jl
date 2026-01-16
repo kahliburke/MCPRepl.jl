@@ -952,38 +952,14 @@ function start_mcp_server(
             for (name, value) in response.headers
                 HTTP.setheader(http, name => value)
             end
-            try
-                HTTP.startwrite(http)
-                write(http, response.body)
-            catch e
-                # Handle broken pipe errors gracefully (client disconnected)
-                if e isa Base.IOError &&
-                   (e.code == Base.UV_EPIPE || occursin("EPIPE", string(e)))
-                    @debug "Client disconnected before response could be sent" exception = e
-                else
-                    rethrow()
-                end
-            end
+            HTTP.startwrite(http)
+            write(http, response.body)
             return nothing
 
         catch e
-            try
-                HTTP.setstatus(http, 500)
-                HTTP.setheader(http, "Content-Type" => "application/json")
-                HTTP.startwrite(http)
-            catch write_error
-                # Handle broken pipe in error response
-                if write_error isa Base.IOError && (
-                    write_error.code == Base.UV_EPIPE ||
-                    occursin("EPIPE", string(write_error))
-                )
-                    @debug "Client disconnected before error response could be sent" exception =
-                        write_error
-                    return nothing
-                else
-                    rethrow()
-                end
-            end
+            HTTP.setstatus(http, 500)
+            HTTP.setheader(http, "Content-Type" => "application/json")
+            HTTP.startwrite(http)
 
             request_id = try
                 parsed = JSON.parse(body; dicttype = Dict{String,Any})

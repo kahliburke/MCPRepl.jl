@@ -4,6 +4,8 @@ MCP Tools for Qdrant Vector Database
 Tools for semantic code search using Qdrant.
 """
 
+using Logging
+
 # QdrantClient will be available from parent module scope
 
 # Note: Embeddings are maintained by external process
@@ -28,11 +30,42 @@ function get_ollama_embedding(text::String; model::String = "nomic-embed-text")
             ["Content-Type" => "application/json"],
             JSON.json(body),
         )
+        body_text = String(response.body)
 
-        data = JSON.parse(String(response.body))
-        return Float64.(get(data, "embedding", []))
+        if response.status != 200
+            preview = body_text
+            if length(preview) > 500
+                preview = first(preview, 500) * "..."
+            end
+            @warn "Ollama embedding request failed" status = response.status model = model body =
+                preview
+            return Float64[]
+        end
+
+        data = try
+            JSON.parse(body_text)
+        catch e
+            preview = body_text
+            if length(preview) > 500
+                preview = first(preview, 500) * "..."
+            end
+            @warn "Ollama embedding response parse failed" model = model body = preview exception =
+                e
+            return Float64[]
+        end
+
+        embedding = get(data, "embedding", [])
+        if isempty(embedding)
+            preview = body_text
+            if length(preview) > 500
+                preview = first(preview, 500) * "..."
+            end
+            @warn "Ollama embedding empty" model = model body = preview
+        end
+
+        return Float64.(embedding)
     catch e
-        @debug "Ollama embedding not available" exception = e
+        @warn "Ollama embedding request error" model = model exception = e
         return Float64[]
     end
 end
@@ -40,6 +73,68 @@ end
 # ============================================================================
 # MCP Tool Definitions
 # ============================================================================
+
+mutable struct QdrantIndexLogger <: AbstractLogger
+    records::Vector{NamedTuple}
+    min_level::LogLevel
+end
+
+QdrantIndexLogger(; min_level::LogLevel = Logging.Warn) =
+    QdrantIndexLogger(NamedTuple[], min_level)
+
+Logging.min_enabled_level(logger::QdrantIndexLogger) = logger.min_level
+Logging.shouldlog(logger::QdrantIndexLogger, level, _module, group, id) =
+    level >= logger.min_level
+
+function Logging.handle_message(
+    logger::QdrantIndexLogger,
+    level,
+    message,
+    _module,
+    group,
+    id,
+    file,
+    line;
+    kwargs...,
+)
+    push!(
+        logger.records,
+        (
+            level = level,
+            message = message,
+            mod = _module,
+            file = file,
+            line = line,
+            kwargs = kwargs,
+        ),
+    )
+end
+
+function format_indexing_report(message::String, records::Vector{NamedTuple})
+    error_count = count(r -> r.level >= Logging.Error, records)
+    warn_count = count(r -> r.level == Logging.Warn, records)
+
+    output = message
+    if error_count > 0 || warn_count > 0
+        output *= "\n\n⚠️  Indexing reported $warn_count warnings and $error_count errors."
+        max_records = 20
+        for (i, record) in enumerate(records)
+            if i > max_records
+                output *= "\n... (truncated; total $(length(records)) records)"
+                break
+            end
+            level = record.level
+            msg = record.message
+            output *= "\n- [$level] $msg"
+            if !isempty(record.kwargs)
+                details = join([string(k, "=", v) for (k, v) in pairs(record.kwargs)], ", ")
+                output *= " (" * details * ")"
+            end
+        end
+    end
+
+    return output
+end
 
 qdrant_list_collections_tool = @mcp_tool(
     :qdrant_list_collections,
@@ -173,28 +268,42 @@ qdrant_search_code_tool = @mcp_tool(
             return "No results found for query: \"$query\""
         end
 
-        # Format results
-        output = "🔍 Search Results for: \"$query\"\n"
-        output *= "Collection: $collection\n\n"
+        # Format results (optimized for minimal tokens)
+        output = "🔍 \"$query\" in $collection:\n\n"
 
         for (i, result) in enumerate(results)
             score = get(result, "score", 0.0)
             payload = get(result, "payload", Dict())
 
-            output *= "$i. Score: $(round(score, digits=3))\n"
+            # Extract key fields
+            file = get(payload, "file", "")
+            name = get(payload, "name", "")
+            start_line = get(payload, "start_line", 0)
+            end_line = get(payload, "end_line", 0)
+            chunk_type = get(payload, "type", "")
+            text = get(payload, "text", "")
 
-            # Display payload fields
-            for (key, value) in payload
-                if key == "text" || key == "content" || key == "code"
-                    # Truncate long text
-                    text_str = string(value)
-                    if length(text_str) > 200
-                        text_str = text_str[1:200] * "..."
-                    end
-                    output *= "   $key: $text_str\n"
-                else
-                    output *= "   $key: $value\n"
+            # Use relative path if possible
+            if !isempty(file) && startswith(file, pwd())
+                file = relpath(file, pwd())
+            end
+
+            # Compact format: [score] name @ file:L10-20 (type)
+            output *= "[$i $(round(score, digits=2))] "
+            output *= isempty(name) ? "" : "$name @ "
+            output *= "$file:L$start_line"
+            output *= start_line != end_line ? "-$end_line" : ""
+            output *= isempty(chunk_type) ? "" : " ($chunk_type)"
+            output *= "\n"
+
+            # Only show text preview if it's meaningful (>20 chars after strip)
+            text_preview = strip(string(text))
+            if length(text_preview) > 20
+                # Truncate to 150 chars
+                if length(text_preview) > 150
+                    text_preview = first(text_preview, 150) * "..."
                 end
+                output *= "  $text_preview\n"
             end
             output *= "\n"
         end
@@ -265,6 +374,128 @@ qdrant_browse_collection_tool = @mcp_tool(
     end
 )
 
+qdrant_index_project_tool = @mcp_tool(
+    :qdrant_index_project,
+    "Index a Julia project into Qdrant. Creates or recreates the collection and indexes project source files.",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "project_path" => Dict(
+                "type" => "string",
+                "description" => "Project path to index (default: current working directory)",
+            ),
+            "collection" => Dict(
+                "type" => "string",
+                "description" => "Collection name to use (optional, defaults to project name)",
+            ),
+            "recreate" => Dict(
+                "type" => "boolean",
+                "description" => "Recreate the collection before indexing (default: false)",
+            ),
+        ),
+        "required" => [],
+    ),
+    function (args)
+        project_path = get(args, "project_path", pwd())
+        collection = get(args, "collection", nothing)
+        recreate = get(args, "recreate", false)
+
+        if collection isa String && isempty(collection)
+            collection = nothing
+        end
+
+        chunks =
+            index_project(project_path; collection = collection, recreate = recreate)
+
+        col_name =
+            collection === nothing ? get_project_collection_name(project_path) : collection
+
+        return "✓ Indexed $chunks chunks into '$col_name'."
+    end
+)
+
+qdrant_sync_index_tool = @mcp_tool(
+    :qdrant_sync_index,
+    "Sync Qdrant index with current files. Reindexes changed files and removes deleted ones.",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "project_path" => Dict(
+                "type" => "string",
+                "description" => "Project path to sync (default: current working directory)",
+            ),
+            "collection" => Dict(
+                "type" => "string",
+                "description" => "Collection name to sync (optional, defaults to project name)",
+            ),
+            "verbose" => Dict(
+                "type" => "boolean",
+                "description" => "Print progress to stdout (default: true)",
+            ),
+        ),
+        "required" => [],
+    ),
+    function (args)
+        project_path = get(args, "project_path", pwd())
+        collection = get(args, "collection", nothing)
+        verbose = get(args, "verbose", true)
+
+        if collection isa String && isempty(collection)
+            collection = nothing
+        end
+
+        result = sync_index(project_path; collection = collection, verbose = verbose)
+
+        col_name =
+            collection === nothing ? get_project_collection_name(project_path) : collection
+        return "✓ Sync complete for '$col_name': $(result.reindexed) files reindexed, $(result.deleted) files removed, $(result.chunks) chunks indexed."
+    end
+)
+
+qdrant_reindex_file_tool = @mcp_tool(
+    :qdrant_reindex_file,
+    "Re-index a single file: delete old chunks then index fresh.",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "file_path" =>
+                Dict("type" => "string", "description" => "File path to re-index"),
+            "collection" =>
+                Dict("type" => "string", "description" => "Collection name"),
+            "project_path" => Dict(
+                "type" => "string",
+                "description" => "Project path for index tracking (default: current working directory)",
+            ),
+            "verbose" => Dict(
+                "type" => "boolean",
+                "description" => "Print progress to stdout (default: true)",
+            ),
+        ),
+        "required" => ["file_path", "collection"],
+    ),
+    function (args)
+        file_path = get(args, "file_path", "")
+        collection = get(args, "collection", "")
+        project_path = get(args, "project_path", pwd())
+        verbose = get(args, "verbose", true)
+
+        if isempty(file_path)
+            return "Error: file_path is required"
+        end
+        if isempty(collection)
+            return "Error: collection is required"
+        end
+
+        chunks = reindex_file(
+            file_path,
+            collection;
+            project_path = project_path,
+            verbose = verbose,
+        )
+        return "✓ Re-indexed $chunks chunks for $(basename(file_path)) in '$collection'."
+    end
+)
+
 # ============================================================================
 # Tool Registration
 # ============================================================================
@@ -275,5 +506,8 @@ function create_qdrant_tools()
         qdrant_collection_info_tool,
         qdrant_search_code_tool,
         qdrant_browse_collection_tool,
+        qdrant_index_project_tool,
+        qdrant_sync_index_tool,
+        qdrant_reindex_file_tool,
     ]
 end

@@ -39,3 +39,4 @@ crush.json
 HANDOFF.md
 coverage.info
 lcov.info
+.qdrant_index.json

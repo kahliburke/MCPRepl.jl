@@ -1,5 +1,7 @@
 # Julia REPL Workflow Guide
 
+**Start here:** `ex()` is the primary tool. Use it for almost everything.
+
 **New to MCPRepl?** → `usage_quiz()` then `usage_quiz(show_sols=true)` to self-grade
 
 ## ⚠️ CRITICAL: Shared REPL Model
@@ -50,9 +52,20 @@ ex(e="function f() ... end", q=false)    # ❌ Definitions
 **Julia introspection (DON'T use Read/Grep for these):**
 `list_names("Module")`, `type_info("Type")`, `search_methods(func)`
 
-**Code intelligence:** `lsp_find_references()`, `lsp_rename()`, `lsp_code_actions()`
+**Semantic search (fastest for “what does this do?”):**
+`qdrant_search_code(query="...")` and `qdrant_list_collections()`
+
+**LSP navigation (best-of):** `lsp_goto_definition()`, `lsp_find_references()`, `lsp_document_symbols()`, `lsp_workspace_symbols()`
 
 **Utilities:** `format_code(path)`, `ping()`, `investigate_environment()`
+
+## Demo‑Fast Loop (Recommended)
+
+1. **Run code / inspect state:** `ex()` (q=true by default)
+2. **Clarify types/methods:** `type_info()`, `search_methods()`
+3. **Semantic search:** `qdrant_search_code()` for meaning-based lookup
+
+> If `qdrant_search_code` errors about embeddings, ensure Ollama is running with the embedding model (default: `nomic-embed-text`).
 
 **Need help with a tool?** → `tool_help("tool_name")` or `tool_help("tool_name", extended=true)`
 

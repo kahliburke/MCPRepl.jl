@@ -32,6 +32,8 @@ The default configuration reduces this to **~5,500 tokens** (58% reduction), and
 
 ### Available Tool Sets
 
+**Note:** This workspace uses a **demo-focused** configuration (see tools.json). The table below is general guidance for typical setups.
+
 | Tool Set | Tokens | Default | Description |
 |----------|--------|---------|-------------|
 | **core** | ~600 | ✓ Enabled | Essential tools (ping, usage_instructions, investigate_environment, tool_help, restart_repl) |
@@ -46,6 +48,31 @@ The default configuration reduces this to **~5,500 tokens** (58% reduction), and
 | **education** | ~1,000 | ✗ Disabled | Learning tools (usage_quiz) |
 
 ### Usage Examples
+
+#### Demo‑Focused Configuration (Current Workspace)
+
+Focuses on `ex`, core introspection, best‑of LSP navigation, and Qdrant semantic search:
+
+```json
+{
+  "tool_sets": {
+    "core": { "enabled": true },
+    "execution": { "enabled": true },
+    "code-analysis": { "enabled": true },
+    "lsp": { "enabled": true },
+    "qdrant": { "enabled": true },
+    "advanced-analysis": { "enabled": false },
+    "code-quality": { "enabled": false },
+    "debugging": { "enabled": false },
+    "package-management": { "enabled": false },
+    "testing": { "enabled": false },
+    "vscode": { "enabled": false },
+    "education": { "enabled": false }
+  }
+}
+```
+
+> Qdrant tools assume a local Qdrant at http://localhost:6333 and Ollama for embeddings (default model: `nomic-embed-text`).
 
 #### Minimal Configuration (Core + Execution only)
 Save ~20,000 tokens by only enabling essential functionality:

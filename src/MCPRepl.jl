@@ -1055,7 +1055,7 @@ function start!(;
                         # If parsing fails, show raw body (truncated)
                         body_str = String(response.body)
                         error_details =
-                            length(body_str) > 200 ? body_str[1:200] * "..." : body_str
+                            length(body_str) > 200 ? first(body_str, 200) * "..." : body_str
                     end
 
                     # Stop spinner before showing error
@@ -1396,7 +1396,8 @@ function call_tool(tool_id::Symbol, args::Dict)
         result = try
             tool.handler(args)
         catch e
-            if e isa MethodError && hasmethod(tool.handler, Tuple{typeof(args),typeof(nothing)})
+            if e isa MethodError &&
+               hasmethod(tool.handler, Tuple{typeof(args),typeof(nothing)})
                 # Handler supports streaming, call with both parameters
                 tool.handler(args, nothing)
             else

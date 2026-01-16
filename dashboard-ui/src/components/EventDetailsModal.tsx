@@ -11,7 +11,6 @@ interface EventDetailsModalProps {
 export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, sessions, onClose }) => {
     const sessionName = sessions[event.id]?.name || 'Unknown';
     const shortUuid = event.id.substring(0, 8) + '...';
-    const safeData = event.data ?? {};
     return (
         <div className="modal-overlay" onClick={onClose}>
             <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -40,18 +39,18 @@ export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, ses
                             <span className="detail-value">{event.duration_ms.toFixed(2)} ms</span>
                         </div>
                     )}
-                    {safeData.tool && (
+                    {event.data.tool && (
                         <div className="detail-row">
                             <span className="detail-label">Tool:</span>
-                            <span className="detail-value">{safeData.tool}</span>
+                            <span className="detail-value">{event.data.tool}</span>
                         </div>
                     )}
-                    {safeData.arguments && Object.keys(safeData.arguments).length > 0 && (
+                    {event.data.arguments && Object.keys(event.data.arguments).length > 0 && (
                         <div className="detail-row detail-data">
                             <span className="detail-label">Arguments:</span>
                             <div className="detail-value json-tree">
                                 <JsonViewer
-                                    value={safeData.arguments}
+                                    value={event.data.arguments}
                                     theme="dark"
                                     defaultInspectDepth={2}
                                     displayDataTypes={false}
@@ -60,12 +59,12 @@ export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, ses
                             </div>
                         </div>
                     )}
-                    {safeData.result && (
+                    {event.data.result && (
                         <div className="detail-row detail-data">
                             <span className="detail-label">Result:</span>
                             <div className="detail-value json-tree">
                                 <JsonViewer
-                                    value={safeData.result}
+                                    value={event.data.result}
                                     theme="dark"
                                     defaultInspectDepth={2}
                                     displayDataTypes={false}
@@ -74,12 +73,12 @@ export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, ses
                             </div>
                         </div>
                     )}
-                    {safeData.error && (
+                    {event.data.error && (
                         <div className="detail-row detail-data">
                             <span className="detail-label">Error:</span>
                             <div className="detail-value json-tree error-tree">
                                 <JsonViewer
-                                    value={safeData.error}
+                                    value={event.data.error}
                                     theme="dark"
                                     defaultInspectDepth={2}
                                     displayDataTypes={false}
@@ -92,7 +91,7 @@ export const EventDetailsModal: React.FC<EventDetailsModalProps> = ({ event, ses
                         <span className="detail-label">Raw Data:</span>
                         <div className="detail-value json-tree">
                             <JsonViewer
-                                value={safeData}
+                                value={event.data}
                                 theme="dark"
                                 defaultInspectDepth={1}
                                 displayDataTypes={false}

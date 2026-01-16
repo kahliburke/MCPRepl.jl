@@ -31,12 +31,12 @@ calc_tool =
         end
     end
 
-tools = [time_tool, reverse_tool, calc_tool]
+server_tools = [time_tool, reverse_tool, calc_tool]
 
 @testset "Server Startup and Shutdown" begin
     # Start server on test port (use port that shouldn't conflict)
     test_port = 13001
-    server = MCPRepl.start_mcp_server(tools, test_port)
+    server = MCPRepl.start_mcp_server(server_tools, test_port)
 
     @test server.port == test_port
     @test length(server.tools) == 3
@@ -57,7 +57,7 @@ end
 @testset "Invalid Requests" begin
     # Start server for invalid request tests
     test_port = 13002
-    server = MCPRepl.start_mcp_server(tools, test_port)
+    server = MCPRepl.start_mcp_server(server_tools, test_port)
 
     # Give server time to start
     sleep(0.1)
@@ -90,7 +90,7 @@ end
 @testset "Tool Listing" begin
     # Start server for tool listing tests
     test_port = 13003
-    server = MCPRepl.start_mcp_server(tools, test_port)
+    server = MCPRepl.start_mcp_server(server_tools, test_port)
 
     # Give server time to start
     sleep(0.1)
@@ -133,7 +133,7 @@ end
 @testset "Tool Execution" begin
     # Start server for tool execution tests
     test_port = 13004
-    server = MCPRepl.start_mcp_server(tools, test_port)
+    server = MCPRepl.start_mcp_server(server_tools, test_port)
 
     # Give server time to start
     sleep(0.1)

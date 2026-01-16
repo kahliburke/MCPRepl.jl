@@ -240,6 +240,7 @@ repl_tool = @mcp_tool(
     :ex,
     """Execute Julia code in a persistent REPL. User sees all code execute in real-time.
 
+Primary tool: use `ex` for almost everything (run code, tests, docs, quick checks).
 Default (q=true): Returns only printed output/errors, suppresses return values (saves 70-90% tokens).
 Verbose (q=false): Returns full output including return value - use ONLY when you need the result to make a decision.
 
@@ -1471,19 +1472,15 @@ Test results summary including:
                 Coverage.clean_folder("test")
 
                 # Coverage requires --code-coverage flag, so spawn a subprocess
-                if hasReTest
-                    # Build ReTest command with pattern filtering
-                    test_script = """
-                    using ReTest
-                    include(joinpath("test", "$(project_name)Tests.jl"))
-                    retest(Main.$(project_name)Tests, r"$pattern"; verbose=$verbose)
-                    """
-                    cmd =
-                        `julia --project=$project_path --code-coverage=user -e $test_script`
+                test_args = String[]
+                if !isempty(pattern) && pattern != ".*"
+                    push!(test_args, pattern)
+                end
+
+                cmd = if hasReTest
+                    `julia --project=$project_path --startup-file=no --code-coverage=user test/runtests.jl $test_args`
                 else
-                    # Fall back to running runtests.jl directly
-                    cmd =
-                        `julia --project=$project_path --code-coverage=user test/runtests.jl`
+                    `julia --project=$project_path --startup-file=no --code-coverage=user test/runtests.jl $test_args`
                 end
 
                 # Run the subprocess and capture output
@@ -1508,29 +1505,20 @@ Test results summary including:
             else
                 println(out_buf, "🧪 Running tests...\n")
 
-                try
-                    if hasReTest
-                        # Get the current project as a module
-                        project_mod = Base.root_module(
-                            Base.PkgId(Base.UUID(Pkg.project().uuid), project_name),
-                        )
+                test_args = String[]
+                if !isempty(pattern) && pattern != ".*"
+                    push!(test_args, pattern)
+                end
 
-                        # Use ReTest's load=true to automatically find and load ProjectNameTests.jl
-                        # Capture stdout since retest() prints output but returns nothing
-                        (rd, wr) = redirect_stdout()
-                        reader_task = @async read(rd, String)
-                        try
-                            retest(project_mod, Regex(pattern); load = true, verbose = verbose)
-                        finally
-                            redirect_stdout()  # Restore stdout
-                            close(wr)
-                        end
-                        test_output = fetch(reader_task)
-                        close(rd)
-                        print(out_buf, test_output)
+                try
+                    cmd = if hasReTest
+                        `julia --project=$project_path --startup-file=no test/runtests.jl $test_args`
                     else
-                        Pkg.test()
+                        `julia --project=$project_path --startup-file=no -e "using Pkg; Pkg.test()"`
                     end
+
+                    test_output = read(cmd, String)
+                    print(out_buf, test_output)
                 catch e
                     print(out_buf, "Error running tests: $e")
                 end

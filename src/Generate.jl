@@ -361,6 +361,20 @@ function create_tools_config(project_path::String)
                 "tokens" => "~1,000",
                 "tools" => ["usage_quiz"],
             ),
+            "qdrant" => Dict(
+                "enabled" => true,
+                "description" => "Semantic code search using Qdrant vector database",
+                "tokens" => "~400",
+                "tools" => [
+                    "qdrant_list_collections",
+                    "qdrant_collection_info",
+                    "qdrant_search_code",
+                    "qdrant_browse_collection",
+                    "qdrant_index_project",
+                    "qdrant_sync_index",
+                    "qdrant_reindex_file",
+                ],
+            ),
         ),
         "individual_overrides" => Dict(),
     )
