@@ -21,7 +21,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         session = MCPSession()
 
         params = Dict{String,Any}(
-            "protocolVersion" => "2024-11-05",
+            "protocolVersion" => "2024-11-25",
             "capabilities" => Dict{String,Any}("tools" => Dict()),
             "clientInfo" =>
                 Dict{String,Any}("name" => "test-client", "version" => "1.0.0"),
@@ -30,7 +30,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         result = initialize_session!(session, params)
 
         @test session.state == INITIALIZED
-        @test session.protocol_version == "2024-11-05"
+        @test session.protocol_version == "2024-11-25"
         @test session.initialized_at !== nothing
         @test haskey(session.client_info, "name")
         @test session.client_info["name"] == "test-client"
@@ -70,7 +70,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         session = MCPSession()
 
         params = Dict{String,Any}(
-            "protocolVersion" => "2024-11-05",
+            "protocolVersion" => "2024-11-25",
             "capabilities" => Dict{String,Any}(),
             "clientInfo" => Dict{String,Any}(),
         )
@@ -86,7 +86,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         session = MCPSession()
 
         params = Dict{String,Any}(
-            "protocolVersion" => "2024-11-05",
+            "protocolVersion" => "2024-11-25",
             "capabilities" => Dict{String,Any}(),
             "clientInfo" => Dict{String,Any}(),
         )
@@ -113,7 +113,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         @test info["state"] == "UNINITIALIZED"
 
         params = Dict{String,Any}(
-            "protocolVersion" => "2024-11-05",
+            "protocolVersion" => "2024-11-25",
             "capabilities" => Dict{String,Any}(),
             "clientInfo" => Dict{String,Any}("name" => "test-client"),
         )
@@ -122,7 +122,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
 
         info = get_session_info(session)
         @test info["state"] == "INITIALIZED"
-        @test info["protocol_version"] == "2024-11-05"
+        @test info["protocol_version"] == "2024-11-25"
         @test haskey(info, "uptime")
         @test info["uptime"] !== nothing
     end
@@ -149,7 +149,7 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
 
         # Initialize
         params = Dict{String,Any}(
-            "protocolVersion" => "2024-11-05",
+            "protocolVersion" => "2024-11-25",
             "capabilities" => Dict{String,Any}("tools" => Dict()),
             "clientInfo" => Dict{String,Any}("name" => "client"),
         )

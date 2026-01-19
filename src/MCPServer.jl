@@ -343,7 +343,7 @@ function create_handler(
                     else
                         # Fallback without session management
                         init_result = Dict(
-                            "protocolVersion" => "2024-11-05",
+                            "protocolVersion" => "2024-11-25",
                             "capabilities" => Dict(
                                 "tools" => Dict(),
                                 "prompts" => Dict(),

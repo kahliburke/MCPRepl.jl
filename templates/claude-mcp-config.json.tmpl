@@ -2,14 +2,17 @@
   "mcpServers": {
     "julia-repl": {
       "type": "http",
-      "url": "http://localhost:\${JULIA_MCP_PORT}",{% if has_api_key %}
+      "url": "http://localhost:${JULIA_MCP_PORT}",
+      {% if has_api_key %}
       "headers": {
         "Authorization": "Bearer \${JULIA_MCP_API_KEY}",
         "X-MCPRepl-Target": "\${JULIA_MCP_REPL_ID}"
-      }{% else %}
+      }
+      {% else %}
       "headers": {
         "X-MCPRepl-Target": "\${JULIA_MCP_REPL_ID}"
-      }{% end %}
+      }
+      {% end %}
     }
   }
 }

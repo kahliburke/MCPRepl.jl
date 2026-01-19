@@ -1,7 +1,7 @@
 name = "MCPRepl"
 uuid = "b62cb57a-788d-40b5-9d64-84a1dfc37ce3"
-version = "0.5.1"
-authors = ["Hans Würfel <git@wuerfel.io>", "Kahli Burke <kahli@kahliburke.com>"]
+version = "0.8.0"
+authors = ["Kahli Burke <kahli@kahliburke.com>", "Hans Würfel <git@wuerfel.io>"]
 
 [deps]
 CodeTracking = "da1fd8a2-8d9e-5ec2-8556-3022fb5608a2"

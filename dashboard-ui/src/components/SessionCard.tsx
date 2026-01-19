@@ -32,8 +32,8 @@ export const SessionCard: React.FC<SessionCardProps> = ({ session, isSelected, o
             title="Click to view logs"
         >
             <div className="session-header">
-                <span className="session-id">{session.name}</span>
-                <span className="session-uuid" title={`UUID: ${session.uuid}`} style={{ fontSize: '0.75em', color: '#64748b', marginLeft: '8px' }}>
+                <span className="session-id" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, minWidth: 0 }}>{session.name}</span>
+                <span className="session-uuid" title={`UUID: ${session.uuid}`} style={{ fontSize: '0.75em', color: '#64748b', marginLeft: '8px', flexShrink: 0 }}>
                     {session.uuid.substring(0, 8)}...
                 </span>
             </div>

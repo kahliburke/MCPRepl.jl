@@ -121,14 +121,14 @@ using Dates
 
             # Initialize
             params = Dict(
-                "protocolVersion" => "2024-11-05",
+                "protocolVersion" => "2024-11-25",
                 "capabilities" => Dict("roots" => Dict("listChanged" => true)),
                 "clientInfo" => Dict("name" => "test-client", "version" => "1.0"),
             )
             result = MCPRepl.Proxy.Session.initialize_session!(session, params)
 
             @test session.state == MCPRepl.Proxy.Session.INITIALIZED
-            @test session.protocol_version == "2024-11-05"
+            @test session.protocol_version == "2024-11-25"
             @test haskey(session.client_info, "name")
 
             # Save to database
@@ -137,7 +137,7 @@ using Dates
             # Reload and verify
             loaded = Proxy.get_mcp_session(session.id)
             @test loaded.state == MCPRepl.Proxy.Session.INITIALIZED
-            @test loaded.protocol_version == "2024-11-05"
+            @test loaded.protocol_version == "2024-11-25"
             @test loaded.client_info["name"] == "test-client"
         end
 

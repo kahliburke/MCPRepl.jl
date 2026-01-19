@@ -13,6 +13,7 @@ struct SecurityConfig
     api_keys::Vector{String}
     allowed_ips::Vector{String}
     port::Int
+    bypass_proxy::Bool  # If true, run MCP server directly without proxy
     created_at::Int64
 end
 
@@ -20,9 +21,17 @@ function SecurityConfig(
     mode::Symbol,
     api_keys::Vector{String},
     allowed_ips::Vector{String},
-    port::Int = 3000,
+    port::Int = 0,
+    bypass_proxy::Bool = false,
 )
-    return SecurityConfig(mode, api_keys, allowed_ips, port, Int64(round(time())))
+    return SecurityConfig(
+        mode,
+        api_keys,
+        allowed_ips,
+        port,
+        bypass_proxy,
+        Int64(round(time())),
+    )
 end
 
 """
@@ -72,9 +81,10 @@ function load_security_config(workspace_dir::String = pwd())
         api_keys = get(data, "api_keys", String[])
         allowed_ips = get(data, "allowed_ips", ["127.0.0.1", "::1"])
         port = get(data, "port", 0)  # Default to 0 (dynamic port assignment)
+        bypass_proxy = get(data, "bypass_proxy", false)  # Default to false (use proxy)
         created_at = get(data, "created_at", time())
 
-        return SecurityConfig(mode, api_keys, allowed_ips, port, created_at)
+        return SecurityConfig(mode, api_keys, allowed_ips, port, bypass_proxy, created_at)
     catch e
         @warn "Failed to load security config" exception = e
         return nothing
@@ -118,7 +128,7 @@ function save_security_config(config::SecurityConfig, workspace_dir::String = pw
             "mode" => string(config.mode),
             "api_keys" => config.api_keys,
             "allowed_ips" => config.allowed_ips,
-            "port" => config.port,
+            "bypass_proxy" => config.bypass_proxy,
             "created_at" => config.created_at,
         )
 
@@ -260,6 +270,7 @@ function add_api_key!(workspace_dir::String = pwd())
         vcat(config.api_keys, [new_key]),
         config.allowed_ips,
         config.port,
+        config.bypass_proxy,
         config.created_at,
     )
 
@@ -294,6 +305,7 @@ function remove_api_key!(key::String, workspace_dir::String = pwd())
         new_keys,
         config.allowed_ips,
         config.port,
+        config.bypass_proxy,
         config.created_at,
     )
 
@@ -327,6 +339,7 @@ function add_allowed_ip!(ip::String, workspace_dir::String = pwd())
         config.api_keys,
         new_ips,
         config.port,
+        config.bypass_proxy,
         config.created_at,
     )
 
@@ -360,6 +373,7 @@ function remove_allowed_ip!(ip::String, workspace_dir::String = pwd())
         config.api_keys,
         new_ips,
         config.port,
+        config.bypass_proxy,
         config.created_at,
     )
 
@@ -391,6 +405,7 @@ function change_security_mode!(mode::Symbol, workspace_dir::String = pwd())
         config.api_keys,
         config.allowed_ips,
         config.port,
+        config.bypass_proxy,
         config.created_at,
     )
 

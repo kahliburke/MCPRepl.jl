@@ -11,6 +11,9 @@ catch e
 end
 using MCPRepl
 
+# To bypass proxy and run MCP server in standalone mode:
+# ENV["MCPREPL_BYPASS_PROXY"] = "true"
+
 # Start MCP REPL server for AI agent integration
 try
     if Threads.threadid() == 1

@@ -207,6 +207,11 @@ const VSCODE_NONCES = Dict{String,Tuple{String,Float64}}()
 # Lock for thread-safe access to nonces dictionary
 const VSCODE_NONCE_LOCK = ReentrantLock()
 
+# Lock for serializing REPL-like execution.
+# `execute_repllike` currently uses stdout/stderr redirection which is process-global;
+# concurrent calls can collide and leave the session in a bad state.
+const EXEC_REPLLIKE_LOCK = ReentrantLock()
+
 
 """
     store_vscode_response(request_id::String, result, error::Union{Nothing,String})
@@ -473,168 +478,320 @@ function execute_repllike(
     quiet::Bool = true,
     description::Union{String,Nothing} = nothing,
 )
-    # Check for Pkg.activate usage
-    if contains(str, "activate(") && !contains(str, r"#.*overwrite no-activate-rule")
-        return """
-            ERROR: Using Pkg.activate to change environments is not allowed.
-            You should assume you are in the correct environment for your tasks.
-            You may use Pkg.status() to see the current environment and available packages.
-            If you need to use a third-party 'activate' function, add '# overwrite no-activate-rule' at the end of your command.
-        """
-    end
+    lock(EXEC_REPLLIKE_LOCK)
+    try
+        # Check for Pkg.activate usage
+        if contains(str, "activate(") && !contains(str, r"#.*overwrite no-activate-rule")
+            return """
+                ERROR: Using Pkg.activate to change environments is not allowed.
+                You should assume you are in the correct environment for your tasks.
+                You may use Pkg.status() to see the current environment and available packages.
+                If you need to use a third-party 'activate' function, add '# overwrite no-activate-rule' at the end of your command.
+            """
+        end
 
-    # Check if we have an active REPL (interactive mode) or running in server mode
-    has_repl = isdefined(Base, :active_repl)
-    repl = has_repl ? Base.active_repl : nothing
-    backend = has_repl ? repl.backendref : nothing
+        # Check if we have an active REPL (interactive mode) or running in server mode
+        # Note: `Base.active_repl` may exist but be `nothing` in non-interactive contexts.
+        repl =
+            (isdefined(Base, :active_repl) && (Base.active_repl !== nothing)) ?
+            Base.active_repl : nothing
+        backend =
+            repl !== nothing && hasproperty(repl, :backendref) ? repl.backendref : nothing
+        has_repl =
+            repl !== nothing &&
+            backend !== nothing &&
+            hasproperty(backend, :repl_channel) &&
+            hasproperty(backend, :response_channel) &&
+            isopen(backend.repl_channel) &&
+            isopen(backend.response_channel)
 
-    # Auto-append semicolon in quiet mode to suppress output
-    if quiet && !REPL.ends_with_semicolon(str)
-        str = str * ";"
-    end
+        # Auto-append semicolon in quiet mode to suppress output
+        if quiet && !REPL.ends_with_semicolon(str)
+            str = str * ";"
+        end
 
-    expr = Base.parse_input_line(str)
+        expr = Base.parse_input_line(str)
 
-    # In quiet mode, strip println statements from the AST
-    # User already sees code execution in their REPL - println is redundant
-    if quiet
-        expr = remove_println_calls(expr)
-    end
+        # In quiet mode, strip println statements from the AST
+        # User already sees code execution in their REPL - println is redundant
+        if quiet
+            expr = remove_println_calls(expr)
+        end
 
-    if has_repl
-        REPL.prepare_next(repl)
-    end
+        if has_repl && !silent
+            REPL.prepare_next(repl)
+        end
 
-    # Only print the agent prompt if not silent
-    if !silent
-        printstyled("\nagent> ", color = :red, bold = :true)
-        if description !== nothing
-            println(description)
-        else
-            # Transform println calls to comments for display
-            display_str = replace(str, r"println\s*\(\s*\"([^\"]*)\"\s*\)" => s"# \1")
-            display_str = replace(display_str, r"@info\s+\"([^\"]*?)\"" => s"# \1")
-            display_str = replace(display_str, r"@warn\s+\"([^\"]*?)\"" => s"# WARNING: \1")
-            display_str = replace(display_str, r"@error\s+\"([^\"]*?)\"" => s"# ERROR: \1")
-            # Split on semicolons for multi-line display
-            display_str = replace(display_str, r";\s*" => "\n")
-            # If multiline, start on new line for proper indentation
-            if contains(display_str, '\n')
-                println()  # Start on new line
-                print(display_str, "\n")
+        # Only print the agent prompt if not silent
+        if !silent
+            printstyled("\nagent> ", color = :red, bold = :true)
+            if description !== nothing
+                println(description)
             else
-                print(display_str, "\n")
-            end
-        end
-    end
-
-    # Use pipes for capturing output (simpler approach)
-    orig_stdout = stdout
-    orig_stderr = stderr
-
-    # redirect_stdout/stderr return (reader, writer) pipe pair
-    stdout_read, stdout_write = redirect_stdout()
-    stderr_read, stderr_write = redirect_stderr()
-
-    # Capture output in background task
-    stdout_content = String[]
-    stderr_content = String[]
-
-    stdout_task = @async begin
-        try
-            while !eof(stdout_read)
-                line = readline(stdout_read; keep = true)
-                push!(stdout_content, line)
-                # Show real-time output unless silent mode
-                if !silent
-                    write(orig_stdout, line)
-                    flush(orig_stdout)
+                # Transform println calls to comments for display
+                display_str = replace(str, r"println\s*\(\s*\"([^\"]*)\"\s*\)" => s"# \1")
+                display_str = replace(display_str, r"@info\s+\"([^\"]*?)\"" => s"# \1")
+                display_str =
+                    replace(display_str, r"@warn\s+\"([^\"]*?)\"" => s"# WARNING: \1")
+                display_str =
+                    replace(display_str, r"@error\s+\"([^\"]*?)\"" => s"# ERROR: \1")
+                # Split on semicolons for multi-line display
+                display_str = replace(display_str, r";\s*" => "\n")
+                # If multiline, start on new line for proper indentation
+                if contains(display_str, '\n')
+                    println()  # Start on new line
+                    print(display_str, "\n")
+                else
+                    print(display_str, "\n")
                 end
             end
-        catch e
-            if !isa(e, EOFError)
-                @debug "stdout read error" exception = e
-            end
         end
-    end
 
-    stderr_task = @async begin
-        try
-            while !eof(stderr_read)
-                line = readline(stderr_read; keep = true)
-                push!(stderr_content, line)
-                # Show real-time output unless silent mode
-                if !silent
-                    write(orig_stderr, line)
-                    flush(orig_stderr)
+        # Evaluate the expression and capture stdout/stderr.
+        # Important: in interactive REPL mode, evaluation happens on the REPL backend task.
+        # Redirecting stdout/stderr in the current task won't reliably capture backend output.
+        # So we run a function on the backend that performs the capture *within* the backend task.
+        backend_iserr = false
+        response = try
+            if has_repl
+                result = REPL.call_on_backend(
+                    () -> begin
+                        orig_stdout = stdout
+                        orig_stderr = stderr
+
+                        stdout_read, stdout_write = redirect_stdout()
+                        stderr_read, stderr_write = redirect_stderr()
+
+                        stdout_content = String[]
+                        stderr_content = String[]
+
+                        stdout_task = @async begin
+                            try
+                                while !eof(stdout_read)
+                                    line = readline(stdout_read; keep = true)
+                                    push!(stdout_content, line)
+                                    if !silent
+                                        write(orig_stdout, line)
+                                        flush(orig_stdout)
+                                    end
+                                end
+                            catch e
+                                if !isa(e, EOFError)
+                                    @debug "stdout read error" exception = e
+                                end
+                            end
+                        end
+
+                        stderr_task = @async begin
+                            try
+                                while !eof(stderr_read)
+                                    line = readline(stderr_read; keep = true)
+                                    push!(stderr_content, line)
+                                    if !silent
+                                        write(orig_stderr, line)
+                                        flush(orig_stderr)
+                                    end
+                                end
+                            catch e
+                                if !isa(e, EOFError)
+                                    @debug "stderr read error" exception = e
+                                end
+                            end
+                        end
+
+                        value = nothing
+                        caught = nothing
+                        bt = nothing
+                        try
+                            value = Core.eval(Main, expr)
+                        catch e
+                            caught = e
+                            bt = catch_backtrace()
+                        finally
+                            redirect_stdout(orig_stdout)
+                            redirect_stderr(orig_stderr)
+
+                            close(stdout_write)
+                            close(stderr_write)
+
+                            wait(stdout_task)
+                            wait(stderr_task)
+
+                            close(stdout_read)
+                            close(stderr_read)
+                        end
+
+                        (
+                            stdout = join(stdout_content),
+                            stderr = join(stderr_content),
+                            value = value,
+                            exception = caught,
+                            backtrace = bt,
+                        )
+                    end,
+                    backend,
+                )
+
+                val, iserr = if result isa Pair
+                    (result.first, result.second)
+                elseif result isa Tuple && length(result) == 2
+                    (result[1], result[2])
+                else
+                    (result, false)
                 end
+
+                backend_iserr = iserr
+                val
+            else
+                # Server/non-interactive mode: capture in the current task.
+                orig_stdout = stdout
+                orig_stderr = stderr
+
+                stdout_read, stdout_write = redirect_stdout()
+                stderr_read, stderr_write = redirect_stderr()
+
+                stdout_content = String[]
+                stderr_content = String[]
+
+                stdout_task = @async begin
+                    try
+                        while !eof(stdout_read)
+                            line = readline(stdout_read; keep = true)
+                            push!(stdout_content, line)
+                            if !silent
+                                write(orig_stdout, line)
+                                flush(orig_stdout)
+                            end
+                        end
+                    catch e
+                        if !isa(e, EOFError)
+                            @debug "stdout read error" exception = e
+                        end
+                    end
+                end
+
+                stderr_task = @async begin
+                    try
+                        while !eof(stderr_read)
+                            line = readline(stderr_read; keep = true)
+                            push!(stderr_content, line)
+                            if !silent
+                                write(orig_stderr, line)
+                                flush(orig_stderr)
+                            end
+                        end
+                    catch e
+                        if !isa(e, EOFError)
+                            @debug "stderr read error" exception = e
+                        end
+                    end
+                end
+
+                value = nothing
+                caught = nothing
+                bt = nothing
+                try
+                    value = Core.eval(Main, expr)
+                catch e
+                    caught = e
+                    bt = catch_backtrace()
+                finally
+                    redirect_stdout(orig_stdout)
+                    redirect_stderr(orig_stderr)
+
+                    close(stdout_write)
+                    close(stderr_write)
+
+                    wait(stdout_task)
+                    wait(stderr_task)
+
+                    close(stdout_read)
+                    close(stderr_read)
+                end
+
+                (
+                    stdout = join(stdout_content),
+                    stderr = join(stderr_content),
+                    value = value,
+                    exception = caught,
+                    backtrace = bt,
+                )
             end
         catch e
-            if !isa(e, EOFError)
-                @debug "stderr read error" exception = e
-            end
+            backend_iserr = true
+            (exception = e, backtrace = catch_backtrace())
         end
-    end
 
-    # Evaluate the expression
-    response = try
-        if has_repl
-            result_pair = REPL.eval_on_backend(expr, backend)
-            result_pair.first  # Extract result from Pair{Any, Bool}
+        captured_content =
+            if response isa NamedTuple &&
+               haskey(response, :stdout) &&
+               haskey(response, :stderr)
+                String(response.stdout) * String(response.stderr)
+            else
+                ""
+            end
+
+        # Note: Output was already displayed in real-time by the async tasks
+        # No need to print captured_content again unless silent mode
+
+        # Format the result for display
+        result_str = if response isa NamedTuple
+            if haskey(response, :exception) && response.exception !== nothing
+                io_buf = IOBuffer()
+                try
+                    showerror(io_buf, response.exception, response.backtrace)
+                catch
+                    # If Base's error hint machinery explodes due to a mock/partial REPL,
+                    # still return the core exception message.
+                    showerror(io_buf, response.exception)
+                end
+                "ERROR: " * String(take!(io_buf))
+            elseif haskey(response, :value) && !REPL.ends_with_semicolon(str)
+                io_buf = IOBuffer()
+                show(io_buf, MIME("text/plain"), response.value)
+                String(take!(io_buf))
+            else
+                ""
+            end
+        elseif response isa Exception
+            io_buf = IOBuffer()
+            showerror(io_buf, response)
+            "ERROR: " * String(take!(io_buf))
         else
-            # In server mode without interactive REPL, eval directly in Main
-            Core.eval(Main, expr)
+            ""
         end
-    catch e
-        e
+
+        # Refresh REPL if not silent and we have a REPL
+        if !silent && has_repl
+            if !isempty(result_str)
+                println(result_str)
+            end
+            REPL.prepare_next(repl)
+            REPL.LineEdit.refresh_line(repl.mistate)
+        end
+
+        # In quiet mode, don't return captured stdout/stderr (println output)
+        # EXCEPT for errors - always return errors to the agent.
+        # REPL.eval_on_backend signals errors via an `iserr` flag instead of throwing.
+        has_error =
+            backend_iserr ||
+            (
+                response isa NamedTuple &&
+                haskey(response, :exception) &&
+                response.exception !== nothing
+            ) ||
+            response isa Exception
+
+        result = if quiet && !has_error
+            ""  # In quiet mode without errors, return empty string (suppresses "nothing")
+        else
+            # Return full output for non-quiet mode OR when there's an error
+            captured_content * result_str
+        end
+
+        return result
     finally
-        # Restore streams and clean up pipes
-        redirect_stdout(orig_stdout)
-        redirect_stderr(orig_stderr)
-
-        # Close write ends to signal EOF
-        close(stdout_write)
-        close(stderr_write)
-
-        # Wait for readers to finish
-        wait(stdout_task)
-        wait(stderr_task)
-
-        # Close read ends
-        close(stdout_read)
-        close(stderr_read)
-    end
-
-    # Get captured output
-    captured_content = join(stdout_content) * join(stderr_content)
-
-    # Note: Output was already displayed in real-time by the async tasks
-    # No need to print captured_content again unless silent mode
-
-    # Format the result for display
-    result_str = if !REPL.ends_with_semicolon(str)
-        io_buf = IOBuffer()
-        show(io_buf, MIME("text/plain"), response)
-        String(take!(io_buf))
-    else
-        ""
-    end
-
-    # Refresh REPL if not silent and we have a REPL
-    if !silent && has_repl
-        if !isempty(result_str)
-            println(result_str)
-        end
-        REPL.prepare_next(repl)
-        REPL.LineEdit.refresh_line(repl.mistate)
-    end
-
-    # In quiet mode, don't return captured stdout/stderr (println output)
-    # User already saw it in their REPL, no need to send it back to agent
-    if quiet
-        return result_str  # Only return the result value (which is "" in quiet mode)
-    else
-        return captured_content * result_str
+        unlock(EXEC_REPLLIKE_LOCK)
     end
 end
 
@@ -765,7 +922,6 @@ function start!(;
 
     # Check for persistent proxy server
     proxy_port = 3000  # Default proxy port
-    proxy_running = Proxy.is_server_running(proxy_port)
 
     # Temporarily suppress Info logs during startup to avoid interfering with spinner
     old_logger = global_logger()
@@ -789,16 +945,6 @@ function start!(;
         end
     end
 
-    if !proxy_running
-        # Start proxy server in background (using our shared status)
-        status_msg[] = "Starting MCPRepl (starting proxy)..."
-        Proxy.start_server(
-            proxy_port;
-            background = true,
-            status_callback = (msg) -> (status_msg[] = msg),
-        )
-    end
-
     # Load or prompt for security configuration
     # Use workspace_dir (project root) not pwd() (which may be agent dir)
     @debug "Loading security config" workspace_dir = workspace_dir
@@ -820,6 +966,24 @@ function start!(;
     else
         @debug "Security config loaded successfully" port = security_config.port mode =
             security_config.mode
+    end
+
+    # Check if proxy should be bypassed (from security config or ENV override)
+    bypass_proxy =
+        security_config.bypass_proxy || get(ENV, "MCPREPL_BYPASS_PROXY", "false") == "true"
+    proxy_running = bypass_proxy ? false : Proxy.is_server_running(proxy_port)
+
+    # Start proxy if needed
+    if !proxy_running && !bypass_proxy
+        # Start proxy server in background (using our shared status)
+        status_msg[] = "Starting MCPRepl (starting proxy)..."
+        Proxy.start_server(
+            proxy_port;
+            background = true,
+            status_callback = (msg) -> (status_msg[] = msg),
+        )
+    elseif bypass_proxy
+        @debug "Bypassing proxy - running in standalone mode"
     end
 
     # Determine port: function arg overrides config, otherwise use what load_security_config() found
@@ -862,6 +1026,7 @@ function start!(;
             security_config.api_keys,
             security_config.allowed_ips,
             security_config.port,
+            security_config.bypass_proxy,
             security_config.created_at,
         )
     end
@@ -945,8 +1110,9 @@ function start!(;
         session_uuid = session_uuid,
     )
 
-    # Register this REPL with the proxy if proxy is running and registration is enabled
-    if register_with_proxy && Proxy.is_server_running(proxy_port)
+    # Register this REPL with the proxy if proxy is running and registration is enabled.
+    # If we're explicitly bypassing the proxy, never attempt registration.
+    if register_with_proxy && proxy_running
         # Wait for the backend HTTP server to be ready to accept connections
         # This prevents race conditions where the proxy flushes buffered requests
         # before the backend can handle them
@@ -1004,6 +1170,7 @@ function start!(;
                     ),
                 )
 
+                @debug "Proxy registration payload" registration
                 response = HTTP.post(
                     "http://127.0.0.1:$proxy_port/",
                     ["Content-Type" => "application/json"],
@@ -1041,7 +1208,12 @@ function start!(;
                     println(
                         "Use a different julia_session_name or stop the existing session",
                     )
-                    # Don't start heartbeat if registration failed
+                    # Registration is required for proxy routing; stop the server to avoid a
+                    # confusing half-started state.
+                    try
+                        stop!()
+                    catch
+                    end
                     return nothing
                 else
                     # Try to parse error response for details
@@ -1058,24 +1230,24 @@ function start!(;
                             length(body_str) > 200 ? first(body_str, 200) * "..." : body_str
                     end
 
-                    # Stop spinner before showing error
-                    spinner_active[] = false
-                    wait(spinner_task)
-                    global_logger(old_logger)
-
-                    # Show user-friendly error message
-                    print("\r\033[K")  # Clear spinner line
-                    printstyled("❌ Registration failed: ", color = :red, bold = true)
-                    if !isempty(error_details)
-                        println(error_details)
-                    else
-                        println("HTTP $(response.status)")
+                    # Registration failures should not prevent standalone use.
+                    # Treat common cases (proxy not running / wrong service on port 3000 / old proxy)
+                    # as non-fatal and continue.
+                    if verbose
+                        printstyled(
+                            "⚠️  Proxy registration skipped: ",
+                            color = :yellow,
+                            bold = true,
+                        )
+                        if !isempty(error_details)
+                            println(error_details)
+                        else
+                            println("HTTP $(response.status)")
+                        end
                     end
 
-                    # Also log as warning for debugging
-                    @warn "Failed to register with proxy" status = response.status error =
-                        error_details
-                    return nothing
+                    @warn "Failed to register with proxy (continuing without proxy)" status =
+                        response.status error = error_details
                 end
 
                 # Only start heartbeat if registration succeeded
@@ -1133,9 +1305,13 @@ function start!(;
                     end
                 end  # if response.status == 200
             catch e
-                @warn "Failed to register with proxy" exception = e
+                @warn "Failed to register with proxy (continuing without proxy)" exception =
+                    e
             end
         end  # if server_ready
+    elseif bypass_proxy && verbose
+        printstyled("🔌 Standalone mode: ", color = :cyan, bold = true)
+        println("proxy disabled (no registration/heartbeat)")
     end  # if register_with_proxy
 
     # Stop the spinner and show completion
@@ -1396,8 +1572,7 @@ function call_tool(tool_id::Symbol, args::Dict)
         result = try
             tool.handler(args)
         catch e
-            if e isa MethodError &&
-               hasmethod(tool.handler, Tuple{typeof(args),typeof(nothing)})
+            if e isa MethodError && hasmethod(tool.handler, Tuple{typeof(args),typeof(nothing)})
                 # Handler supports streaming, call with both parameters
                 tool.handler(args, nothing)
             else

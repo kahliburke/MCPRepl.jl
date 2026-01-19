@@ -112,7 +112,7 @@ MCPRepl.Generate.generate("MyProject", path="/Users/name/projects")
 function generate(
     project_name::String;
     security_mode::Symbol = :lax,
-    proxy_port::Int = 3000,  # Proxy server port that AI clients connect to
+    proxy_port::Int = 3000,  # Project REPL port (0 = dynamic port assignment)
     path::String = pwd(),
     emoticon::String = "🐉",
 )
@@ -171,7 +171,7 @@ function generate(
         end
     end
 
-    create_startup_script(project_path, proxy_port, emoticon)
+    create_startup_script(project_path, emoticon)
     create_repl_script(project_path)
     create_env_file(project_path, proxy_port, api_key)
     create_claude_env_settings(project_path, proxy_port, api_key)
@@ -413,6 +413,7 @@ function create_security_config(project_path::String, mode::Symbol, port::Int)
         "mode" => string(config.mode),
         "api_keys" => config.api_keys,
         "allowed_ips" => config.allowed_ips,
+        "bypass_proxy" => false,  # Default to using proxy
         "created_at" => config.created_at,
     )
 
@@ -438,7 +439,7 @@ function render_template(template_name::String; kwargs...)
     tmp(init = Dict(kwargs))
 end
 
-function create_startup_script(project_path::String, port::Int, emoticon::String = "🐉")
+function create_startup_script(project_path::String, emoticon::String = "🐉")
     println("📝 Creating Julia startup script...")
 
     # Use template rendering for startup script
@@ -481,17 +482,19 @@ end
 
 function create_env_file(
     project_path::String,
-    port::Int,
+    port::Int,  # Ignored - .env should always reference proxy port 3000
     api_key::Union{String,Nothing} = nothing,
 )
     println("🔐 Creating .env file...")
 
+    # .env files are for AI clients that connect to the proxy, so use proxy port
+    proxy_port = 3000
     repl_id = basename(project_path)
     env_content = render_template(
         "env";
         has_api_key = api_key !== nothing,
         api_key = api_key,
-        port = port,
+        port = proxy_port,
         repl_id = repl_id,
     )
 
@@ -503,7 +506,7 @@ end
 
 function create_claude_env_settings(
     project_path::String,
-    port::Int,
+    port::Int,  # Ignored - Claude connects to proxy port 3000
     api_key::Union{String,Nothing} = nothing,
 )
     println("🔐 Creating .claude/settings.local.json...")
@@ -511,12 +514,14 @@ function create_claude_env_settings(
     claude_dir = joinpath(project_path, ".claude")
     mkpath(claude_dir)
 
+    # Claude connects to the proxy server on port 3000
+    proxy_port = 3000
     repl_id = basename(project_path)
     settings_content = render_template(
         "claude-settings.local.json";
         has_api_key = api_key !== nothing,
         api_key = api_key,
-        port = string(port),
+        port = string(proxy_port),
         repl_id = repl_id,
     )
 
@@ -528,7 +533,7 @@ end
 
 function create_vscode_config(
     project_path::String,
-    port::Int,
+    port::Int,  # Ignored - VS Code clients always connect to proxy on port 3000
     api_key::Union{String,Nothing} = nothing,
 )
     println("⚙️  Creating VS Code MCP configuration...")
@@ -540,10 +545,12 @@ function create_vscode_config(
     # NOTE: Claude Code does not support environment variable expansion in mcp.json
     # So we hardcode the values here and add the file to .gitignore
     # REPL ID is the project directory name
+    # VS Code clients connect to the proxy server on port 3000, not the REPL directly
+    proxy_port = 3000
     repl_id = basename(project_path)
     mcp_content = render_template(
         "vscode-mcp.json";
-        port = port,
+        port = proxy_port,
         has_api_key = api_key !== nothing,
         api_key = api_key,
         repl_id = repl_id,

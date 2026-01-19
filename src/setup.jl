@@ -279,12 +279,9 @@ end
 function install_startup_script(; emoticon::String = "🐉")
     startup_path = get_startup_script_path()
 
-    # Load security config to get port if available
-    security_config = load_security_config()
-    port = security_config !== nothing ? security_config.port : 3000
-
     # Use Generate module's shared function
-    return Generate.create_startup_script(dirname(startup_path), port, emoticon)
+    # The startup script will call MCPRepl.start!() which reads the security config at runtime
+    return Generate.create_startup_script(dirname(startup_path), emoticon)
 end
 
 function install_repl_script()

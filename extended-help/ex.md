@@ -34,8 +34,29 @@ ex(e="typeof([1,2,3])", q=false)            # Returns: "Vector{Int64}"
 
 **This is equivalent to automatically adding a semicolon!**
 
-## Println behavior
-Printlns are removed from being executed when `s=false` (default). If you want to see printed output in real-time, set `s=true`. But don't use println to communicate with the user; they see output in real-time in their REPL already. Talk to them in the chat interface instead. If you need print information for debugging/logging, use `s=true` or consider using @show.
+## Printing vs `q`/`s`
+
+### Quiet mode (`q=true`) affects what runs
+
+When `q=true` (default), `ex` is optimized for token efficiency:
+- It auto-appends a semicolon to suppress return values.
+- It strips top-level `println`/`print`/`@show` (and top-level logging macros like `@info`) from the executed AST.
+
+So: **printing is primarily for interactive debugging, not agent→user communication**.
+
+### Silent mode (`s=true`) affects what the user sees live
+
+`s` does **not** control whether `println` runs. It controls whether the user sees the `agent>` prompt and real-time REPL echo.
+
+- **Default:** `s=false` (recommended)
+- **Use `s=true` only rarely** when you intentionally expect very large printed output and want to avoid spamming the user's REPL.
+
+Examples:
+```julia
+ex(e="undefined_var + 1", q=true, s=false)   # ✅ errors still returned
+ex(e="big = rand(10^7); sum(big)", q=true)   # ✅ compute side effects, no spam
+ex(e="println(join(1:100000, '\n'))", q=false, s=true)  # ⚠️ rare: huge stdout
+```
 ```
 
 ### 📦 Combine Multiple Operations

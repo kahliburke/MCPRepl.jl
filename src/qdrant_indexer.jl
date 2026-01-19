@@ -9,7 +9,7 @@ Uses Ollama for embeddings (nomic-embed-text model).
 
 const CHUNK_SIZE = 1500  # Target chunk size in characters
 const CHUNK_OVERLAP = 200  # Overlap between chunks
-const MAX_EMBEDDING_LENGTH = 8000  # Max characters for nomic-embed-text model
+const MAX_EMBEDDING_LENGTH = 2000  # Max characters for nomic-embed-text model (512 token limit ~ 2000 chars)
 
 # Lightweight file tracking for indexing state
 # Stores per-project index metadata in .mcprepl/.qdrant_index.json

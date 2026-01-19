@@ -57,11 +57,20 @@ function pkg_operation_tool(operation::String, verb::String, args)
         end
 
         # Use Pkg operation with io=devnull to disable interactivity
+        # Also set JULIA_PKG_PRECOMPILE_AUTO=0 to avoid long precompilation waits
         pkg_names = join(["\"$p\"" for p in packages], ", ")
-        code = "using Pkg; Pkg.$operation([$pkg_names]; io=devnull)"
+        code = """
+        using Pkg
+        withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+            Pkg.$operation([$pkg_names]; io=devnull)
+        end
+        """
 
-        result = execute_repllike(code; silent = false, quiet = false)
-        return "$verb packages: $(join(packages, ", "))\n\n$result"
+        execute_repllike(code; silent = false, quiet = false)
+
+        return """$verb packages: $(join(packages, ", "))
+
+Note: Packages installed but not precompiled. They will precompile on first use."""
     catch e
         action = lowercase(verb) * "ing"
         return "Error $action packages: $e"
@@ -238,11 +247,13 @@ Ensures agents understand:
 
 repl_tool = @mcp_tool(
     :ex,
-    """Execute Julia code in a persistent REPL. User sees all code execute in real-time.
+    """Execute Julia code in a persistent REPL. User typically sees code execute in real-time.
 
 Primary tool: use `ex` for almost everything (run code, tests, docs, quick checks).
 Default (q=true): Returns only printed output/errors, suppresses return values (saves 70-90% tokens).
 Verbose (q=false): Returns full output including return value - use ONLY when you need the result to make a decision.
+
+Silent mode (s=true) is rare: it suppresses the 'agent>' prompt and real-time REPL echo to avoid spamming the user with intentionally huge output.
 
 Never use `julia` in bash. Call usage_instructions first for workflow guidance.""",
     Dict(
@@ -258,7 +269,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
             ),
             "s" => Dict(
                 "type" => "boolean",
-                "description" => "Silent mode: suppresses 'agent>' prompt and real-time output (default: false)",
+                "description" => "Silent mode: suppresses 'agent>' prompt and real-time REPL echo (default: false). Use s=true only rarely to avoid spamming huge output.",
             ),
         ),
         "required" => ["e"],
