@@ -907,7 +907,27 @@ MCPRepl.start!(port=0)
 
 # Start with a custom name
 MCPRepl.start!(julia_session_name="data-processor")
+
+# Start in standalone mode (no proxy, includes dashboard)
+MCPRepl.start!(register_with_proxy=false)
 ```
+
+# Standalone Mode (Proxy-Compatible Mode)
+
+When the proxy is not available or `bypass_proxy=true` in security config, MCPRepl runs in
+standalone mode with full proxy-compatible functionality:
+
+- **HTTP JSON-RPC**: Accepts MCP protocol requests at `/` or `/mcp` endpoints
+- **Dashboard UI**: Serves React dashboard at `http://localhost:<port>/`
+- **WebSocket Live Updates**: Real-time event streaming at `/ws`
+- **All MCP Tools**: Full tool registry accessible via HTTP
+
+This mode is ideal for:
+- Single-session development without proxy overhead
+- Testing and debugging MCP integrations
+- Simplified deployment scenarios
+- Direct HTTP client access to MCP protocol
+
 """
 function start!(;
     port::Union{Int,Nothing} = nothing,
@@ -1310,8 +1330,14 @@ function start!(;
             end
         end  # if server_ready
     elseif bypass_proxy && verbose
-        printstyled("🔌 Standalone mode: ", color = :cyan, bold = true)
-        println("proxy disabled (no registration/heartbeat)")
+        printstyled("\n🔌 Standalone Mode (Proxy-Compatible)\n", color = :cyan, bold = true)
+        printstyled("   📊 Dashboard: ", color = :green)
+        println("http://localhost:$actual_port/")
+        printstyled("   🔧 MCP JSON-RPC: ", color = :green)
+        println("http://localhost:$actual_port/mcp")
+        printstyled("   💡 Tip: ", color = :yellow)
+        println("This server includes the full dashboard UI and accepts MCP calls via HTTP")
+        println()
     end  # if register_with_proxy
 
     # Stop the spinner and show completion

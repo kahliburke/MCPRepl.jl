@@ -7,6 +7,9 @@ using UUIDs
 include("session.jl")
 using .Session
 
+# Import Dashboard for standalone mode
+import ..Dashboard
+
 # Import types and functions from parent module
 import ..MCPRepl:
     SecurityConfig, extract_api_key, validate_api_key, get_client_ip, validate_ip
@@ -199,6 +202,39 @@ function create_handler(
                 end
             end
 
+            # Handle MCP JSON-RPC endpoint (for standalone/proxy-compatible mode)
+            if req.target == "/mcp" && req.method == "POST"
+                # Route MCP JSON-RPC calls to the standard handler
+                # This allows HTTP-based MCP clients to connect directly without a proxy
+                # Fall through to the JSON-RPC handling below
+            end
+
+            # Handle WebSocket connections for live dashboard updates
+            if req.target == "/ws"
+                return HTTP.WebSockets.upgrade(req) do ws
+                    # Add client to broadcast list
+                    lock(Dashboard.WS_CLIENTS_LOCK) do
+                        push!(Dashboard.WS_CLIENTS, ws)
+                    end
+
+                    try
+                        # Keep connection alive and handle incoming messages
+                        while !eof(ws)
+                            msg = HTTP.WebSockets.receive(ws)
+                            # Echo back for ping/pong
+                            HTTP.WebSockets.send(ws, msg)
+                        end
+                    catch e
+                        @debug "WebSocket connection closed" exception = e
+                    finally
+                        # Remove client from broadcast list
+                        lock(Dashboard.WS_CLIENTS_LOCK) do
+                            delete!(Dashboard.WS_CLIENTS, ws)
+                        end
+                    end
+                end
+            end
+
             # Handle OAuth well-known metadata requests first (before JSON parsing)
             # Only advertise OAuth if security is configured (not in lax mode)
             if req.target == "/.well-known/oauth-authorization-server"
@@ -313,6 +349,8 @@ function create_handler(
                 )
             end
 
+            # Support both root "/" and "/mcp" endpoints for HTTP JSON-RPC
+            # This allows MCP clients to use either endpoint
             request = JSON.parse(body; dicttype = Dict{String,Any})
 
             # Check if method field exists
@@ -922,6 +960,286 @@ function start_mcp_server(
                 end
             end
 
+            # Handle dashboard routes for GET requests (for standalone/proxy-compatible mode)
+            if req.method == "GET"
+                # Normalize API paths - handle both /api/* and /dashboard/api/*
+                # Strip query string for path matching
+                target_path = split(req.target, '?')[1]
+                api_path =
+                    startswith(target_path, "/dashboard/api/") ?
+                    replace(target_path, r"^/dashboard" => "") : target_path
+
+                # Dashboard API: sessions list
+                if api_path == "/api/sessions"
+                    # In standalone mode, return the current Julia session
+                    # Format matches dashboard TypeScript Session interface
+                    sessions = Dict{String,Any}()
+                    if session !== nothing
+                        # Map session state to dashboard status
+                        status =
+                            if session.state in (
+                                Session.UNINITIALIZED,
+                                Session.INITIALIZED,
+                                Session.INITIALIZING,
+                            )
+                                "ready"
+                            elseif session.state == Session.CLOSED
+                                "stopped"
+                            else
+                                "ready"  # Default to ready
+                            end
+
+                        session_info = Dict(
+                            "uuid" => session.id,
+                            "name" => basename(pwd()),  # Use current directory name
+                            "port" => port,
+                            "pid" => getpid(),
+                            "status" => status,
+                            "created_at" =>
+                                Dates.format(session.created_at, "yyyy-mm-dd HH:MM:SS"),
+                            "last_heartbeat" => Dates.format(
+                                session.last_activity,
+                                "yyyy-mm-dd HH:MM:SS",
+                            ),
+                            "last_event" => Dates.format(
+                                session.last_activity,
+                                "yyyy-mm-dd HH:MM:SS",
+                            ),
+                        )
+                        sessions[session.id] = session_info
+                    end
+
+                    HTTP.setstatus(http, 200)
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(http, JSON.json(sessions))
+                    return nothing
+                end
+
+                # Dashboard API: proxy info
+                if api_path == "/api/proxy-info"
+                    # In standalone mode, return info about this server
+                    proxy_info = Dict(
+                        "mode" => "standalone",
+                        "version" => "0.8.0",
+                        "port" => port,
+                        "has_database" => false,
+                        "active_sessions" => session !== nothing ? 1 : 0,
+                    )
+                    HTTP.setstatus(http, 200)
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(http, JSON.json(proxy_info))
+                    return nothing
+                end
+
+                # Dashboard API: tools list
+                if api_path == "/api/tools"
+                    # Return the list of available MCP tools in dashboard format
+                    # In standalone mode, all tools are "proxy_tools" (we are the server)
+                    tools_list = map(collect(values(tools_dict))) do tool
+                        Dict(
+                            "name" => tool.name,
+                            "description" => tool.description,
+                            "inputSchema" => tool.parameters,
+                        )
+                    end
+
+                    # Dashboard expects proxy_tools and session_tools structure
+                    response = Dict(
+                        "proxy_tools" => tools_list,
+                        "session_tools" => Dict{String,Vector}(),  # Empty in standalone mode
+                    )
+
+                    HTTP.setstatus(http, 200)
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(http, JSON.json(response))
+                    return nothing
+                end
+
+                # Dashboard API: events list
+                if startswith(api_path, "/api/events")
+                    # Handle SSE streaming endpoint
+                    if contains(api_path, "/stream")
+                        # Generate unique channel ID
+                        channel_id = "sse-$(time_ns())"
+
+                        # Create SSE channel for this connection
+                        channel = Dashboard.create_sse_channel(channel_id)
+
+                        # Set up SSE response headers
+                        HTTP.setstatus(http, 200)
+                        HTTP.setheader(http, "Content-Type" => "text/event-stream")
+                        HTTP.setheader(http, "Cache-Control" => "no-cache")
+                        HTTP.setheader(http, "Connection" => "keep-alive")
+                        HTTP.setheader(http, "Access-Control-Allow-Origin" => "*")
+                        HTTP.startwrite(http)
+
+                        # Send initial event to prime the connection
+                        write(http, "id: $(channel_id)\n")
+                        write(http, "data: {\"status\": \"connected\"}\n\n")
+                        flush(http)
+
+                        try
+                            heartbeat_interval = 30.0  # Send heartbeat every 30 seconds
+                            last_heartbeat = time()
+
+                            # Keep connection alive and send events as they arrive
+                            while isopen(http) && isopen(channel)
+                                # Check if there's a pending event (non-blocking)
+                                if isready(channel)
+                                    event = try
+                                        take!(channel)
+                                    catch e
+                                        if isa(e, InvalidStateException)
+                                            break  # Channel closed
+                                        end
+                                        nothing
+                                    end
+
+                                    if event !== nothing
+                                        # Send event in SSE format
+                                        write(http, "id: $(time_ns())\n")
+                                        event_data = JSON.json(
+                                            Dict(
+                                                "id" => event.id,
+                                                "type" => string(event.event_type),
+                                                "timestamp" => Dates.format(
+                                                    event.timestamp,
+                                                    "yyyy-mm-dd HH:MM:SS.sss",
+                                                ),
+                                                "data" => event.data,
+                                                "duration_ms" => event.duration_ms,
+                                            ),
+                                        )
+                                        write(http, "data: $(event_data)\n\n")
+                                        flush(http)
+                                    end
+                                end
+
+                                # Send heartbeat comment to keep connection alive
+                                if time() - last_heartbeat > heartbeat_interval
+                                    write(http, ": heartbeat\n\n")
+                                    flush(http)
+                                    last_heartbeat = time()
+                                end
+
+                                # Small sleep to prevent busy waiting
+                                sleep(0.1)
+                            end
+                        catch e
+                            if !isa(e, Base.IOError)
+                                @warn "SSE channel error" exception = e
+                            end
+                        finally
+                            # Clean up channel
+                            Dashboard.remove_sse_channel(channel_id)
+                        end
+
+                        return nothing
+                    end
+
+                    # Parse limit parameter if present
+                    limit = 100
+                    if occursin("?", req.target)
+                        query = split(req.target, "?")[2]
+                        for param in split(query, "&")
+                            if startswith(param, "limit=")
+                                limit = parse(Int, split(param, "=")[2])
+                            end
+                        end
+                    end
+
+                    events = Dashboard.get_events(limit = limit)
+                    events_json = map(events) do e
+                        Dict(
+                            "id" => e.id,
+                            "type" => string(e.event_type),
+                            "timestamp" =>
+                                Dates.format(e.timestamp, "yyyy-mm-dd HH:MM:SS.sss"),
+                            "data" => e.data,
+                            "duration_ms" => e.duration_ms,
+                        )
+                    end
+                    HTTP.setstatus(http, 200)
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(http, JSON.json(events_json))
+                    return nothing
+                end
+
+                # Dashboard API: logs (not available in standalone mode)
+                if startswith(api_path, "/api/logs")
+                    # In standalone mode, we don't persist logs to files
+                    # Return a helpful message instead of an error
+                    response = Dict(
+                        "content" => "Log file viewing is not available in standalone mode.\n\nIn standalone mode, the Julia REPL output is displayed directly in your terminal.\n\nTo view logs:\n1. Check your terminal where Julia is running\n2. Or use the proxy mode which logs all activity to files",
+                        "file" => "Not available (standalone mode)",
+                        "total_lines" => 0,
+                        "files" => [],
+                    )
+                    HTTP.setstatus(http, 200)
+                    HTTP.setheader(http, "Content-Type" => "application/json")
+                    HTTP.startwrite(http)
+                    write(http, JSON.json(response))
+                    return nothing
+                end
+
+                # Dashboard UI static files (must be last to avoid catching API routes)
+                # Serve root, /dashboard/*, and static assets like /vite.svg, /*.js, /*.css
+                if req.target == "/" ||
+                   startswith(req.target, "/dashboard") ||
+                   endswith(req.target, ".svg") ||
+                   endswith(req.target, ".js") ||
+                   endswith(req.target, ".css") ||
+                   endswith(req.target, ".png") ||
+                   endswith(req.target, ".jpg") ||
+                   endswith(req.target, ".ico")
+
+                    # Check if Vite dev server is running on port 3001
+                    vite_running = try
+                        sock = connect("localhost", 3001)
+                        close(sock)
+                        true
+                    catch
+                        false
+                    end
+
+                    if vite_running
+                        # Proxy to Vite dev server for hot-reloading during development
+                        try
+                            vite_url = "http://localhost:3001$(req.target)"
+                            vite_response = HTTP.get(vite_url)
+
+                            HTTP.setstatus(http, vite_response.status)
+                            for (k, v) in vite_response.headers
+                                HTTP.setheader(http, k => v)
+                            end
+                            HTTP.startwrite(http)
+                            write(http, vite_response.body)
+                            return nothing
+                        catch e
+                            @warn "Failed to proxy to Vite dev server, falling back to static files" exception =
+                                e
+                        end
+                    end
+
+                    # Fallback to static built files
+                    filepath =
+                        req.target == "/" ? "index.html" :
+                        replace(req.target, r"^/dashboard/?" => "")
+                    response = Dashboard.serve_static_file(filepath)
+                    HTTP.setstatus(http, response.status)
+                    for (k, v) in response.headers
+                        HTTP.setheader(http, k => v)
+                    end
+                    HTTP.startwrite(http)
+                    write(http, response.body)
+                    return nothing
+                end
+            end
+
             if isempty(body)
                 HTTP.setstatus(http, 400)
                 HTTP.setheader(http, "Content-Type" => "application/json")
@@ -982,20 +1300,48 @@ function start_mcp_server(
     # Temporarily suppress HTTP.jl's "Listening on" info message
     old_logger = global_logger()
     global_logger(ConsoleLogger(stderr, Logging.Warn))
+
+    # Auto-start Vite dev server in development mode for hot-reloading
+    try
+        dashboard_src = abspath(joinpath(@__DIR__, "..", "dashboard-ui", "src"))
+        if isdir(dashboard_src)
+            # Check if Vite is already running
+            vite_running = try
+                sock = connect("localhost", 3001)
+                close(sock)
+                true
+            catch
+                false
+            end
+
+            if !vite_running
+                dashboard_dir = abspath(joinpath(@__DIR__, "..", "dashboard-ui"))
+                if isdir(joinpath(dashboard_dir, "node_modules"))
+                    @info "Starting Vite dev server for hot-reloading..."
+                    log_file = joinpath(dashboard_dir, ".vite-dev.log")
+                    cd(dashboard_dir) do
+                        log_io = open(log_file, "w")
+                        run(
+                            pipeline(`npm run dev`, stdout = log_io, stderr = log_io),
+                            wait = false,
+                        )
+                    end
+                    sleep(2)  # Give Vite time to start
+                    @info "✅ Vite dev server started on port 3001 (dashboard will hot-reload)"
+                end
+            else
+                @info "Vite dev server already running on port 3001"
+            end
+        end
+    catch e
+        @debug "Could not start Vite dev server (development features disabled)" exception =
+            e
+    end
+
     server = HTTP.serve!(hybrid_handler, port; verbose = false, stream = true)
     global_logger(old_logger)
 
-    # Server started - verbose status is handled by caller
-    # Only show setup tip if clients are not configured
-    if verbose
-        claude_status = MCPRepl.check_claude_status()
-        gemini_status = MCPRepl.check_gemini_status()
-
-        if claude_status == :not_configured || gemini_status == :not_configured
-            println("\n💡 Tip: Run MCPRepl.setup() to configure MCP clients")
-        end
-    end
-
+    # Server started successfully
     return MCPServer(session_uuid, port, server, tools_dict, name_to_id, session)
 end
 

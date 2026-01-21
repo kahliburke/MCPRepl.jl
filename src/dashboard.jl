@@ -44,6 +44,10 @@ const EVENT_LOG_LOCK = ReentrantLock()
 const WS_CLIENTS = Set{HTTP.WebSockets.WebSocket}()
 const WS_CLIENTS_LOCK = ReentrantLock()
 
+# Active SSE channels for standalone mode real-time updates
+const SSE_CHANNELS = Dict{String,Channel{AgentEvent}}()
+const SSE_CHANNELS_LOCK = ReentrantLock()
+
 # Database logging callback (set by proxy during initialization)
 const DB_LOG_CALLBACK = Ref{Union{Function,Nothing}}(nothing)
 
@@ -96,7 +100,7 @@ end
 """
     broadcast_event(event::AgentEvent)
 
-Send event to all connected WebSocket clients.
+Send event to all connected WebSocket clients and SSE channels.
 """
 function broadcast_event(event::AgentEvent)
     event_json = JSON.json(
@@ -109,12 +113,26 @@ function broadcast_event(event::AgentEvent)
         ),
     )
 
+    # Broadcast to WebSocket clients
     lock(WS_CLIENTS_LOCK) do
         for client in WS_CLIENTS
             try
                 HTTP.WebSockets.send(client, event_json)
             catch e
                 @debug "Failed to send to WebSocket client" exception = e
+            end
+        end
+    end
+
+    # Broadcast to SSE channels (standalone mode)
+    lock(SSE_CHANNELS_LOCK) do
+        for (channel_id, channel) in SSE_CHANNELS
+            if isopen(channel)
+                try
+                    put!(channel, event)
+                catch e
+                    @debug "Failed to send to SSE channel" channel_id exception = e
+                end
             end
         end
     end
@@ -136,6 +154,35 @@ function get_events(; id = nothing, limit = 100)
         # Return most recent events
         start_idx = max(1, length(events) - limit + 1)
         return events[start_idx:end]
+    end
+end
+
+"""
+    create_sse_channel(channel_id::String)
+
+Create a new SSE channel for real-time event streaming.
+Returns the created channel.
+"""
+function create_sse_channel(channel_id::String)
+    channel = Channel{AgentEvent}(100)  # Buffer up to 100 events
+    lock(SSE_CHANNELS_LOCK) do
+        SSE_CHANNELS[channel_id] = channel
+    end
+    return channel
+end
+
+"""
+    remove_sse_channel(channel_id::String)
+
+Remove and close an SSE channel.
+"""
+function remove_sse_channel(channel_id::String)
+    lock(SSE_CHANNELS_LOCK) do
+        if haskey(SSE_CHANNELS, channel_id)
+            channel = SSE_CHANNELS[channel_id]
+            close(channel)
+            delete!(SSE_CHANNELS, channel_id)
+        end
     end
 end
 

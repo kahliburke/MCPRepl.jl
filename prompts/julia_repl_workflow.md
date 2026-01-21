@@ -61,10 +61,29 @@ ex(e="function f() ... end", q=false)    # ❌ Definitions
 
 ## Running without the proxy (standalone)
 
-Most users should use the proxy (it enables session management and survives restarts), but you can run the MCP server directly.
+MCPRepl can run in standalone/proxy-compatible mode when the proxy is not available.
 
-- Set `bypass_proxy=true` in your security config, or set `MCPREPL_BYPASS_PROXY=true` in the environment.
-- In standalone mode, `ex`/tools still work normally; proxy-only features (registration/heartbeat/multi-session) are disabled.
+**How to enable:**
+- Set `bypass_proxy=true` in your security config, or
+- Set `MCPREPL_BYPASS_PROXY=true` in the environment, or
+- The proxy auto-detects and falls back to standalone if not running
+
+**Standalone mode features:**
+- ✅ **HTTP JSON-RPC**: Full MCP protocol at `/` or `/mcp` endpoints
+- ✅ **Dashboard UI**: React dashboard at `http://localhost:<port>/`
+- ✅ **WebSocket Updates**: Real-time event streaming at `/ws`
+- ✅ **All MCP Tools**: Complete tool registry accessible via HTTP
+- ❌ **Multi-session**: No proxy routing (single REPL session only)
+- ❌ **Session Management**: No registration/heartbeat with proxy
+
+**When to use standalone mode:**
+- Single-session development without proxy overhead
+- Testing and debugging MCP integrations
+- Simplified deployment scenarios
+- Direct HTTP client access to Julia REPL
+
+In standalone mode, `ex`/tools work normally; proxy-only features (multi-session routing, 
+registration, heartbeat) are disabled.
 
 ## Tool Discovery
 

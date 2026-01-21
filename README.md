@@ -271,6 +271,53 @@ The proxy provides:
 - **Session routing** - Route requests to specific REPL instances
 - **Zero-downtime** - REPL can restart without breaking client connections
 
+### Standalone/Proxy-Compatible Mode
+
+MCPRepl can also run in standalone mode without the proxy, providing a complete HTTP-based
+MCP server with integrated dashboard:
+
+```julia
+using MCPRepl
+
+# Start in standalone mode (no proxy needed)
+MCPRepl.start!(register_with_proxy=false)
+
+# Or configure in security settings
+# bypass_proxy = true
+```
+
+**Standalone mode includes:**
+- ✅ **HTTP JSON-RPC** - Full MCP protocol at `/` or `/mcp` endpoints
+- ✅ **Dashboard UI** - React dashboard at `http://localhost:<port>/` or `/dashboard`
+- ✅ **Dashboard API** - RESTful API at `/api/events` for programmatic access
+- ✅ **WebSocket Updates** - Real-time event streaming at `/ws`
+- ✅ **All MCP Tools** - Complete tool registry accessible via HTTP
+- ✅ **Security layer** - Same API key, IP restrictions as proxy mode
+- ✅ **No dependencies** - Works without running the separate proxy process
+
+**When you start in standalone mode, you'll see:**
+```
+🔌 Standalone Mode (Proxy-Compatible)
+   📊 Dashboard: http://localhost:4000/
+   🔧 MCP JSON-RPC: http://localhost:4000/mcp
+   💡 Tip: This server includes the full dashboard UI and accepts MCP calls via HTTP
+```
+
+**Trade-offs:**
+- ❌ **Single session only** - No multi-REPL routing (proxy feature)
+- ❌ **No session persistence** - REPL restarts break client connections
+
+**When to use standalone mode:**
+- Single-session development workflows
+- Testing and debugging MCP integrations
+- Simplified deployment scenarios
+- Direct HTTP client access without proxy overhead
+
+The standalone mode automatically activates when:
+1. `bypass_proxy=true` in security config, OR
+2. `MCPREPL_BYPASS_PROXY=true` environment variable is set, OR  
+3. Proxy is not running on default port 3000
+
 ### Dashboard
 
 The dashboard is automatically available when the proxy is running:
