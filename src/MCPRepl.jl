@@ -14,6 +14,7 @@ using ReTest
 using CodeTracking
 using Pkg
 using Sockets
+using TOML
 
 export @mcp_tool, MCPTool
 export start!, stop!, test_server
@@ -32,6 +33,7 @@ export setup_security, security_status, generate_key, revoke_key
 export allow_ip, deny_ip, set_security_mode, quick_setup, gentle_setup
 export call_tool, list_tools, tool_help
 export start_proxy, stop_proxy  # Proxy server functions
+export register_tool!, registry  # Project hook API
 export Proxy  # Proxy server module
 # export Generate  # Project template generator module
 # export Dashboard
@@ -877,6 +879,211 @@ function filter_tools_by_config(enabled_tools::Union{Set{Symbol},Nothing})
     return filter(tool -> tool.id in enabled_tools, ALL_TOOLS[])
 end
 
+# ============================================================================
+# Project Hook API for Tool Registration
+# ============================================================================
+
+"""
+    register_tool!(tools::Vector{MCPTool}; name::String, description::String, 
+                   input_schema::Dict, handler::Function, replace::Bool=false) -> Bool
+
+Register a new MCP tool at runtime.
+
+# Arguments
+- `tools`: The tools vector to register into (typically from `registry()`)
+- `name`: Tool name (use namespaced names like "package.tool" to avoid collisions)
+- `description`: Human-readable description of what the tool does
+- `input_schema`: JSON schema for tool parameters
+- `handler`: Function that implements the tool logic
+- `replace`: If `true`, replaces existing tool with same name. If `false`, warns and skips.
+
+# Returns
+`true` if tool was registered, `false` if skipped due to name collision
+
+# Example
+```julia
+function my_project_hook(registry)
+    MCPRepl.register_tool!(
+        registry;
+        name = "myproject.search",
+        description = "Search my project's documentation",
+        input_schema = Dict(
+            "type" => "object",
+            "properties" => Dict(
+                "query" => Dict("type" => "string", "description" => "Search query")
+            ),
+            "required" => ["query"]
+        ),
+        handler = function(args)
+            # Tool implementation
+            return Dict("result" => "Search results for: \$(args["query"])")
+        end
+    )
+end
+```
+"""
+function register_tool!(
+    tools::Vector{MCPTool};
+    name::String,
+    description::String,
+    input_schema::Dict,
+    handler::Function,
+    replace::Bool = false,
+)
+    tool_id = Symbol(Base.replace(name, "." => "_"))  # Convert dots to underscores for symbol
+
+    # Check for existing tool
+    existing_idx = findfirst(t -> t.name == name, tools)
+
+    if existing_idx !== nothing
+        if replace
+            @warn "Replacing existing tool: $name"
+            deleteat!(tools, existing_idx)
+        else
+            @warn "Tool already registered: $name (use replace=true to override)"
+            return false
+        end
+    end
+
+    # Create and register the tool
+    tool = MCPTool(tool_id, name, description, input_schema, handler)
+    push!(tools, tool)
+    @debug "Registered tool: $name" tool_id = tool_id
+    return true
+end
+
+"""
+    registry() -> Vector{MCPTool}
+
+Get the active tool registry. Returns the tools vector that will be used by the MCP server.
+Use this in project hooks to register custom tools.
+
+# Example
+```julia
+# In your package's module:
+function mcp_register_tools!(registry)
+    MCPRepl.register_tool!(
+        registry;
+        name = "mypackage.tool",
+        description = "My custom tool",
+        input_schema = ...,
+        handler = my_handler
+    )
+end
+```
+"""
+function registry()
+    # Return reference to ALL_TOOLS which will be used by start!
+    return ALL_TOOLS[]
+end
+
+"""
+    discover_and_call_project_hook(tools::Vector{MCPTool}; timeout_ms::Int=2000)
+
+Discover and call the active project's MCP tool registration hook if it exists.
+This function is called automatically during MCPRepl startup.
+
+# Hook Contract
+The hook should be defined as:
+```julia
+module MyPackage
+function mcp_register_tools!(registry)
+    # Register tools using MCPRepl.register_tool!(registry; ...)
+end
+end
+```
+
+# Behavior
+- Reads active project from Base.active_project()
+- Attempts to load project package module
+- Calls `mcp_register_tools!(tools)` if defined
+- All errors are caught and logged (non-fatal)
+- Execution is time-limited to prevent startup hangs
+
+# Environment Variables
+- `MCPREPL_DISABLE_PROJECT_HOOK=1` - Disable hook discovery entirely
+"""
+function discover_and_call_project_hook(tools::Vector{MCPTool}; timeout_ms::Int = 2000)
+    # Get active project
+    project_path = try
+        Base.active_project()
+    catch
+        nothing
+    end
+
+    if project_path === nothing || !isfile(project_path)
+        @debug "No active project found, skipping hook discovery"
+        return nothing
+    end
+
+    # Parse Project.toml to get package name
+    project_name = try
+        project_toml = TOML.parsefile(project_path)
+        get(project_toml, "name", nothing)
+    catch e
+        @debug "Failed to parse Project.toml" exception = e
+        nothing
+    end
+
+    if project_name === nothing
+        @debug "Project has no name field (not a package), skipping hook discovery"
+        return nothing
+    end
+
+    @debug "Discovering MCP hook in project package" package = project_name
+
+    # Attempt to load the package module with timeout
+    task = @async begin
+        try
+            # Try to require the package
+            pkg_sym = Symbol(project_name)
+            Base.require(Main, pkg_sym)
+
+            # Get the module
+            pkg_mod = try
+                getfield(Main, pkg_sym)
+            catch
+                nothing
+            end
+
+            if pkg_mod === nothing
+                @debug "Could not resolve package module: $project_name"
+                return nothing
+            end
+
+            # Check if hook exists
+            if !isdefined(pkg_mod, :mcp_register_tools!)
+                @info "No MCP hook found in $project_name; continuing."
+                return nothing
+            end
+
+            hook_fn = getfield(pkg_mod, :mcp_register_tools!)
+
+            # Call the hook
+            @info "Calling MCP hook: $project_name.mcp_register_tools!"
+            hook_fn(tools)
+            @info "✅ Project tools registered from $project_name"
+
+        catch e
+            @warn "Project MCP hook failed (non-fatal)" package = project_name exception =
+                (e, catch_backtrace())
+        end
+    end
+
+    # Wait with timeout
+    timer = Timer(timeout_ms / 1000.0)
+    result = try
+        timedwait(() -> istaskdone(task) || !isopen(timer), timeout_ms / 1000.0; pollint = 0.1)
+        if result == :timed_out
+            @warn "Project hook timed out after $(timeout_ms)ms" package = project_name
+        end
+    finally
+        close(timer)
+    end
+
+    return nothing
+end
+
 
 """
     start!(; port=nothing, verbose=true, security_mode=nothing, julia_session_name="", workspace_dir=pwd())
@@ -1117,6 +1324,17 @@ function start!(;
         if disabled_count > 0
             printstyled("🔧 Tools: ", color = :cyan, bold = true)
             println("$(length(active_tools)) enabled, $disabled_count disabled by config")
+        end
+    end
+
+    # Discover and call project hook for tool registration BEFORE starting server
+    # This ensures project-registered tools are included in the server's tool list
+    if get(ENV, "MCPREPL_DISABLE_PROJECT_HOOK", "") != "1"
+        try
+            # Call synchronously with timeout to avoid startup delays
+            discover_and_call_project_hook(active_tools, timeout_ms = 2000)
+        catch e
+            @debug "Project hook discovery failed (non-fatal)" exception = e
         end
     end
 
@@ -1722,6 +1940,51 @@ Stop the proxy server on the specified port. Wrapper for Proxy.stop_server().
 """
 function stop_proxy(port::Int = 3000)
     return Proxy.stop_server(port)
+end
+
+# ============================================================================
+# Project Hook Example (for testing/demonstration)
+# ============================================================================
+
+"""
+    mcp_register_tools!(registry::Vector{MCPTool})
+
+Example project hook that registers additional tools when MCPRepl starts.
+This demonstrates the project hook API for other packages.
+
+This hook is called automatically during MCPRepl startup if:
+- MCPRepl is the active project
+- MCPREPL_DISABLE_PROJECT_HOOK != "1"
+"""
+function mcp_register_tools!(registry::Vector{MCPTool})
+    @info "🔧 MCPRepl project hook called - registering example tools"
+
+    # Example: Register a custom tool
+    register_tool!(
+        registry;
+        name = "mcprepl.example_tool",
+        description = "Example tool registered via project hook",
+        input_schema = Dict(
+            "type" => "object",
+            "properties" => Dict(
+                "message" =>
+                    Dict("type" => "string", "description" => "A message to echo"),
+            ),
+            "required" => ["message"],
+        ),
+        handler = function (args)
+            msg = get(args, "message", "")
+            # Return a JSON string that the dashboard can display
+            return """
+            {
+              "response": "Project hook received: $msg",
+              "timestamp": "$(Dates.now())"
+            }
+            """
+        end,
+    )
+
+    @info "✅ MCPRepl example tool registered successfully"
 end
 
 end #module
