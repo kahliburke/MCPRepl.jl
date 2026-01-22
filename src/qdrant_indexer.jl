@@ -7,9 +7,23 @@ Uses Ollama for embeddings (nomic-embed-text model).
 
 # Uses QdrantClient and get_ollama_embedding from parent module
 
+# Embedding model configuration
+const DEFAULT_EMBEDDING_MODEL = "snowflake-arctic-embed:latest"  # Best retrieval quality for code search
+const EMBEDDING_CONFIGS = Dict(
+    "snowflake-arctic-embed:latest" => (dims=1024, context_tokens=512, context_chars=1000),
+    "mxbai-embed-large" => (dims=1024, context_tokens=512, context_chars=1000),
+    "nomic-embed-text" => (dims=768, context_tokens=512, context_chars=1000),
+    "text-embedding-3-large" => (dims=3072, context_tokens=8191, context_chars=32000),  # OpenAI (future)
+    "bge-large" => (dims=1024, context_tokens=512, context_chars=1000),
+)
+
 const CHUNK_SIZE = 1500  # Target chunk size in characters
 const CHUNK_OVERLAP = 200  # Overlap between chunks
-const MAX_EMBEDDING_LENGTH = 2000  # Max characters for nomic-embed-text model (512 token limit ~ 2000 chars)
+
+# Get embedding config for a model
+function get_embedding_config(model::String)
+    return get(EMBEDDING_CONFIGS, model, (dims=768, context_tokens=512, context_chars=2000))
+end
 
 # Logging and error tracking for background indexing
 const INDEX_LOGGER = Ref{Union{LoggingExtras.TeeLogger,Nothing}}(nothing)
@@ -383,6 +397,9 @@ function extract_definition!(
         end
     end
 
+    # Extract additional metadata from the expression
+    metadata = extract_definition_metadata(expr, def_type)
+
     push!(
         chunks,
         Dict(
@@ -392,8 +409,132 @@ function extract_definition!(
             "end_line" => end_line,
             "type" => def_type,
             "name" => name,
+            "signature" => get(metadata, "signature", ""),
+            "parameters" => get(metadata, "parameters", []),
+            "type_params" => get(metadata, "type_params", []),
+            "parent_type" => get(metadata, "parent_type", ""),
+            "is_mutable" => get(metadata, "is_mutable", false),
+            "is_exported" => false,  # Set during post-processing
         ),
     )
+end
+
+"""
+    extract_definition_metadata(expr::Expr, def_type::String) -> Dict
+
+Extract detailed metadata from a definition expression.
+Returns a dict with signature, parameters, type parameters, etc.
+"""
+function extract_definition_metadata(expr::Expr, def_type::String)
+    metadata = Dict{String,Any}()
+
+    if expr.head == :function || expr.head == :macro
+        if length(expr.args) >= 1
+            sig = expr.args[1]
+            
+            # Extract full signature
+            metadata["signature"] = string(sig)
+            
+            # Extract parameters
+            params = extract_parameters(sig)
+            metadata["parameters"] = params
+            
+            # Extract type parameters (where clause)
+            type_params = extract_type_parameters(sig)
+            metadata["type_params"] = type_params
+        end
+    elseif expr.head == :struct
+        # Check if mutable
+        metadata["is_mutable"] = length(expr.args) >= 1 && expr.args[1] == true
+        
+        if length(expr.args) >= 2
+            name_expr = expr.args[2]
+            
+            # Extract parent type (for subtypes)
+            if name_expr isa Expr && name_expr.head == :<:
+                metadata["parent_type"] = string(name_expr.args[2])
+            end
+            
+            # Extract type parameters
+            if name_expr isa Expr && name_expr.head == :curly
+                metadata["type_params"] = [string(p) for p in name_expr.args[2:end]]
+            elseif name_expr isa Expr && name_expr.head == :<: && length(name_expr.args) >= 1
+                inner = name_expr.args[1]
+                if inner isa Expr && inner.head == :curly
+                    metadata["type_params"] = [string(p) for p in inner.args[2:end]]
+                end
+            end
+        end
+    elseif expr.head == :abstract || expr.head == :primitive
+        if length(expr.args) >= 2
+            name_expr = expr.args[2]
+            if name_expr isa Expr && name_expr.head == :<:
+                metadata["parent_type"] = string(name_expr.args[2])
+            end
+        end
+    end
+
+    return metadata
+end
+
+"""
+    extract_parameters(sig) -> Vector{String}
+
+Extract parameter names and types from a function signature.
+"""
+function extract_parameters(sig)
+    params = String[]
+    
+    if sig isa Expr
+        # Handle where clause
+        actual_sig = sig.head == :where ? sig.args[1] : sig
+        
+        if actual_sig isa Expr && actual_sig.head == :call && length(actual_sig.args) >= 2
+            for arg in actual_sig.args[2:end]
+                param_str = if arg isa Symbol
+                    string(arg)
+                elseif arg isa Expr && arg.head == :(::)
+                    # x::Type or ::Type
+                    if length(arg.args) >= 2
+                        string(arg.args[1], "::", arg.args[2])
+                    elseif length(arg.args) == 1
+                        string("::", arg.args[1])
+                    else
+                        string(arg)
+                    end
+                elseif arg isa Expr && arg.head == :kw
+                    # Keyword argument: x=default
+                    string(arg.args[1], "=", arg.args[2])
+                elseif arg isa Expr && arg.head == :parameters
+                    # Skip parameters block (handled separately)
+                    continue
+                else
+                    string(arg)
+                end
+                push!(params, param_str)
+            end
+        end
+    end
+    
+    return params
+end
+
+"""
+    extract_type_parameters(sig) -> Vector{String}
+
+Extract type parameters from where clause.
+"""
+function extract_type_parameters(sig)
+    type_params = String[]
+    
+    if sig isa Expr && sig.head == :where
+        # Handle single or multiple type parameters
+        for i in 2:length(sig.args)
+            push!(type_params, string(sig.args[i]))
+        end
+    end
+    
+    return type_params
 end
 
 """
@@ -643,35 +784,58 @@ function index_file(
                 continue
             end
 
-            # Truncate text if it exceeds max embedding length
-            if length(text) > MAX_EMBEDDING_LENGTH
-                text = first(text, MAX_EMBEDDING_LENGTH)
-                with_index_logger(() -> @debug "Truncated chunk for embedding" file = file_path chunk = i original_length = length(chunk["text"]) truncated_length = length(text))
+            # Handle text length based on model's context window
+            embedding_config = get_embedding_config(DEFAULT_EMBEDDING_MODEL)
+            max_length = embedding_config.context_chars
+            
+            # Intelligently truncate if needed (prefer keeping function signature + docstring)
+            if length(text) > max_length
+                original_length = length(text)
+                # Try to keep the beginning (signature + docstring) and end (return statement)
+                keep_start = div(max_length * 7, 10)  # 70% from start
+                keep_end = div(max_length * 3, 10)    # 30% from end
+                if original_length > keep_start + keep_end + 50
+                    text = first(text, keep_start) * "\n# ... ($(original_length - max_length) chars omitted) ...\n" * last(text, keep_end)
+                    text = first(text, max_length)  # Ensure we don't exceed with the marker
+                else
+                    text = first(text, max_length)
+                end
+                with_index_logger(() -> @debug "Truncated chunk for embedding" file = file_path chunk = i original_length = original_length truncated_length = length(text) model = DEFAULT_EMBEDDING_MODEL)
             end
 
             # Get embedding
-            embedding_model = "nomic-embed-text"
-            embedding = get_ollama_embedding(text; model=embedding_model)
+            embedding = get_ollama_embedding(text; model=DEFAULT_EMBEDDING_MODEL)
             if isempty(embedding)
-                with_index_logger(() -> @warn "Failed to get embedding" file = file_path chunk = i model = embedding_model start_line = chunk["start_line"] end_line = chunk["end_line"])
+                with_index_logger(() -> @warn "Failed to get embedding" file = file_path chunk = i model = DEFAULT_EMBEDDING_MODEL start_line = chunk["start_line"] end_line = chunk["end_line"])
                 continue
             end
 
             # Create point with UUID
             point_id = string(Base.UUID(rand(UInt128)))
+            
+            # Build payload with all available metadata
+            payload = Dict(
+                "file" => chunk["file"],
+                "start_line" => chunk["start_line"],
+                "end_line" => chunk["end_line"],
+                "type" => chunk["type"],
+                "name" => chunk["name"],
+                "text" => first(text, 2000),  # Truncate for storage (Unicode-safe)
+            )
+            
+            # Add optional metadata fields if they exist
+            for key in ["signature", "parameters", "type_params", "parent_type", "is_mutable", "is_exported"]
+                if haskey(chunk, key) && !isempty(chunk[key])
+                    payload[key] = chunk[key]
+                end
+            end
+            
             push!(
                 points,
                 Dict(
                     "id" => point_id,
                     "vector" => embedding,
-                    "payload" => Dict(
-                        "file" => chunk["file"],
-                        "start_line" => chunk["start_line"],
-                        "end_line" => chunk["end_line"],
-                        "type" => chunk["type"],
-                        "name" => chunk["name"],
-                        "text" => first(text, 2000),  # Truncate for storage (Unicode-safe)
-                    ),
+                    "payload" => payload,
                 ),
             )
 
@@ -808,11 +972,23 @@ function index_project(
         src_dir = project_path
     end
 
+    # Get vector size for the embedding model
+    embedding_config = get_embedding_config(DEFAULT_EMBEDDING_MODEL)
+    vector_size = embedding_config.dims
+    
     if recreate
-        !silent && println("Recreating collection '$col_name'...")
-        with_index_logger(() -> @info "Recreating collection" collection = col_name)
+        !silent && println("Recreating collection '$col_name' (model: $DEFAULT_EMBEDDING_MODEL, dims: $vector_size)...")
+        with_index_logger(() -> @info "Recreating collection" collection = col_name model = DEFAULT_EMBEDDING_MODEL vector_size = vector_size)
         QdrantClient.delete_collection(col_name)
-        QdrantClient.create_collection(col_name; vector_size=768)
+        QdrantClient.create_collection(col_name; vector_size=vector_size)
+    else
+        # Check if collection exists; create if it doesn't
+        existing_collections = QdrantClient.list_collections()
+        if !(col_name in existing_collections)
+            !silent && println("Creating collection '$col_name' (model: $DEFAULT_EMBEDDING_MODEL, dims: $vector_size)...")
+            with_index_logger(() -> @info "Creating collection" collection = col_name model = DEFAULT_EMBEDDING_MODEL vector_size = vector_size)
+            QdrantClient.create_collection(col_name; vector_size=vector_size)
+        end
     end
 
     !silent && println("Indexing project into collection '$col_name'...")

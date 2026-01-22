@@ -7,6 +7,52 @@ using UUIDs
 include("session.jl")
 using .Session
 
+# ============================================================================
+# Multi-Session Support (In-Memory)
+# ============================================================================
+
+# Global session registry for standalone mode
+const STANDALONE_SESSIONS = Dict{String,MCPSession}()
+const STANDALONE_SESSIONS_LOCK = ReentrantLock()
+
+"""
+    get_or_create_session(session_id::Union{String,Nothing}, is_initialize::Bool) -> (MCPSession, Bool)
+
+Get existing session by ID or create a new one for initialize requests.
+Returns (session, is_new) tuple.
+"""
+function get_or_create_session(session_id::Union{String,Nothing}, is_initialize::Bool)
+    lock(STANDALONE_SESSIONS_LOCK) do
+        if is_initialize
+            # Always create a new session for initialize requests
+            session = MCPSession()
+            STANDALONE_SESSIONS[session.id] = session
+            @info "Created new MCP session" session_id = session.id
+            return (session, true)
+        elseif session_id !== nothing && haskey(STANDALONE_SESSIONS, session_id)
+            # Return existing session
+            return (STANDALONE_SESSIONS[session_id], false)
+        else
+            # No session found - this will be handled by the caller
+            return (nothing, false)
+        end
+    end
+end
+
+"""
+    extract_session_id(req::HTTP.Request) -> Union{String,Nothing}
+
+Extract Mcp-Session-Id header from request.
+"""
+function extract_mcp_session_id(req)
+    for (name, value) in req.headers
+        if lowercase(name) == "mcp-session-id"
+            return String(value)
+        end
+    end
+    return nothing
+end
+
 # Import Prompts module
 include("prompts.jl")
 using .Prompts
@@ -335,7 +381,43 @@ function create_handler(
                 end
             end
 
-            # Handle empty body (like GET requests) - only for JSON-RPC endpoints
+            # Handle GET requests - return 405 per Streamable HTTP spec (we don't support SSE streaming)
+            if req.method == "GET"
+                return HTTP.Response(
+                    405,
+                    ["Content-Type" => "application/json", "Allow" => "POST"],
+                    JSON.json(
+                        Dict(
+                            "jsonrpc" => "2.0",
+                            "id" => nothing,
+                            "error" => Dict(
+                                "code" => -32600,
+                                "message" => "Method Not Allowed - server does not support SSE streaming via GET",
+                            ),
+                        ),
+                    ),
+                )
+            end
+
+            # Handle DELETE requests - return 405 per Streamable HTTP spec
+            if req.method == "DELETE"
+                return HTTP.Response(
+                    405,
+                    ["Content-Type" => "application/json", "Allow" => "POST"],
+                    JSON.json(
+                        Dict(
+                            "jsonrpc" => "2.0",
+                            "id" => nothing,
+                            "error" => Dict(
+                                "code" => -32600,
+                                "message" => "Method Not Allowed - session termination via DELETE not supported",
+                            ),
+                        ),
+                    ),
+                )
+            end
+
+            # Handle empty body for POST requests
             # Note: Static file endpoints (AGENTS.md, OAuth metadata) already handled above
             if isempty(body)
                 error_response = Dict(
@@ -385,16 +467,12 @@ function create_handler(
                     else
                         # Fallback without session management
                         init_result = Dict(
-                            "protocolVersion" => "2024-11-25",
+                            "protocolVersion" => "2025-11-25",
                             "capabilities" => Dict(
                                 "tools" => Dict(),
                                 "prompts" => Dict(),
                                 "resources" => Dict(),
                                 "logging" => Dict(),
-                                "experimental" => Dict(
-                                    "vscode_integration" => true,
-                                    "proxy_routing" => true,
-                                ),
                             ),
                             "serverInfo" =>
                                 Dict("name" => "MCPRepl", "version" => "0.4.0"),
@@ -407,9 +485,14 @@ function create_handler(
                         "result" => init_result,
                     )
 
+                    # Include Mcp-Session-Id header per Streamable HTTP transport spec
+                    session_id = session !== nothing ? session.id : string(UUIDs.uuid4())
                     return HTTP.Response(
                         200,
-                        ["Content-Type" => "application/json"],
+                        [
+                            "Content-Type" => "application/json",
+                            "Mcp-Session-Id" => session_id,
+                        ],
                         JSON.json(response),
                     )
                 catch e
@@ -431,12 +514,12 @@ function create_handler(
 
             # Handle initialized notification
             if request["method"] == "notifications/initialized"
-                # This is a notification, no response needed
+                # This is a notification - return 202 Accepted with no body per Streamable HTTP spec
                 # Mark session as fully initialized if it's in INITIALIZED state
                 if session !== nothing && session.state == Session.INITIALIZED
                     @info "Session initialized" session_id = session.id
                 end
-                return HTTP.Response(200, ["Content-Type" => "application/json"], "{}")
+                return HTTP.Response(202, [], "")
             end
 
             # Handle logging/setLevel request
@@ -874,8 +957,8 @@ function start_mcp_server(
     # Build string→symbol mapping for JSON-RPC
     name_to_id = Dict{String,Symbol}(tool.name => tool.id for tool in tools)
 
-    # Create session for this server
-    session = MCPSession()
+    # Multi-session support: sessions are created/retrieved per Mcp-Session-Id header
+    # Uses the existing Proxy.create_mcp_session() and Proxy.get_mcp_session() infrastructure
 
     # Create a hybrid handler that supports both regular and streaming responses
     function hybrid_handler(http::HTTP.Stream)
@@ -886,7 +969,6 @@ function start_mcp_server(
             tools_dict,
             name_to_id,
             security_config,
-            session,
             port,
         )
     end
@@ -896,7 +978,6 @@ function start_mcp_server(
         tools_dict,
         name_to_id,
         security_config,
-        session,
         port,
     )
         req = http.message
@@ -1100,60 +1181,67 @@ function start_mcp_server(
 
                 # Dashboard API: sessions list
                 if api_path == "/api/sessions"
-                    # In standalone mode, return the current Julia session
+                    # In standalone mode, return all active MCP sessions
                     # Format matches dashboard TypeScript Session interface
-                    sessions = Dict{String,Any}()
-                    if session !== nothing
-                        # Map session state to dashboard status
-                        status =
-                            if session.state in (
-                                Session.UNINITIALIZED,
-                                Session.INITIALIZED,
-                                Session.INITIALIZING,
-                            )
-                                "ready"
-                            elseif session.state == Session.CLOSED
-                                "stopped"
-                            else
-                                "ready"  # Default to ready
-                            end
+                    sessions_response = Dict{String,Any}()
+                    lock(STANDALONE_SESSIONS_LOCK) do
+                        for (sid, sess) in STANDALONE_SESSIONS
+                            # Map session state to dashboard status
+                            status =
+                                if sess.state in (
+                                    Session.UNINITIALIZED,
+                                    Session.INITIALIZED,
+                                    Session.INITIALIZING,
+                                )
+                                    "ready"
+                                elseif sess.state == Session.CLOSED
+                                    "stopped"
+                                else
+                                    "ready"  # Default to ready
+                                end
 
-                        session_info = Dict(
-                            "uuid" => session.id,
-                            "name" => basename(pwd()),  # Use current directory name
-                            "port" => port,
-                            "pid" => getpid(),
-                            "status" => status,
-                            "created_at" =>
-                                Dates.format(session.created_at, "yyyy-mm-dd HH:MM:SS"),
-                            "last_heartbeat" => Dates.format(
-                                session.last_activity,
-                                "yyyy-mm-dd HH:MM:SS",
-                            ),
-                            "last_event" => Dates.format(
-                                session.last_activity,
-                                "yyyy-mm-dd HH:MM:SS",
-                            ),
-                        )
-                        sessions[session.id] = session_info
+                            session_info = Dict(
+                                "uuid" => sess.id,
+                                "name" => basename(pwd()),  # Use current directory name
+                                "port" => port,
+                                "pid" => getpid(),
+                                "status" => status,
+                                "created_at" => Dates.format(
+                                    sess.created_at,
+                                    "yyyy-mm-dd HH:MM:SS",
+                                ),
+                                "last_heartbeat" => Dates.format(
+                                    sess.last_activity,
+                                    "yyyy-mm-dd HH:MM:SS",
+                                ),
+                                "last_event" => Dates.format(
+                                    sess.last_activity,
+                                    "yyyy-mm-dd HH:MM:SS",
+                                ),
+                            )
+                            sessions_response[sess.id] = session_info
+                        end
                     end
 
                     HTTP.setstatus(http, 200)
                     HTTP.setheader(http, "Content-Type" => "application/json")
                     HTTP.startwrite(http)
-                    write(http, JSON.json(sessions))
+                    write(http, JSON.json(sessions_response))
                     return nothing
                 end
 
                 # Dashboard API: proxy info
                 if api_path == "/api/proxy-info"
                     # In standalone mode, return info about this server
+                    num_sessions = lock(STANDALONE_SESSIONS_LOCK) do
+                        length(STANDALONE_SESSIONS)
+                    end
                     proxy_info = Dict(
                         "mode" => "standalone",
                         "version" => "0.8.0",
                         "port" => port,
                         "has_database" => false,
-                        "active_sessions" => session !== nothing ? 1 : 0,
+                        "active_sessions" => num_sessions,
                     )
                     HTTP.setstatus(http, 200)
                     HTTP.setheader(http, "Content-Type" => "application/json")
@@ -1369,6 +1457,46 @@ function start_mcp_server(
                 end
             end
 
+            # Handle GET requests on MCP endpoint - return 405 per Streamable HTTP spec
+            if req.method == "GET" && (
+                req.target == "/mcp" ||
+                req.target == "/" ||
+                startswith(req.target, "/mcp?")
+            )
+                HTTP.setstatus(http, 405)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.setheader(http, "Allow" => "POST")
+                HTTP.startwrite(http)
+                error_response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => nothing,
+                    "error" => Dict(
+                        "code" => -32600,
+                        "message" => "Method Not Allowed - server does not support SSE streaming via GET",
+                    ),
+                )
+                write(http, JSON.json(error_response))
+                return nothing
+            end
+
+            # Handle DELETE requests - return 405 per Streamable HTTP spec
+            if req.method == "DELETE"
+                HTTP.setstatus(http, 405)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.setheader(http, "Allow" => "POST")
+                HTTP.startwrite(http)
+                error_response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => nothing,
+                    "error" => Dict(
+                        "code" => -32600,
+                        "message" => "Method Not Allowed - session termination via DELETE not supported",
+                    ),
+                )
+                write(http, JSON.json(error_response))
+                return nothing
+            end
+
             if isempty(body)
                 HTTP.setstatus(http, 400)
                 HTTP.setheader(http, "Content-Type" => "application/json")
@@ -1379,6 +1507,41 @@ function start_mcp_server(
                     "error" => Dict(
                         "code" => -32600,
                         "message" => "Invalid Request - empty body",
+                    ),
+                )
+                write(http, JSON.json(error_response))
+                return nothing
+            end
+
+            # Session lookup/creation for multi-session support
+            session_id = extract_mcp_session_id(req)
+
+            # Parse request to check if it's an initialize
+            parsed_request = try
+                JSON.parse(body; dicttype = Dict{String,Any})
+            catch
+                nothing
+            end
+
+            is_initialize =
+                parsed_request !== nothing &&
+                get(parsed_request, "method", "") == "initialize"
+
+            # Get or create session
+            session, is_new_session = get_or_create_session(session_id, is_initialize)
+
+            # For non-initialize requests without a valid session, return error
+            if !is_initialize && session === nothing
+                HTTP.setstatus(http, 400)
+                HTTP.setheader(http, "Content-Type" => "application/json")
+                HTTP.startwrite(http)
+                error_response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" =>
+                        parsed_request !== nothing ? get(parsed_request, "id", 0) : 0,
+                    "error" => Dict(
+                        "code" => -32600,
+                        "message" => "Invalid Request - missing or invalid Mcp-Session-Id header. Send initialize request first.",
                     ),
                 )
                 write(http, JSON.json(error_response))
@@ -1470,14 +1633,21 @@ function start_mcp_server(
     server = HTTP.serve!(hybrid_handler, port; verbose = false, stream = true)
     global_logger(old_logger)
 
-    # Server started successfully
-    return MCPServer(session_uuid, port, server, tools_dict, name_to_id, session)
+    # Server started successfully (session is now managed per-request via STANDALONE_SESSIONS)
+    return MCPServer(session_uuid, port, server, tools_dict, name_to_id, nothing)
 end
 
 function stop_mcp_server(server::MCPServer)
-    # Close session if it exists
-    if server.session !== nothing
-        close_session!(server.session)
+    # Close all sessions in the registry
+    lock(STANDALONE_SESSIONS_LOCK) do
+        for (sid, session) in STANDALONE_SESSIONS
+            try
+                close_session!(session)
+            catch e
+                @warn "Error closing session" session_id = sid exception = e
+            end
+        end
+        empty!(STANDALONE_SESSIONS)
     end
 
     HTTP.close(server.server)

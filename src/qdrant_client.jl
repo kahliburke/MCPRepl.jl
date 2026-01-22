@@ -58,7 +58,7 @@ function get_collection_info(collection::String)
 end
 
 """
-    search(collection::String, vector::Vector{Float64}; limit::Int=5, score_threshold::Float64=0.0) -> Vector{Dict}
+    search(collection::String, vector::Vector{Float64}; limit::Int=5, score_threshold::Float64=0.0, filter::Union{Dict,Nothing}=nothing) -> Vector{Dict}
 
 Search for similar vectors in a collection.
 
@@ -67,6 +67,7 @@ Search for similar vectors in a collection.
 - `vector::Vector{Float64}`: Query vector
 - `limit::Int`: Maximum number of results (default: 5)
 - `score_threshold::Float64`: Minimum similarity score (default: 0.0)
+- `filter::Union{Dict,Nothing}`: Qdrant filter for metadata (e.g., Dict("must" => [Dict("key" => "type", "match" => Dict("value" => "function"))]))
 
 # Returns
 Vector of result dictionaries containing id, score, and payload.
@@ -76,6 +77,7 @@ function search(
     vector::Vector{Float64};
     limit::Int = 5,
     score_threshold::Float64 = 0.0,
+    filter::Union{Dict,Nothing} = nothing,
 )
     try
         body = Dict(
@@ -85,6 +87,11 @@ function search(
             "with_payload" => true,
             "with_vector" => false,
         )
+
+        # Add filter if provided
+        if filter !== nothing
+            body["filter"] = filter
+        end
 
         response = HTTP.post(
             "$(QDRANT_URL[])/collections/$(collection)/points/search",

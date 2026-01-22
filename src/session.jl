@@ -182,10 +182,6 @@ function get_server_capabilities()
         "prompts" => Dict{String,Any}(),  # We support prompts
         "resources" => Dict{String,Any}(),  # We support resources
         "logging" => Dict{String,Any}(),  # We support logging
-        "experimental" => Dict{String,Any}(
-            "vscode_integration" => true,  # Custom VS Code integration
-            "proxy_routing" => true,       # Proxy-based routing
-        ),
     )
 end
 

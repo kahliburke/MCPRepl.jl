@@ -228,9 +228,14 @@ qdrant_search_code_tool = @mcp_tool(
                 "type" => "integer",
                 "description" => "Maximum number of results (default: 5)",
             ),
+            "chunk_type" => Dict(
+                "type" => "string",
+                "description" => "Filter by chunk type: 'definitions' (functions/structs only), 'windows' (sliding window chunks only), or 'all' (default: all)",
+                "enum" => ["all", "definitions", "windows"],
+            ),
             "embedding_model" => Dict(
                 "type" => "string",
-                "description" => "Ollama model for embeddings (default: nomic-embed-text)",
+                "description" => "Ollama model for embeddings (default: snowflake-arctic-embed:latest)",
             ),
         ),
         "required" => ["query"],
@@ -238,7 +243,8 @@ qdrant_search_code_tool = @mcp_tool(
     function (args)
         query = get(args, "query", "")
         limit = get(args, "limit", 5)
-        embedding_model = get(args, "embedding_model", "nomic-embed-text")
+        chunk_type = get(args, "chunk_type", "all")
+        embedding_model = get(args, "embedding_model", "snowflake-arctic-embed:latest")
 
         if isempty(query)
             return "Error: query is required"
@@ -261,8 +267,25 @@ qdrant_search_code_tool = @mcp_tool(
             return "Error: Failed to generate embedding. Make sure Ollama is running with model '$embedding_model'."
         end
 
+        # Build filter based on chunk_type
+        filter = nothing
+        if chunk_type == "definitions"
+            # Filter for definition types (function, struct, macro, const, tool)
+            filter = Dict(
+                "should" => [
+                    Dict("key" => "type", "match" => Dict("value" => "function")),
+                    Dict("key" => "type", "match" => Dict("value" => "struct")),
+                    Dict("key" => "type", "match" => Dict("value" => "macro")),
+                    Dict("key" => "type", "match" => Dict("value" => "const")),
+                    Dict("key" => "type", "match" => Dict("value" => "tool")),
+                ],
+            )
+        elseif chunk_type == "windows"
+            filter = Dict("must" => [Dict("key" => "type", "match" => Dict("value" => "window"))])
+        end
+
         # Search
-        results = QdrantClient.search(collection, embedding; limit = limit)
+        results = QdrantClient.search(collection, embedding; limit = limit, filter = filter)
 
         if isempty(results)
             return "No results found for query: \"$query\""
@@ -282,6 +305,13 @@ qdrant_search_code_tool = @mcp_tool(
             end_line = get(payload, "end_line", 0)
             chunk_type = get(payload, "type", "")
             text = get(payload, "text", "")
+            
+            # Extract rich metadata
+            signature = get(payload, "signature", "")
+            parameters = get(payload, "parameters", [])
+            type_params = get(payload, "type_params", [])
+            parent_type = get(payload, "parent_type", "")
+            is_mutable = get(payload, "is_mutable", false)
 
             # Use relative path if possible
             if !isempty(file) && startswith(file, pwd())
@@ -290,10 +320,29 @@ qdrant_search_code_tool = @mcp_tool(
 
             # Compact format: [score] name @ file:L10-20 (type)
             output *= "[$i $(round(score, digits=2))] "
-            output *= isempty(name) ? "" : "$name @ "
+            
+            # Show name with signature if available
+            if !isempty(signature)
+                output *= "$signature @ "
+            elseif !isempty(name)
+                output *= "$name @ "
+            end
+            
             output *= "$file:L$start_line"
             output *= start_line != end_line ? "-$end_line" : ""
-            output *= isempty(chunk_type) ? "" : " ($chunk_type)"
+            
+            # Show type with additional metadata
+            type_info = chunk_type
+            if chunk_type == "struct" && is_mutable
+                type_info = "mutable struct"
+            end
+            if !isempty(parent_type)
+                type_info *= " <: $parent_type"
+            end
+            if !isempty(type_params)
+                type_info *= "{" * join(type_params, ",") * "}"
+            end
+            output *= isempty(type_info) ? "" : " ($type_info)"
             output *= "\n"
 
             # Only show text preview if it's meaningful (>20 chars after strip)
