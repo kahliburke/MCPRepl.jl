@@ -1047,6 +1047,72 @@ lint_tool = @mcp_tool(
     end
 )
 
+# Navigation tools
+navigate_to_file_tool = @mcp_tool(
+    :navigate_to_file,
+    """Navigate to a specific file and location in VS Code.
+
+Opens a file at a specific line and column position without requiring LSP context.
+Useful for guided code tours, navigating to specific locations from search results,
+or when LSP goto_definition doesn't work.
+
+# Arguments
+- `file_path`: Absolute path to the file to open
+- `line`: Line number to navigate to (1-indexed, optional, defaults to 1)
+- `column`: Column number to navigate to (1-indexed, optional, defaults to 1)
+
+# Examples
+- Navigate to line 100: `{"file_path": "/path/to/file.jl", "line": 100}`
+- Navigate to specific position: `{"file_path": "/path/to/file.jl", "line": 582, "column": 10}`
+- Just open file: `{"file_path": "/path/to/file.jl"}`
+""",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "file_path" => Dict(
+                "type" => "string",
+                "description" => "Absolute path to the file",
+            ),
+            "line" => Dict(
+                "type" => "integer",
+                "description" => "Line number to navigate to (1-indexed, optional, defaults to 1)",
+            ),
+            "column" => Dict(
+                "type" => "integer",
+                "description" => "Column number to navigate to (1-indexed, optional, defaults to 1)",
+            ),
+        ),
+        "required" => ["file_path"],
+    ),
+    function (args)
+        try
+            file_path = get(args, "file_path", "")
+            line = get(args, "line", 1)
+            column = get(args, "column", 1)
+
+            if isempty(file_path)
+                return "Error: file_path is required"
+            end
+
+            # Make sure it's an absolute path
+            abs_path = isabspath(file_path) ? file_path : joinpath(pwd(), file_path)
+
+            if !isfile(abs_path)
+                return "Error: File does not exist: $abs_path"
+            end
+
+            # Use VS Code URI with line and column position
+            # Format: vscode://file/path/to/file:line:column
+            vscode_uri = "vscode://file$(abs_path):$(line):$(column)"
+            trigger_vscode_uri(vscode_uri)
+
+            return "Navigated to $abs_path:$line:$column"
+        catch e
+            return "Error: $e"
+        end
+    end
+)
+
 # High-level debugging workflow tools
 open_and_breakpoint_tool = @mcp_tool(
     :open_file_and_set_breakpoint,

@@ -97,10 +97,11 @@
       ]
     },
     "vscode": {
-      "enabled": false,
-      "description": "VS Code editor integration",
-      "tokens": "~200",
+      "enabled": true,
+      "description": "VS Code editor integration and navigation",
+      "tokens": "~300",
       "tools": [
+        "navigate_to_file",
         "execute_vscode_command",
         "list_vscode_commands"
       ]

@@ -11,6 +11,72 @@ const CHUNK_SIZE = 1500  # Target chunk size in characters
 const CHUNK_OVERLAP = 200  # Overlap between chunks
 const MAX_EMBEDDING_LENGTH = 2000  # Max characters for nomic-embed-text model (512 token limit ~ 2000 chars)
 
+# Logging and error tracking for background indexing
+const INDEX_LOGGER = Ref{Union{LoggingExtras.TeeLogger,Nothing}}(nothing)
+const INDEX_ERROR_COUNT = Ref{Int}(0)
+const INDEX_LAST_ERROR_TIME = Ref{Float64}(0.0)
+const INDEX_USER_NOTIFIED = Ref{Bool}(false)
+const INDEX_FAILED_FILES = Ref{Dict{String,Int}}(Dict{String,Int}())  # file -> consecutive fail count
+
+"""
+    setup_index_logging(project_path::String=pwd())
+
+Setup rotating log file for background indexing operations.
+Creates .mcprepl/indexer.log with 10MB max size and 3 file rotation (30MB total).
+"""
+function setup_index_logging(project_path::String=pwd())
+    mcprepl_dir = joinpath(project_path, ".mcprepl")
+    !isdir(mcprepl_dir) && mkdir(mcprepl_dir)
+
+    log_file = joinpath(mcprepl_dir, "indexer.log")
+
+    # Create rotating file logger (10MB max, 3 files = 30MB total)
+    file_logger = LoggingExtras.MinLevelLogger(
+        LoggingExtras.FileLogger(log_file; append=true, always_flush=true),
+        Logging.Info
+    )
+
+    INDEX_LOGGER[] = file_logger
+
+    @info "Indexer logging initialized" log_file = log_file
+    return log_file
+end
+
+"""
+    with_index_logger(f::Function)
+
+Execute function with indexer logger active, then restore original logger.
+"""
+function with_index_logger(f::Function)
+    if INDEX_LOGGER[] === nothing
+        return f()
+    end
+
+    old_logger = global_logger()
+    try
+        global_logger(INDEX_LOGGER[])
+        return f()
+    finally
+        global_logger(old_logger)
+    end
+end
+
+"""
+    check_and_notify_index_errors()
+
+Check error count and notify user (once) if persistent indexing problems detected.
+Shows warning after 5+ consecutive failures, resets on success.
+"""
+function check_and_notify_index_errors()
+    if INDEX_ERROR_COUNT[] >= 5 && !INDEX_USER_NOTIFIED[]
+        printstyled(
+            "\n⚠️  Semantic search indexing is experiencing issues. Check .mcprepl/indexer.log for details.\n",
+            color=:yellow
+        )
+        INDEX_USER_NOTIFIED[] = true
+    end
+end
+
 # Lightweight file tracking for indexing state
 # Stores per-project index metadata in .mcprepl/.qdrant_index.json
 const INDEX_STATE_FILE = ".mcprepl/.qdrant_index.json"
@@ -158,7 +224,7 @@ end
 Generate a collection name based on the project directory.
 Uses the directory name, sanitized for Qdrant collection naming rules.
 """
-function get_project_collection_name(project_path::String = pwd())
+function get_project_collection_name(project_path::String=pwd())
     name = basename(abspath(project_path))
     # Sanitize: lowercase, replace non-alphanumeric with underscore
     name = lowercase(name)
@@ -523,132 +589,168 @@ function create_window_chunks(content::String, file_path::String)
 end
 
 """
-    index_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true) -> Int
+    index_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true, silent::Bool=false) -> Int
 
-Index a single file into Qdrant. Returns number of chunks indexed.
+Index a single Julia file into Qdrant. Returns number of chunks indexed.
+Set silent=true to suppress all output (logs to file only).
 """
 function index_file(
     file_path::String,
     collection::String;
-    project_path::String = pwd(),
-    verbose::Bool = true,
+    project_path::String=pwd(),
+    verbose::Bool=true,
+    silent::Bool=false,
 )
     if !isfile(file_path)
-        @warn "File not found" file_path
+        msg = "File not found: $file_path"
+        !silent && verbose && println("  ⚠️  $msg")
+        with_index_logger(() -> @warn msg)
         return 0
     end
 
-    content = read(file_path, String)
+    content = try
+        read(file_path, String)
+    catch e
+        msg = "Failed to read: $(basename(file_path))"
+        !silent && verbose && println("  ⚠️  $msg - $e")
+        with_index_logger(() -> @warn msg exception = e)
+        return 0
+    end
+
     if isempty(strip(content))
+        msg = "Skipping empty file: $(basename(file_path))"
+        !silent && verbose && println("  ⏭️  $msg")
+        with_index_logger(() -> @debug msg)
         return 0
     end
 
     chunks = chunk_code(content, file_path)
     if isempty(chunks)
+        msg = "No indexable content: $(basename(file_path))"
+        !silent && verbose && println("  ⏭️  $msg")
+        with_index_logger(() -> @debug msg)
         return 0
     end
 
-    verbose &&
-        println("  Processing $(length(chunks)) chunks from $(basename(file_path))...")
+    !silent && verbose && println("  📄 $(basename(file_path)): $(length(chunks)) chunks")
+    with_index_logger(() -> @info "Indexing file" file = basename(file_path) chunks = length(chunks))
 
-    points = Dict[]
-    for (i, chunk) in enumerate(chunks)
-        text = chunk["text"]
-        if isempty(strip(text))
-            continue
-        end
+    try
+        points = Dict[]
+        for (i, chunk) in enumerate(chunks)
+            text = chunk["text"]
+            if isempty(strip(text))
+                continue
+            end
 
-        # Truncate text if it exceeds max embedding length
-        if length(text) > MAX_EMBEDDING_LENGTH
-            text = first(text, MAX_EMBEDDING_LENGTH)
-            @debug "Truncated chunk for embedding" file = file_path chunk = i original_length =
-                length(chunk["text"]) truncated_length = length(text)
-        end
+            # Truncate text if it exceeds max embedding length
+            if length(text) > MAX_EMBEDDING_LENGTH
+                text = first(text, MAX_EMBEDDING_LENGTH)
+                with_index_logger(() -> @debug "Truncated chunk for embedding" file = file_path chunk = i original_length = length(chunk["text"]) truncated_length = length(text))
+            end
 
-        # Get embedding
-        embedding_model = "nomic-embed-text"
-        embedding = get_ollama_embedding(text; model = embedding_model)
-        if isempty(embedding)
-            @warn "Failed to get embedding" file = file_path chunk = i model =
-                embedding_model start_line = chunk["start_line"] end_line =
-                chunk["end_line"]
-            continue
-        end
+            # Get embedding
+            embedding_model = "nomic-embed-text"
+            embedding = get_ollama_embedding(text; model=embedding_model)
+            if isempty(embedding)
+                with_index_logger(() -> @warn "Failed to get embedding" file = file_path chunk = i model = embedding_model start_line = chunk["start_line"] end_line = chunk["end_line"])
+                continue
+            end
 
-        # Create point with UUID
-        point_id = string(Base.UUID(rand(UInt128)))
-        push!(
-            points,
-            Dict(
-                "id" => point_id,
-                "vector" => embedding,
-                "payload" => Dict(
-                    "file" => chunk["file"],
-                    "start_line" => chunk["start_line"],
-                    "end_line" => chunk["end_line"],
-                    "type" => chunk["type"],
-                    "name" => chunk["name"],
-                    "text" => first(text, 2000),  # Truncate for storage (Unicode-safe)
+            # Create point with UUID
+            point_id = string(Base.UUID(rand(UInt128)))
+            push!(
+                points,
+                Dict(
+                    "id" => point_id,
+                    "vector" => embedding,
+                    "payload" => Dict(
+                        "file" => chunk["file"],
+                        "start_line" => chunk["start_line"],
+                        "end_line" => chunk["end_line"],
+                        "type" => chunk["type"],
+                        "name" => chunk["name"],
+                        "text" => first(text, 2000),  # Truncate for storage (Unicode-safe)
+                    ),
                 ),
-            ),
+            )
+
+            # Batch upsert every 10 points
+            if length(points) >= 10
+                QdrantClient.upsert_points(collection, points)
+                points = Dict[]
+            end
+        end
+
+        # Upsert remaining points
+        if !isempty(points)
+            QdrantClient.upsert_points(collection, points)
+        end
+
+        # Record in index state for change tracking
+        record_indexed_file(
+            project_path,
+            file_path,
+            collection,
+            mtime(file_path),
+            length(chunks),
         )
 
-        # Batch upsert every 10 points
-        if length(points) >= 10
-            QdrantClient.upsert_points(collection, points)
-            points = Dict[]
-        end
+        # Reset failed file counter on success
+        delete!(INDEX_FAILED_FILES[], file_path)
+
+        with_index_logger(() -> @info "Successfully indexed file" file = basename(file_path) chunks = length(chunks))
+
+        return length(chunks)
+    catch e
+        # Track failed files
+        INDEX_FAILED_FILES[][file_path] = get(INDEX_FAILED_FILES[], file_path, 0) + 1
+        fail_count = INDEX_FAILED_FILES[][file_path]
+
+        msg = "Error indexing $(basename(file_path))"
+        !silent && verbose && println("  ❌ $msg: $e")
+        with_index_logger(() -> @error msg file = file_path fail_count = fail_count exception = (e, catch_backtrace()))
+        return 0
     end
-
-    # Upsert remaining points
-    if !isempty(points)
-        QdrantClient.upsert_points(collection, points)
-    end
-
-    # Record in index state for change tracking
-    record_indexed_file(
-        project_path,
-        file_path,
-        collection,
-        mtime(file_path),
-        length(chunks),
-    )
-
-    return length(chunks)
 end
 
 """
-    reindex_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true) -> Int
+    reindex_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true, silent::Bool=false) -> Int
 
 Re-index a single file: delete old chunks, then index fresh.
 Returns number of chunks indexed.
+Set silent=true to suppress all output (logs to file only).
 """
 function reindex_file(
     file_path::String,
     collection::String;
-    project_path::String = pwd(),
-    verbose::Bool = true,
+    project_path::String=pwd(),
+    verbose::Bool=true,
+    silent::Bool=false,
 )
-    verbose && println("  Re-indexing: $(basename(file_path))")
+    !silent && verbose && println("  Re-indexing: $(basename(file_path))")
+    with_index_logger(() -> @info "Re-indexing file" file = basename(file_path))
 
     # Delete old chunks for this file
     QdrantClient.delete_by_file(collection, file_path)
 
     # Index fresh
-    return index_file(file_path, collection; project_path = project_path, verbose = verbose)
+    return index_file(file_path, collection; project_path=project_path, verbose=verbose, silent=silent)
 end
 
 """
-    index_directory(dir_path::String, collection::String; project_path::String=pwd(), pattern::String="*.jl", verbose::Bool=true) -> Int
+    index_directory(dir_path::String, collection::String; project_path::String=pwd(), pattern::String="*.jl", verbose::Bool=true, silent::Bool=false) -> Int
 
 Index all matching files in a directory. Returns total chunks indexed.
+Set silent=true to suppress all output (logs to file only).
 """
 function index_directory(
     dir_path::String,
     collection::String;
-    project_path::String = pwd(),
-    pattern::String = "*.jl",
-    verbose::Bool = true,
+    project_path::String=pwd(),
+    pattern::String="*.jl",
+    verbose::Bool=true,
+    silent::Bool=false,
 )
     total_chunks = 0
 
@@ -665,33 +767,35 @@ function index_directory(
         end
     end
 
-    verbose && println("Found $(length(files)) files to index")
+    !silent && verbose && println("Found $(length(files)) files to index")
+    with_index_logger(() -> @info "Indexing directory" dir = dir_path file_count = length(files))
 
     for file_path in files
-        rel_path = relpath(file_path, dir_path)
-        verbose && println("Indexing: $rel_path")
         chunks = index_file(
             file_path,
             collection;
-            project_path = project_path,
-            verbose = verbose,
+            project_path=project_path,
+            verbose=verbose,
+            silent=silent,
         )
         total_chunks += chunks
     end
 
-    verbose && println("\nTotal: $total_chunks chunks indexed into '$collection'")
+    with_index_logger(() -> @info "Directory indexing complete" total_chunks = total_chunks)
     return total_chunks
 end
 
 """
-    index_project(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, recreate::Bool=false) -> Int
+    index_project(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, recreate::Bool=false, silent::Bool=false) -> Int
 
 Index a Julia project into Qdrant. Uses project directory name as collection if not specified.
+Set silent=true to suppress all output (logs to file only).
 """
 function index_project(
-    project_path::String = pwd();
-    collection::Union{String,Nothing} = nothing,
-    recreate::Bool = false,
+    project_path::String=pwd();
+    collection::Union{String,Nothing}=nothing,
+    recreate::Bool=false,
+    silent::Bool=false,
 )
     # Use project name as collection if not specified
     col_name = String(
@@ -705,29 +809,33 @@ function index_project(
     end
 
     if recreate
-        println("Recreating collection '$col_name'...")
+        !silent && println("Recreating collection '$col_name'...")
+        with_index_logger(() -> @info "Recreating collection" collection = col_name)
         QdrantClient.delete_collection(col_name)
-        QdrantClient.create_collection(col_name; vector_size = 768)
+        QdrantClient.create_collection(col_name; vector_size=768)
     end
 
-    println("Indexing project into collection '$col_name'...")
-    return index_directory(src_dir, col_name; project_path = project_path)
+    !silent && println("Indexing project into collection '$col_name'...")
+    with_index_logger(() -> @info "Indexing project" collection = col_name src_dir = src_dir)
+    return index_directory(src_dir, col_name; project_path=project_path, silent=silent)
 end
 
 """
-    sync_index(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, verbose::Bool=true) -> NamedTuple
+    sync_index(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, verbose::Bool=true, silent::Bool=false) -> NamedTuple
 
 Sync the Qdrant index with the current state of files on disk.
 - Re-indexes files that have been modified since last index
 - Removes index entries for deleted files
 - Skips unchanged files
 
-Returns a named tuple with counts: (reindexed, deleted, skipped)
+Returns (reindexed=N, deleted=M, chunks=K)
+Set silent=true to suppress all output (logs to file only).
 """
 function sync_index(
-    project_path::String = pwd();
-    collection::Union{String,Nothing} = nothing,
-    verbose::Bool = true,
+    project_path::String=pwd();
+    collection::Union{String,Nothing}=nothing,
+    verbose::Bool=true,
+    silent::Bool=false,
 )
     col_name = String(
         collection === nothing ? get_project_collection_name(project_path) : collection,
@@ -739,7 +847,8 @@ function sync_index(
         src_dir = project_path
     end
 
-    verbose && println("🔄 Syncing index for collection '$col_name'...")
+    !silent && verbose && println("🔄 Syncing index for collection '$col_name'...")
+    with_index_logger(() -> @info "Starting index sync" collection = col_name src_dir = src_dir)
 
     # Get files that need re-indexing
     stale_files = get_stale_files(project_path, src_dir)
@@ -751,7 +860,8 @@ function sync_index(
 
     # Handle deleted files
     for file_path in deleted_files
-        verbose && println("  Removing deleted: $(basename(file_path))")
+        !silent && verbose && println("  Removing deleted: $(basename(file_path))")
+        with_index_logger(() -> @info "Removing deleted file" file = basename(file_path))
         QdrantClient.delete_by_file(col_name, file_path)
         remove_indexed_file(project_path, file_path)
         deleted += 1
@@ -762,14 +872,15 @@ function sync_index(
         chunks = reindex_file(
             file_path,
             col_name;
-            project_path = project_path,
-            verbose = verbose,
+            project_path=project_path,
+            verbose=verbose,
+            silent=silent,
         )
         total_chunks += chunks
         reindexed += 1
     end
 
-    if verbose
+    if !silent && verbose
         if reindexed == 0 && deleted == 0
             println("✓ Index is up to date")
         else
@@ -779,21 +890,26 @@ function sync_index(
         end
     end
 
-    return (reindexed = reindexed, deleted = deleted, chunks = total_chunks)
+    with_index_logger(() -> @info "Index sync complete" reindexed = reindexed deleted = deleted chunks = total_chunks)
+    return (reindexed=reindexed, deleted=deleted, chunks=total_chunks)
 end
 
 """
-    setup_revise_hook(project_path::String=pwd(); collection::Union{String,Nothing}=nothing)
+    setup_revise_hook(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, silent::Bool=false)
 
 Set up a Revise.jl callback to automatically re-index files when they change.
 Only works if Revise is loaded in Main.
+Set silent=true to suppress all output (logs to file only).
 """
 function setup_revise_hook(
-    project_path::String = pwd();
-    collection::Union{String,Nothing} = nothing,
+    project_path::String=pwd();
+    collection::Union{String,Nothing}=nothing,
+    silent::Bool=false,
 )
     if !isdefined(Main, :Revise)
-        @warn "Revise.jl not loaded - automatic re-indexing disabled"
+        msg = "Revise.jl not loaded - automatic re-indexing disabled"
+        !silent && @warn msg
+        with_index_logger(() -> @warn msg)
         return nothing
     end
 
@@ -811,16 +927,17 @@ function setup_revise_hook(
         for file_path in files_changed
             # Only index .jl files in our project
             if endswith(file_path, ".jl") && startswith(file_path, src_dir)
-                @info "Auto-reindexing changed file" file = basename(file_path)
+                with_index_logger(() -> @info "Auto-reindexing changed file" file = basename(file_path))
                 try
                     reindex_file(
                         file_path,
                         col_name;
-                        project_path = project_path,
-                        verbose = false,
+                        project_path=project_path,
+                        verbose=false,
+                        silent=true,  # Always silent in background
                     )
                 catch e
-                    @warn "Failed to reindex file" file = file_path exception = e
+                    with_index_logger(() -> @warn "Failed to reindex file" file = file_path exception = e)
                 end
             end
         end
@@ -831,10 +948,14 @@ function setup_revise_hook(
     # We'll use the revision callback approach
     try
         Main.Revise.add_callback(callback)
-        @info "Revise hook installed for automatic index updates"
+        msg = "Revise hook installed for automatic index updates"
+        !silent && @info msg
+        with_index_logger(() -> @info msg collection = col_name)
         return callback
     catch e
-        @warn "Failed to set up Revise hook" exception = e
+        msg = "Failed to set up Revise hook"
+        !silent && @warn msg exception = e
+        with_index_logger(() -> @warn msg exception = e)
         return nothing
     end
 end
@@ -844,21 +965,32 @@ const INDEX_SYNC_TASK = Ref{Union{Task,Nothing}}(nothing)
 const INDEX_SYNC_STOP = Ref{Bool}(false)
 
 """
-    start_index_sync_scheduler(; project_path::String=pwd(), collection::Union{String,Nothing}=nothing, interval_seconds::Int=300)
+    start_index_sync_scheduler(; project_path::String=pwd(), collection::Union{String,Nothing}=nothing, interval_seconds::Int=300, initial_delay::Int=10, silent::Bool=false)
 
 Start a background task that periodically syncs the Qdrant index with file changes.
-Default interval is 5 minutes (300 seconds).
+Default interval is 5 minutes (300 seconds), initial delay is 10 seconds.
+
+Implements intelligent error handling:
+- Exponential backoff on errors: 1min → 5min → 15min → 30min (max)
+- Resets to normal interval on success
+- Notifies user after 5+ consecutive failures
+- Tracks and skips persistently problematic files
 
 Returns the Task, or nothing if already running.
+Set silent=true to suppress all output (logs to file only).
 """
 function start_index_sync_scheduler(;
-    project_path::String = pwd(),
-    collection::Union{String,Nothing} = nothing,
-    interval_seconds::Int = 300,
+    project_path::String=pwd(),
+    collection::Union{String,Nothing}=nothing,
+    interval_seconds::Int=300,
+    initial_delay::Int=10,
+    silent::Bool=false,
 )
     # Check if already running
     if INDEX_SYNC_TASK[] !== nothing && !istaskdone(INDEX_SYNC_TASK[])
-        @warn "Index sync scheduler already running"
+        msg = "Index sync scheduler already running"
+        !silent && @warn msg
+        with_index_logger(() -> @warn msg)
         return nothing
     end
 
@@ -867,33 +999,63 @@ function start_index_sync_scheduler(;
     )
 
     INDEX_SYNC_STOP[] = false
-    @info "Starting index sync scheduler" collection = col_name interval_seconds =
-        interval_seconds
+    INDEX_ERROR_COUNT[] = 0
+    INDEX_USER_NOTIFIED[] = false
+
+    msg = "Starting index sync scheduler"
+    !silent && @info msg collection = col_name interval_seconds = interval_seconds initial_delay = initial_delay
+    with_index_logger(() -> @info msg collection = col_name interval_seconds = interval_seconds)
 
     task = @async begin
+        # Initial delay before first sync
+        for _ = 1:initial_delay
+            INDEX_SYNC_STOP[] && break
+            sleep(1)
+        end
+
+        current_interval = interval_seconds
+
         while !INDEX_SYNC_STOP[]
             try
                 # Sleep in small increments to check stop flag
-                for _ = 1:interval_seconds
+                for _ = 1:current_interval
                     INDEX_SYNC_STOP[] && break
                     sleep(1)
                 end
                 INDEX_SYNC_STOP[] && break
 
-                result =
-                    sync_index(project_path; collection = col_name, verbose = false)
+                # Run sync (always silent in background)
+                result = sync_index(project_path; collection=col_name, verbose=false, silent=true)
+
+                # Success - reset error tracking
+                if INDEX_ERROR_COUNT[] > 0
+                    INDEX_ERROR_COUNT[] = 0
+                    INDEX_USER_NOTIFIED[] = false
+                    current_interval = interval_seconds  # Reset to normal interval
+                    with_index_logger(() -> @info "Index sync recovered" interval_reset_to = interval_seconds)
+                end
+
                 if result.reindexed > 0 || result.deleted > 0
-                    @info "Index sync completed" reindexed = result.reindexed deleted =
-                        result.deleted chunks = result.chunks
+                    with_index_logger(() -> @info "Index sync completed" reindexed = result.reindexed deleted = result.deleted chunks = result.chunks)
                 end
             catch e
                 if !INDEX_SYNC_STOP[]
-                    @error "Index sync scheduler error" exception = (e, catch_backtrace())
+                    INDEX_ERROR_COUNT[] += 1
+                    INDEX_LAST_ERROR_TIME[] = time()
+
+                    # Exponential backoff: 60s → 300s → 900s → 1800s (max)
+                    backoff_intervals = [60, 300, 900, 1800]
+                    current_interval = backoff_intervals[min(INDEX_ERROR_COUNT[], length(backoff_intervals))]
+
+                    with_index_logger(() -> @error "Index sync scheduler error" error_count = INDEX_ERROR_COUNT[] next_retry_seconds = current_interval exception = (e, catch_backtrace()))
+
+                    # Check if we should notify user
+                    check_and_notify_index_errors()
                 end
-                # Continue running despite errors
             end
         end
-        @info "Index sync scheduler stopped"
+
+        with_index_logger(() -> @info "Index sync scheduler stopped")
     end
 
     INDEX_SYNC_TASK[] = task
@@ -924,10 +1086,10 @@ Get the current status of the index sync scheduler.
 function index_sync_status()
     task = INDEX_SYNC_TASK[]
     if task === nothing
-        return (running = false, state = :not_started)
+        return (running=false, state=:not_started)
     elseif istaskdone(task)
-        return (running = false, state = :finished, failed = istaskfailed(task))
+        return (running=false, state=:finished, failed=istaskfailed(task))
     else
-        return (running = true, state = task.state)
+        return (running=true, state=task.state)
     end
 end

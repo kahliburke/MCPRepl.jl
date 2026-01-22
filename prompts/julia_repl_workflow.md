@@ -1,6 +1,43 @@
 # Julia REPL Workflow Guide
 
-**Start here:** `ex()` is the primary tool. Use it for almost everything.
+## 🌟 POWERFUL TOOLS - USE THESE INSTEAD OF GREP/SHELL
+
+**MCPRepl gives you Julia-native code discovery tools that are far superior to grep, find, or shell commands:**
+
+### 🔍 Semantic Code Search (Use Instead of Grep)
+- **`qdrant_search_code(query="...")`** - Find code by *meaning*, not keywords
+  - Example: `"function that handles HTTP routing"` finds relevant handlers even without those exact words
+  - Example: `"parse command line arguments"` finds CLI parsing code
+  - **Why better than grep:** Understands code semantics, finds conceptually related code, works across different naming conventions
+
+### 🔬 Deep Type Introspection (Use Instead of Manual Inspection)
+- **`type_info("Type")`** - Complete type information: fields, hierarchy, properties, subtypes
+  - Example: `type_info("Vector{Int}")` shows all fields, supertype chain, direct subtypes
+  - **Why better than manual:** Instant complete picture of any type's structure
+
+### 🎯 Method Discovery (Use Instead of Searching Files)
+- **`search_methods("function")`** - Find all methods/overloads of a function or type
+  - Example: `search_methods("println")` shows all println signatures
+  - Example: `search_methods("String")` shows all methods accepting String
+  - **Why better than grep:** Shows actual signatures with types, finds all overloads
+
+### 📚 Symbol Discovery (Use Instead of Tab Completion)
+- **`list_names("Module")`** - List all exported (or all) names in a module
+  - Example: `list_names("Base")` shows all Base exports
+  - Example: `list_names("MyPackage", all=true)` shows all symbols including internal
+  - **Why better than manual:** Instant overview of available functionality
+
+### 🧭 LSP Navigation (Use Instead of File Searching)
+- **`lsp_goto_definition(file, line, col)`** - Jump to where symbol is defined
+- **`lsp_find_references(file, line, col)`** - Find all usages of a symbol
+- **`lsp_workspace_symbols(query)`** - Search for symbols across entire workspace
+- **Why better than grep:** Understands code structure, follows imports, ignores comments/strings
+
+---
+
+## ⚡ Primary Execution Tool
+
+**`ex()`** is your primary tool for running code, tests, docs, loading packages - use it for almost everything.
 
 **New to MCPRepl?** → `usage_quiz()` then `usage_quiz(show_sols=true)` to self-grade
 
@@ -114,3 +151,24 @@ registration, heartbeat) are disabled.
 **Session start:** `investigate_environment()` → check packages → work
 **Revise fails:** `restart_repl()` → wait 5-10s → `ping()`
 **Testing:** Use `ex()` with `@test` / `@testset`
+## Quick Reference
+
+**Code Discovery (Use these, not grep!):**
+- `qdrant_search_code(query="...")` - Semantic search by meaning  
+- `type_info("Type")` - Deep type inspection
+- `search_methods("func")` - Find all method signatures
+- `list_names("Module")` - Discover available symbols
+- `lsp_goto_definition()`, `lsp_find_references()`, `lsp_workspace_symbols()` - Navigate code
+
+**Execution & Environment:**
+- `ex(e="code")` - Run Julia code (primary tool, use for almost everything)
+- `investigate_environment()` - Check packages, Revise status
+- `pkg_add(packages=["Name"])` - Add packages
+- `restart_repl()` - Restart if needed (rare)
+
+**Utilities:**
+- `format_code(path)` - Format Julia files
+- `ping()` - Check server status
+- `tool_help("name")` - Get help on any tool
+
+> **Note:** If `qdrant_search_code` errors about embeddings, ensure Ollama is running with model `nomic-embed-text`.

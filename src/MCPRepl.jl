@@ -15,6 +15,7 @@ using CodeTracking
 using Pkg
 using Sockets
 using TOML
+using LoggingExtras
 
 export @mcp_tool, MCPTool
 export start!, stop!, test_server
@@ -1300,6 +1301,7 @@ function start!(;
         code_typed_tool,
         format_tool,
         lint_tool,
+        navigate_to_file_tool,
         open_and_breakpoint_tool,
         start_debug_session_tool,
         add_watch_expression_tool,
@@ -1587,6 +1589,29 @@ function start!(;
     else
         atreplinit(set_prefix!)
     end
+
+    # Start automatic background indexing (silent, non-blocking)
+    try
+        @async begin
+            # Setup logging first
+            setup_index_logging(workspace_dir)
+
+            # Start background indexing with dual monitoring:
+            # 1. Revise hook for immediate reindexing on file save
+            # 2. Periodic scheduler for catching missed changes
+            setup_revise_hook(workspace_dir; silent = true)
+            start_index_sync_scheduler(
+                project_path = workspace_dir,
+                interval_seconds = 300,  # 5 minutes
+                initial_delay = 10,  # Wait 10 seconds after startup
+                silent = true,
+            )
+        end
+    catch e
+        # Never let indexing failure break server startup
+        @debug "Failed to start background indexing (non-fatal)" exception = e
+    end
+
     nothing
 end
 
@@ -1630,6 +1655,14 @@ end
 function stop!()
     if SERVER[] !== nothing
         println("Stop existing server...")
+
+        # Stop background indexing scheduler
+        try
+            stop_index_sync_scheduler()
+        catch e
+            @debug "Failed to stop index sync scheduler" exception = e
+        end
+
         stop_mcp_server(SERVER[])
         SERVER[] = nothing
         if isdefined(Base, :active_repl) && Base.active_repl !== nothing

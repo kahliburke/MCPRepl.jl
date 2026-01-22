@@ -1,17 +1,24 @@
 goto_definition_tool = @mcp_tool(
     :lsp_goto_definition,
-    "Find the definition of a symbol using Julia LSP. Navigates to the source code location where a given symbol is defined.",
+    "Find where a symbol is defined using Julia LSP. Provide the position where a symbol is USED/REFERENCED, and this returns the file path and position where that symbol is DEFINED. Returns text information only by default. Set navigate=true to automatically open the definition location in VS Code. Useful for understanding code structure: 'where does this function/type come from?'",
     Dict(
         "type" => "object",
         "properties" => Dict(
             "file_path" => Dict(
                 "type" => "string",
-                "description" => "Absolute path to the file",
+                "description" => "Absolute path to the file where the symbol is referenced/used",
             ),
-            "line" => Dict("type" => "integer", "description" => "Line number (1-indexed)"),
+            "line" => Dict(
+                "type" => "integer",
+                "description" => "Line number where the symbol is referenced (1-indexed)",
+            ),
             "column" => Dict(
                 "type" => "integer",
-                "description" => "Column number (1-indexed)",
+                "description" => "Column number where the symbol is referenced (1-indexed)",
+            ),
+            "navigate" => Dict(
+                "type" => "boolean",
+                "description" => "Automatically navigate to the definition location in VS Code (default: false)",
             ),
         ),
         "required" => ["file_path", "line", "column"],
@@ -21,6 +28,7 @@ goto_definition_tool = @mcp_tool(
             file_path = get(args, "file_path", "")
             line = get(args, "line", 1)
             column = get(args, "column", 1)
+            navigate = get(args, "navigate", false)
 
             if isempty(file_path)
                 return "Error: file_path is required"
@@ -28,6 +36,33 @@ goto_definition_tool = @mcp_tool(
 
             if !isfile(file_path)
                 return "Error: File not found: $file_path"
+            end
+
+            # Extract the symbol name at the given position
+            symbol_name = ""
+            try
+                lines = readlines(file_path)
+                if line <= length(lines)
+                    text_line = lines[line]
+                    # Extract word at column position (simple word boundary extraction)
+                    if column <= length(text_line)
+                        # Find start of symbol (alphanumeric, underscore, or !)
+                        start_col = column
+                        while start_col > 1 &&
+                            occursin(r"[A-Za-z0-9_!]", string(text_line[start_col-1]))
+                            start_col -= 1
+                        end
+                        # Find end of symbol
+                        end_col = column
+                        while end_col <= length(text_line) &&
+                            occursin(r"[A-Za-z0-9_!]", string(text_line[end_col]))
+                            end_col += 1
+                        end
+                        symbol_name = text_line[start_col:end_col-1]
+                    end
+                end
+            catch
+                # Ignore errors in symbol extraction
             end
 
             # Convert to LSP format (0-indexed)
@@ -44,7 +79,55 @@ goto_definition_tool = @mcp_tool(
             end
 
             result = get(response, "result", nothing)
-            return format_locations(result)
+            formatted = format_locations(result)
+
+            # Print clickable links to REPL for user convenience
+            if result !== nothing
+                println()  # Blank line before output
+                locations = result isa Vector ? result : [result]
+                for loc in locations
+                    clickable = format_location(loc)
+                    if isempty(symbol_name)
+                        println("  ", clickable)
+                    else
+                        println("  [$symbol_name] defined at: $clickable")
+                    end
+                end
+                flush(stdout)
+            end
+
+            # Optionally navigate to the first result
+            if navigate && result !== nothing
+                location = if isa(result, Vector) && !isempty(result)
+                    result[1]
+                elseif isa(result, Dict)
+                    result
+                else
+                    nothing
+                end
+
+                if location !== nothing && haskey(location, "uri")
+                    nav_path = uri_to_path(location["uri"])
+                    range = get(location, "range", Dict())
+                    start_pos =
+                        get(range, "start", Dict("line" => 0, "character" => 0))
+                    nav_line = get(start_pos, "line", 0) + 1
+                    nav_col = get(start_pos, "character", 0) + 1
+
+                    # Use the navigate_to_file tool
+                    nav_result = call_tool(
+                        :navigate_to_file,
+                        Dict(
+                            "file_path" => nav_path,
+                            "line" => nav_line,
+                            "column" => nav_col,
+                        ),
+                    )
+                    return formatted * "\n\n" * nav_result
+                end
+            end
+
+            return formatted
 
         catch e
             return "Error finding definition: $e"

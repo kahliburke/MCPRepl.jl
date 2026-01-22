@@ -7,6 +7,10 @@ using UUIDs
 include("session.jl")
 using .Session
 
+# Import Prompts module
+include("prompts.jl")
+using .Prompts
+
 # Import Dashboard for standalone mode
 import ..Dashboard
 
@@ -592,10 +596,76 @@ function create_handler(
 
             # Handle prompts/list request
             if request["method"] == "prompts/list"
+                prompts = get_prompts()
                 response = Dict(
                     "jsonrpc" => "2.0",
                     "id" => request["id"],
-                    "result" => Dict("prompts" => []),
+                    "result" => Dict("prompts" => prompts),
+                )
+                return HTTP.Response(
+                    200,
+                    ["Content-Type" => "application/json"],
+                    JSON.json(response),
+                )
+            end
+
+            # Handle prompts/get request
+            if request["method"] == "prompts/get"
+                prompt_name = get(request["params"], "name", nothing)
+
+                if prompt_name === nothing
+                    response = Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => request["id"],
+                        "error" => Dict(
+                            "code" => -32602,
+                            "message" => "Missing required parameter: name",
+                        ),
+                    )
+                    return HTTP.Response(
+                        400,
+                        ["Content-Type" => "application/json"],
+                        JSON.json(response),
+                    )
+                end
+
+                prompt_content = get_prompt(String(prompt_name))
+
+                if prompt_content === nothing
+                    response = Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => request["id"],
+                        "error" => Dict(
+                            "code" => -32602,
+                            "message" => "Prompt not found: $prompt_name",
+                        ),
+                    )
+                    return HTTP.Response(
+                        404,
+                        ["Content-Type" => "application/json"],
+                        JSON.json(response),
+                    )
+                end
+
+                # Get prompt arguments if provided
+                prompt_args = get(request["params"], "arguments", Dict())
+
+                # Return the prompt with messages
+                response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request["id"],
+                    "result" => Dict(
+                        "description" => "Learn how to use MCPRepl effectively",
+                        "messages" => [
+                            Dict(
+                                "role" => "user",
+                                "content" => Dict(
+                                    "type" => "text",
+                                    "text" => prompt_content,
+                                ),
+                            ),
+                        ],
+                    ),
                 )
                 return HTTP.Response(
                     200,

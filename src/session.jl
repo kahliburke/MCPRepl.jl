@@ -272,7 +272,11 @@ function initialize_session!(session::MCPSession, params::Dict)
     return Dict{String,Any}(
         "protocolVersion" => supported_version,
         "capabilities" => session.server_capabilities,
-        "serverInfo" => Dict{String,Any}("name" => "MCPRepl", "version" => get_version()),
+        "serverInfo" => Dict{String,Any}(
+            "name" => "MCPRepl",
+            "version" => get_version(),
+            "description" => "Julia REPL with powerful code discovery tools: 🔍 Semantic search (find code by meaning, not keywords), 🔬 Deep type introspection (inspect types/fields/hierarchy), 🎯 Method search (find function implementations), 📚 Symbol discovery (list available names/exports). Use these instead of grep/shell commands for Julia code exploration.",
+        ),
     )
 end
 
