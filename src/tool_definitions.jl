@@ -293,7 +293,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 end
             end
 
-            execute_repllike(expr_str; silent = silent, quiet = quiet)
+            Base.invokelatest(execute_repllike, expr_str; silent = silent, quiet = quiet)
         catch e
             println("Error during execute_repllike", e)
             "Apparently there was an **internal** error to the MCP server: $e"
@@ -765,6 +765,7 @@ type_info_tool = @mcp_tool(
                 code;
                 description = "[Getting type info for: $type_expr]",
                 quiet = false,
+                show_prompt = false,
             )
         catch e
             "Error getting type info: $e"
@@ -839,6 +840,7 @@ list_names_tool = @mcp_tool(
                 code;
                 description = "[Listing names in: $module_name]",
                 quiet = false,
+                show_prompt = false,
             )
         catch e
             "Error listing names: \$e"

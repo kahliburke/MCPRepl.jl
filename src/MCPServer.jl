@@ -670,8 +670,47 @@ function create_handler(
                         )
                     end
 
+                    # Track timing for tools (except for those that show agent> prompts)
+                    excluded_tools = [
+                        "ex",
+                        "search_methods",
+                        "macro_expand",
+                        "code_lowered",
+                        "code_typed",
+                    ]
+                    show_timing = !(tool.name in excluded_tools)
+
+                    # Show tool start indicator (stays on same line)
+                    if show_timing
+                        print("🔧 ")
+                        printstyled(tool.name, color = :light_blue)
+                        flush(stdout)
+                    end
+
+                    start_time = time()
+
                     # Non-streaming mode (streaming handled in hybrid_handler)
-                    result_text = tool.handler(args)
+                    # Use invokelatest to pick up Revise changes to tool handlers
+                    result_text = try
+                        Base.invokelatest(tool.handler, args)
+                    finally
+                        # Show completion with timing (updates the line or adds new line)
+                        if show_timing
+                            elapsed = time() - start_time
+                            # Format time nicely
+                            time_str = if elapsed < 1.0
+                                @sprintf("%.0fms", elapsed * 1000)
+                            else
+                                @sprintf("%.1fs", elapsed)
+                            end
+                            # Use carriage return to overwrite the line if no output, or write on current line if there was output
+                            print("\r\033[K🔧 ")
+                            printstyled(tool.name, color = :light_blue)
+                            printstyled(" ✓ ", color = :green)
+                            printstyled("($time_str)\n", color = :light_black)
+                            flush(stdout)
+                        end
+                    end
 
                     response = Dict(
                         "jsonrpc" => "2.0",
@@ -770,6 +809,26 @@ function start_mcp_server(
 
     # Create a hybrid handler that supports both regular and streaming responses
     function hybrid_handler(http::HTTP.Stream)
+        # Use Base.invokelatest to allow Revise to hot-reload the handler logic
+        return Base.invokelatest(
+            _hybrid_handler_impl,
+            http,
+            tools_dict,
+            name_to_id,
+            security_config,
+            session,
+            port,
+        )
+    end
+
+    function _hybrid_handler_impl(
+        http::HTTP.Stream,
+        tools_dict,
+        name_to_id,
+        security_config,
+        session,
+        port,
+    )
         req = http.message
 
         # CRITICAL: Read the request body FIRST before any response

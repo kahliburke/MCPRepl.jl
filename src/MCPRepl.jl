@@ -479,6 +479,7 @@ function execute_repllike(
     silent::Bool = false,
     quiet::Bool = true,
     description::Union{String,Nothing} = nothing,
+    show_prompt::Bool = true,
 )
     lock(EXEC_REPLLIKE_LOCK)
     try
@@ -507,6 +508,10 @@ function execute_repllike(
             isopen(backend.repl_channel) &&
             isopen(backend.response_channel)
 
+        # Track whether user explicitly wants to see the return value
+        # In non-quiet mode, show return value unless they added a semicolon
+        show_return_value = !quiet && !REPL.ends_with_semicolon(str)
+
         # Auto-append semicolon in quiet mode to suppress output
         if quiet && !REPL.ends_with_semicolon(str)
             str = str * ";"
@@ -524,8 +529,8 @@ function execute_repllike(
             REPL.prepare_next(repl)
         end
 
-        # Only print the agent prompt if not silent
-        if !silent
+        # Only print the agent prompt if not silent and show_prompt is true
+        if !silent && show_prompt
             printstyled("\nagent> ", color = :red, bold = :true)
             if description !== nothing
                 println(description)
@@ -748,7 +753,7 @@ function execute_repllike(
                     showerror(io_buf, response.exception)
                 end
                 "ERROR: " * String(take!(io_buf))
-            elseif haskey(response, :value) && !REPL.ends_with_semicolon(str)
+            elseif haskey(response, :value) && show_return_value
                 io_buf = IOBuffer()
                 show(io_buf, MIME("text/plain"), response.value)
                 String(take!(io_buf))
@@ -1035,21 +1040,9 @@ function discover_and_call_project_hook(tools::Vector{MCPTool}; timeout_ms::Int 
     # Attempt to load the package module with timeout
     task = @async begin
         try
-            # Try to require the package
+            # Try to require the package - it returns the loaded module directly
             pkg_sym = Symbol(project_name)
-            Base.require(Main, pkg_sym)
-
-            # Get the module
-            pkg_mod = try
-                getfield(Main, pkg_sym)
-            catch
-                nothing
-            end
-
-            if pkg_mod === nothing
-                @debug "Could not resolve package module: $project_name"
-                return nothing
-            end
+            pkg_mod = Base.require(Main, pkg_sym)
 
             # Check if hook exists
             if !isdefined(pkg_mod, :mcp_register_tools!)
@@ -1061,12 +1054,14 @@ function discover_and_call_project_hook(tools::Vector{MCPTool}; timeout_ms::Int 
 
             # Call the hook
             @info "Calling MCP hook: $project_name.mcp_register_tools!"
-            hook_fn(tools)
+            Base.invokelatest(hook_fn, tools)
             @info "✅ Project tools registered from $project_name"
 
         catch e
             @warn "Project MCP hook failed (non-fatal)" package = project_name exception =
                 (e, catch_backtrace())
+            # Suppress the error - it's non-fatal
+            return nothing
         end
     end
 
@@ -1074,11 +1069,19 @@ function discover_and_call_project_hook(tools::Vector{MCPTool}; timeout_ms::Int 
     timer = Timer(timeout_ms / 1000.0)
     result = try
         timedwait(() -> istaskdone(task) || !isopen(timer), timeout_ms / 1000.0; pollint = 0.1)
-        if result == :timed_out
-            @warn "Project hook timed out after $(timeout_ms)ms" package = project_name
-        end
     finally
         close(timer)
+    end
+
+    if result == :timed_out
+        @warn "Project hook timed out after $(timeout_ms)ms" package = project_name
+    else
+        # Wait for task to fully complete to ensure tools are registered
+        try
+            wait(task)
+        catch e
+            @debug "Project hook task error (non-fatal)" exception = e
+        end
     end
 
     return nothing
@@ -1571,10 +1574,16 @@ function start!(;
     )
     flush(stdout)
 
-    if isdefined(Base, :active_repl)
-        set_prefix!(Base.active_repl)
-        # Refresh the prompt to show the new prefix
-        REPL.LineEdit.refresh_line(Base.active_repl.mistate)
+    if isdefined(Base, :active_repl) && Base.active_repl !== nothing
+        try
+            set_prefix!(Base.active_repl)
+            # Refresh the prompt to show the new prefix
+            if isdefined(Base.active_repl, :mistate) && Base.active_repl.mistate !== nothing
+                REPL.LineEdit.refresh_line(Base.active_repl.mistate)
+            end
+        catch e
+            @debug "Failed to set REPL prefix" exception = e
+        end
     else
         atreplinit(set_prefix!)
     end
@@ -1582,21 +1591,40 @@ function start!(;
 end
 
 function set_prefix!(repl)
-    mode = get_mainmode(repl)
-    mode.prompt = REPL.contextual_prompt(repl, "✻ julia> ")
+    try
+        mode = get_mainmode(repl)
+        if mode !== nothing
+            mode.prompt = REPL.contextual_prompt(repl, "✻ julia> ")
+        end
+    catch e
+        @debug "Failed to set REPL prefix" exception = e
+    end
 end
 function unset_prefix!(repl)
-    mode = get_mainmode(repl)
-    mode.prompt = REPL.contextual_prompt(repl, REPL.JULIA_PROMPT)
+    try
+        mode = get_mainmode(repl)
+        if mode !== nothing
+            mode.prompt = REPL.contextual_prompt(repl, REPL.JULIA_PROMPT)
+        end
+    catch e
+        @debug "Failed to unset REPL prefix" exception = e
+    end
 end
 function get_mainmode(repl)
-    only(
-        filter(repl.interface.modes) do mode
+    try
+        if !isdefined(repl, :interface) || repl.interface === nothing
+            return nothing
+        end
+        modes = filter(repl.interface.modes) do mode
             mode isa REPL.Prompt &&
                 mode.prompt isa Function &&
                 contains(mode.prompt(), "julia>")
-        end,
-    )
+        end
+        return isempty(modes) ? nothing : only(modes)
+    catch e
+        @debug "Failed to get main REPL mode" exception = e
+        return nothing
+    end
 end
 
 function stop!()
@@ -1604,8 +1632,12 @@ function stop!()
         println("Stop existing server...")
         stop_mcp_server(SERVER[])
         SERVER[] = nothing
-        if isdefined(Base, :active_repl)
-            unset_prefix!(Base.active_repl) # Reset the prompt prefix
+        if isdefined(Base, :active_repl) && Base.active_repl !== nothing
+            try
+                unset_prefix!(Base.active_repl) # Reset the prompt prefix
+            catch e
+                @debug "Failed to reset REPL prefix" exception = e
+            end
         end
     else
         println("No server running to stop.")
@@ -1940,51 +1972,6 @@ Stop the proxy server on the specified port. Wrapper for Proxy.stop_server().
 """
 function stop_proxy(port::Int = 3000)
     return Proxy.stop_server(port)
-end
-
-# ============================================================================
-# Project Hook Example (for testing/demonstration)
-# ============================================================================
-
-"""
-    mcp_register_tools!(registry::Vector{MCPTool})
-
-Example project hook that registers additional tools when MCPRepl starts.
-This demonstrates the project hook API for other packages.
-
-This hook is called automatically during MCPRepl startup if:
-- MCPRepl is the active project
-- MCPREPL_DISABLE_PROJECT_HOOK != "1"
-"""
-function mcp_register_tools!(registry::Vector{MCPTool})
-    @info "🔧 MCPRepl project hook called - registering example tools"
-
-    # Example: Register a custom tool
-    register_tool!(
-        registry;
-        name = "mcprepl.example_tool",
-        description = "Example tool registered via project hook",
-        input_schema = Dict(
-            "type" => "object",
-            "properties" => Dict(
-                "message" =>
-                    Dict("type" => "string", "description" => "A message to echo"),
-            ),
-            "required" => ["message"],
-        ),
-        handler = function (args)
-            msg = get(args, "message", "")
-            # Return a JSON string that the dashboard can display
-            return """
-            {
-              "response": "Project hook received: $msg",
-              "timestamp": "$(Dates.now())"
-            }
-            """
-        end,
-    )
-
-    @info "✅ MCPRepl example tool registered successfully"
 end
 
 end #module
