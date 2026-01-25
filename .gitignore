@@ -28,8 +28,9 @@ dist/
 .env
 Manifest.toml
 
-# MCPRepl configuration (contains API keys and security settings)
+# MCPRepl configuration (contains API keys, security settings, and session data)
 .mcprepl/security.json
+.mcprepl/sessions.json
 
 **/.DS_Store
 .kilocode/mcp.json

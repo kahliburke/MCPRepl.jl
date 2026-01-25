@@ -2,6 +2,7 @@ using HTTP
 using JSON
 using Logging
 using UUIDs
+using Dates
 
 # Import Session module
 include("session.jl")
@@ -15,25 +16,164 @@ using .Session
 const STANDALONE_SESSIONS = Dict{String,MCPSession}()
 const STANDALONE_SESSIONS_LOCK = ReentrantLock()
 
+# ============================================================================
+# Session Persistence (Standalone Mode)
+# ============================================================================
+
+"""
+    get_sessions_file_path() -> String
+
+Get the path to the sessions persistence file (.mcprepl/sessions.json).
+"""
+function get_sessions_file_path()
+    mcprepl_dir = joinpath(pwd(), ".mcprepl")
+    mkpath(mcprepl_dir)
+    return joinpath(mcprepl_dir, "sessions.json")
+end
+
+"""
+    load_persisted_sessions() -> Dict{String, Dict}
+
+Load persisted session data from .mcprepl/sessions.json.
+Returns a dict mapping session_id => {created_at, last_seen}.
+Filters out sessions older than 1 month.
+"""
+function load_persisted_sessions()
+    sessions_file = get_sessions_file_path()
+
+    if !isfile(sessions_file)
+        return Dict{String,Dict}()
+    end
+
+    try
+        data = JSON.parsefile(sessions_file)
+        sessions = get(data, "sessions", Dict())
+
+        # Filter out expired sessions (older than 1 month)
+        cutoff = now() - Month(1)
+        valid_sessions = Dict{String,Dict}()
+
+        for (session_id, session_data) in sessions
+            created_at_str = get(session_data, "created_at", nothing)
+            if created_at_str !== nothing
+                try
+                    created_at = DateTime(created_at_str, dateformat"yyyy-mm-dd\THH:MM:SS")
+                    if created_at >= cutoff
+                        valid_sessions[session_id] = session_data
+                    else
+                        @debug "Expired session filtered out" session_id = session_id age =
+                            (now() - created_at)
+                    end
+                catch e
+                    @warn "Invalid date format for session" session_id = session_id error =
+                        e
+                end
+            end
+        end
+
+        return valid_sessions
+    catch e
+        @warn "Failed to load persisted sessions" error = e path = sessions_file
+        return Dict{String,Dict}()
+    end
+end
+
+"""
+    save_persisted_sessions(sessions::Dict{String, Dict})
+
+Save session data to .mcprepl/sessions.json.
+"""
+function save_persisted_sessions(sessions::Dict{String,Dict})
+    sessions_file = get_sessions_file_path()
+
+    try
+        data = Dict("sessions" => sessions)
+        open(sessions_file, "w") do f
+            JSON.print(f, data, 2)
+        end
+        @debug "Saved persisted sessions" count = length(sessions) path = sessions_file
+    catch e
+        @warn "Failed to save persisted sessions" error = e path = sessions_file
+    end
+end
+
+"""
+    register_persisted_session(session_id::String)
+
+Register a session in the persistence file with the current timestamp.
+"""
+function register_persisted_session(session_id::String)
+    sessions = load_persisted_sessions()
+    now_str = Dates.format(now(), "yyyy-mm-dd\\THH:MM:SS")
+
+    # If session exists, only update last_seen; otherwise create new entry
+    if haskey(sessions, session_id)
+        sessions[session_id]["last_seen"] = now_str
+    else
+        sessions[session_id] = Dict("created_at" => now_str, "last_seen" => now_str)
+    end
+
+    save_persisted_sessions(sessions)
+end
+
 """
     get_or_create_session(session_id::Union{String,Nothing}, is_initialize::Bool) -> (MCPSession, Bool)
 
 Get existing session by ID or create a new one for initialize requests.
+Checks persisted sessions file to allow reconnection after REPL restart.
 Returns (session, is_new) tuple.
 """
 function get_or_create_session(session_id::Union{String,Nothing}, is_initialize::Bool)
     lock(STANDALONE_SESSIONS_LOCK) do
         if is_initialize
-            # Always create a new session for initialize requests
+            # Check if client provided an existing session ID
+            if session_id !== nothing
+                # Try to restore from persisted sessions (allows reconnection after restart)
+                persisted_sessions = load_persisted_sessions()
+                if haskey(persisted_sessions, session_id)
+                    # Valid persisted session found - restore it
+                    session = MCPSession()
+                    session.id = session_id  # Use the existing session ID
+                    STANDALONE_SESSIONS[session.id] = session
+                    register_persisted_session(session.id)  # Update last_seen
+                    @info "Restored persisted MCP session" session_id = session.id
+                    return (session, false)
+                else
+                    @debug "Session ID provided but not found in persisted sessions" session_id =
+                        session_id
+                end
+            end
+
+            # Create a new session (either no ID provided or ID not found in persisted sessions)
             session = MCPSession()
             STANDALONE_SESSIONS[session.id] = session
+            register_persisted_session(session.id)  # Save to persistence file
             @info "Created new MCP session" session_id = session.id
             return (session, true)
-        elseif session_id !== nothing && haskey(STANDALONE_SESSIONS, session_id)
-            # Return existing session
-            return (STANDALONE_SESSIONS[session_id], false)
+        elseif session_id !== nothing
+            # Non-initialize request - check memory first
+            if haskey(STANDALONE_SESSIONS, session_id)
+                # Session exists in memory
+                register_persisted_session(session_id)  # Update last_seen
+                return (STANDALONE_SESSIONS[session_id], false)
+            else
+                # Not in memory - check persisted sessions
+                persisted_sessions = load_persisted_sessions()
+                if haskey(persisted_sessions, session_id)
+                    # Restore from persistence
+                    session = MCPSession()
+                    session.id = session_id
+                    STANDALONE_SESSIONS[session.id] = session
+                    register_persisted_session(session.id)  # Update last_seen
+                    @info "Restored session from persistence file" session_id = session.id
+                    return (session, false)
+                else
+                    # Session not found anywhere
+                    return (nothing, false)
+                end
+            end
         else
-            # No session found - this will be handled by the caller
+            # No session ID provided for non-initialize request
             return (nothing, false)
         end
     end
