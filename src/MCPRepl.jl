@@ -407,7 +407,7 @@ the user already sees code execution in their REPL.
 Logging macros (@error, @debug, @info, @warn) are only removed at the top level,
 not inside function definitions or other nested code.
 """
-function remove_println_calls(expr, toplevel::Bool = true)
+function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = true)
     if expr isa Expr
         # Check if this is a print-related call
         if expr.head == :call
@@ -430,8 +430,8 @@ function remove_println_calls(expr, toplevel::Bool = true)
             end
         elseif expr.head == :macrocall
             macro_name = expr.args[1]
-            # Remove @show always
-            if macro_name == Symbol("@show")
+            # Remove @show conditionally based on strip_show parameter
+            if strip_show && macro_name == Symbol("@show")
                 return nothing
             end
             # Remove logging macros ONLY at top level
@@ -460,7 +460,7 @@ function remove_println_calls(expr, toplevel::Bool = true)
         # Recursively process all arguments, filtering out nothings
         new_args = []
         for arg in expr.args
-            cleaned = remove_println_calls(arg, toplevel && !entering_nested)
+            cleaned = remove_println_calls(arg, toplevel && !entering_nested, strip_show)
             if cleaned !== nothing
                 push!(new_args, cleaned)
             end
@@ -520,11 +520,9 @@ function execute_repllike(
 
         expr = Base.parse_input_line(str)
 
-        # In quiet mode, strip println statements from the AST
-        # User already sees code execution in their REPL - println is redundant
-        if quiet
-            expr = remove_println_calls(expr)
-        end
+        # Always strip println (it's never appropriate for agent communication)
+        # Strip @show only in quiet mode; in verbose mode (q=false), @show is useful for debugging
+        expr = remove_println_calls(expr, true, quiet)
 
         if has_repl && !silent
             REPL.prepare_next(repl)

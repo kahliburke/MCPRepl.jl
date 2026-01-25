@@ -34,29 +34,43 @@ ex(e="typeof([1,2,3])", q=false)            # Returns: "Vector{Int64}"
 
 **This is equivalent to automatically adding a semicolon!**
 
-## Printing vs `q`/`s`
+## 🚨 CRITICAL: println is ALWAYS Stripped
 
-### Quiet mode (`q=true`) affects what runs
+**`println` is ALWAYS removed from the AST before execution - regardless of `q` setting.**
 
-When `q=true` (default), `ex` is optimized for token efficiency:
-- It auto-appends a semicolon to suppress return values.
-- It strips top-level `println`/`print`/`@show` (and top-level logging macros like `@info`) from the executed AST.
+To see values, use **`q=false`** with the value as the final expression:
 
-So: **printing is primarily for interactive debugging, not agent→user communication**.
+```julia
+# ❌ WRONG - println is always stripped (never works for agent feedback)
+ex(e="println('Result: ', my_result)")
+
+# ✅ CORRECT - Use q=false with value as final expression
+ex(e="my_result", q=false)
+ex(e="(x, y, z)", q=false)                    # Multiple values
+ex(e="(length(data), typeof(data))", q=false) # Summary info
+```
+
+### What gets stripped:
+
+- **Always stripped (regardless of `q`):**
+  - `println`, `print`, `printstyled` - at ALL levels (even inside functions)
+  - Top-level logging macros (`@info`, `@warn`, `@error`, `@debug`)
+
+- **Stripped only with `q=true`:**
+  - `@show` macro (available with `q=false` for debugging)
 
 ### Silent mode (`s=true`) affects what the user sees live
 
-`s` does **not** control whether `println` runs. It controls whether the user sees the `agent>` prompt and real-time REPL echo.
+`s` controls whether the user sees the `agent>` prompt and real-time REPL echo.
 
 - **Default:** `s=false` (recommended)
-- **Use `s=true` only rarely** when you intentionally expect very large printed output and want to avoid spamming the user's REPL.
+- **Use `s=true` only rarely** when you intentionally expect very large output
 
 Examples:
 ```julia
 ex(e="undefined_var + 1", q=true, s=false)   # ✅ errors still returned
-ex(e="big = rand(10^7); sum(big)", q=true)   # ✅ compute side effects, no spam
-ex(e="println(join(1:100000, '\n'))", q=false, s=true)  # ⚠️ rare: huge stdout
-```
+ex(e="big = rand(10^7); sum(big)", q=true)   # ✅ compute, no spam
+ex(e="@show x; x+1", q=false)                # ✅ @show works with q=false
 ```
 
 ### 📦 Combine Multiple Operations

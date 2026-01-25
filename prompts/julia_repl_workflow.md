@@ -45,10 +45,24 @@
 
 **User sees everything you execute in real-time.** You share the same REPL.
 
-**Implications:**
-1. **NO `println` to communicate** - User already sees execution. Use TEXT responses.
-2. **Default to `q=true` (quiet mode)** - Saves 70-90% tokens by suppressing return values
-3. **Use `q=false` ONLY when you need the return value for a decision**
+**🚨 DON'T USE `println` - IT'S ALWAYS STRIPPED**
+
+Want to see a value? Use **`q=false`** with the value as the final expression:
+```julia
+# ❌ WRONG - println is always stripped (never works)
+ex(e="println('Result: ', x)")
+
+# ✅ CORRECT - Use q=false with final expression
+ex(e="x", q=false)                         # Single value
+ex(e="(x, y, z)", q=false)                 # Multiple values
+ex(e="(length(data), typeof(data))", q=false)  # Summary
+```
+
+**Key points:**
+1. **`println` is ALWAYS stripped** - Never use it
+2. **Default to `q=true`** - Saves 70-90% tokens by suppressing return values
+3. **Use `q=false`** ONLY when YOU need the return value for a decision
+4. **`@show` works with `q=false`** for debugging (stripped with `q=true`)
 
 ### `s` (silent mode) — keep `s=false` by default
 

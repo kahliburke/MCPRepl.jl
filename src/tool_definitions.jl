@@ -250,8 +250,10 @@ repl_tool = @mcp_tool(
     """Execute Julia code in a persistent REPL. User typically sees code execute in real-time.
 
 Primary tool: use `ex` for almost everything (run code, tests, docs, quick checks).
-Default (q=true): Returns only printed output/errors, suppresses return values (saves 70-90% tokens).
+Default (q=true): Returns only errors, suppresses return values (saves 70-90% tokens).
 Verbose (q=false): Returns full output including return value - use ONLY when you need the result to make a decision.
+
+🚨 CRITICAL: println is ALWAYS stripped - never use it. To see values, use q=false with the value as final expression: ex(e="result", q=false)
 
 Silent mode (s=true) is rare: it suppresses the 'agent>' prompt and real-time REPL echo to avoid spamming the user with intentionally huge output.
 
