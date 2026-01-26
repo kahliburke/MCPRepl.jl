@@ -20,6 +20,14 @@ const EMBEDDING_CONFIGS = Dict(
 const CHUNK_SIZE = 1500  # Target chunk size in characters
 const CHUNK_OVERLAP = 200  # Overlap between chunks
 
+# Supported file extensions for indexing
+# Note: .js excluded to avoid indexing compiled output (use .ts/.tsx for TypeScript sources)
+const DEFAULT_INDEX_EXTENSIONS = [".jl", ".ts", ".tsx", ".jsx", ".md"]
+
+# Default source directories to index (relative to project root)
+# Additional directories can be specified via index_project(extra_dirs=...)
+const DEFAULT_SOURCE_DIRS = ["src"]
+
 # Get embedding config for a model
 function get_embedding_config(model::String)
     return get(EMBEDDING_CONFIGS, model, (dims=768, context_tokens=512, context_chars=2000))
@@ -100,20 +108,51 @@ const INDEX_STATE_FILE = ".mcprepl/.qdrant_index.json"
 
 Load the index state from the project's .qdrant_index.json file.
 Returns an empty dict if file doesn't exist.
+
+Structure:
+- "config": Dict with "dirs" (full list of indexed directories) and "extensions"
+- "files": Dict mapping file paths to their index metadata
 """
 function load_index_state(project_path::String)
     state_file = joinpath(project_path, INDEX_STATE_FILE)
     if !isfile(state_file)
-        return Dict("files" => Dict())
+        return Dict(
+            "config" => Dict(
+                "dirs" => String[],
+                "extensions" => DEFAULT_INDEX_EXTENSIONS
+            ),
+            "files" => Dict()
+        )
     end
 
     try
         parsed = JSON.parse(read(state_file, String))
-        # Convert JSON.Object to Dict for proper type handling
-        return Dict("files" => Dict(parsed["files"]))
+
+        # Ensure config exists with defaults
+        config = get(parsed, "config", Dict())
+        if !haskey(config, "dirs")
+            config["dirs"] = String[]
+        end
+        if !haskey(config, "extensions")
+            config["extensions"] = DEFAULT_INDEX_EXTENSIONS
+        end
+
+        return Dict(
+            "config" => Dict(
+                "dirs" => Vector{String}(config["dirs"]),
+                "extensions" => Vector{String}(config["extensions"])
+            ),
+            "files" => Dict(parsed["files"])
+        )
     catch e
         @warn "Failed to load index state, starting fresh" exception = e
-        return Dict("files" => Dict())
+        return Dict(
+            "config" => Dict(
+                "dirs" => String[],
+                "extensions" => DEFAULT_INDEX_EXTENSIONS
+            ),
+            "files" => Dict()
+        )
     end
 end
 
@@ -195,14 +234,15 @@ end
 
 Get list of files that need re-indexing.
 """
-function get_stale_files(project_path::String, src_dir::String)
+function get_stale_files(project_path::String, src_dir::String; extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS)
     stale = String[]
 
     for (root, dirs, files) in walkdir(src_dir)
         filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
 
         for file in files
-            if endswith(file, ".jl")
+            # Check if file has any of the supported extensions
+            if any(ext -> endswith(file, ext), extensions)
                 file_path = joinpath(root, file)
                 if file_needs_reindex(project_path, file_path)
                     push!(stale, file_path)
@@ -431,14 +471,14 @@ function extract_definition_metadata(expr::Expr, def_type::String)
     if expr.head == :function || expr.head == :macro
         if length(expr.args) >= 1
             sig = expr.args[1]
-            
+
             # Extract full signature
             metadata["signature"] = string(sig)
-            
+
             # Extract parameters
             params = extract_parameters(sig)
             metadata["parameters"] = params
-            
+
             # Extract type parameters (where clause)
             type_params = extract_type_parameters(sig)
             metadata["type_params"] = type_params
@@ -446,15 +486,15 @@ function extract_definition_metadata(expr::Expr, def_type::String)
     elseif expr.head == :struct
         # Check if mutable
         metadata["is_mutable"] = length(expr.args) >= 1 && expr.args[1] == true
-        
+
         if length(expr.args) >= 2
             name_expr = expr.args[2]
-            
+
             # Extract parent type (for subtypes)
             if name_expr isa Expr && name_expr.head == :<:
                 metadata["parent_type"] = string(name_expr.args[2])
             end
-            
+
             # Extract type parameters
             if name_expr isa Expr && name_expr.head == :curly
                 metadata["type_params"] = [string(p) for p in name_expr.args[2:end]]
@@ -484,11 +524,11 @@ Extract parameter names and types from a function signature.
 """
 function extract_parameters(sig)
     params = String[]
-    
+
     if sig isa Expr
         # Handle where clause
         actual_sig = sig.head == :where ? sig.args[1] : sig
-        
+
         if actual_sig isa Expr && actual_sig.head == :call && length(actual_sig.args) >= 2
             for arg in actual_sig.args[2:end]
                 param_str = if arg isa Symbol
@@ -515,7 +555,7 @@ function extract_parameters(sig)
             end
         end
     end
-    
+
     return params
 end
 
@@ -526,14 +566,14 @@ Extract type parameters from where clause.
 """
 function extract_type_parameters(sig)
     type_params = String[]
-    
+
     if sig isa Expr && sig.head == :where
         # Handle single or multiple type parameters
         for i in 2:length(sig.args)
             push!(type_params, string(sig.args[i]))
         end
     end
-    
+
     return type_params
 end
 
@@ -730,9 +770,80 @@ function create_window_chunks(content::String, file_path::String)
 end
 
 """
+    split_chunk_recursive(chunk::Dict, max_length::Int, model::String) -> Vector{Dict}
+
+Recursively split a chunk if it's too large or fails to embed.
+Returns a vector of successfully embedded sub-chunks with their embeddings.
+"""
+function split_chunk_recursive(chunk::Dict, max_length::Int, model::String, depth::Int=0)
+    text = chunk["text"]
+
+    # Limit recursion depth to prevent infinite loops
+    if depth > 10
+        with_index_logger(() -> @warn "Maximum recursion depth reached for chunk splitting" file = chunk["file"] start_line = chunk["start_line"])
+        return Dict[]
+    end
+
+    # Try to embed the chunk as-is if it's within size limit
+    if length(text) <= max_length
+        embedding = get_ollama_embedding(text; model=model)
+        if !isempty(embedding)
+            # Success - return chunk with embedding
+            return [merge(chunk, Dict("embedding" => embedding, "text" => text))]
+        end
+        # Embedding failed even though text is small enough - try splitting anyway
+    end
+
+    # Text is too large or embedding failed - split in half by lines
+    lines = split(text, '\n')
+    if length(lines) <= 1
+        # Can't split further - just truncate
+        with_index_logger(() -> @warn "Cannot split chunk further, truncating" file = chunk["file"] start_line = chunk["start_line"] original_length = length(text))
+        truncated = first(text, max_length)
+        embedding = get_ollama_embedding(truncated; model=model)
+        if !isempty(embedding)
+            return [merge(chunk, Dict("embedding" => embedding, "text" => truncated))]
+        else
+            return Dict[]
+        end
+    end
+
+    # Split into two halves
+    mid = div(length(lines), 2)
+    first_half_text = join(lines[1:mid], '\n')
+    second_half_text = join(lines[mid+1:end], '\n')
+
+    # Calculate approximate line numbers for each half
+    start_line = chunk["start_line"]
+    end_line = chunk["end_line"]
+    mid_line = start_line + mid
+
+    # Create sub-chunks
+    chunk1 = merge(chunk, Dict(
+        "text" => first_half_text,
+        "end_line" => mid_line,
+        "name" => chunk["name"] * " (part 1)"
+    ))
+
+    chunk2 = merge(chunk, Dict(
+        "text" => second_half_text,
+        "start_line" => mid_line + 1,
+        "name" => chunk["name"] * " (part 2)"
+    ))
+
+    # Recursively process each half
+    results = Dict[]
+    append!(results, split_chunk_recursive(chunk1, max_length, model, depth + 1))
+    append!(results, split_chunk_recursive(chunk2, max_length, model, depth + 1))
+
+    return results
+end
+
+"""
     index_file(file_path::String, collection::String; project_path::String=pwd(), verbose::Bool=true, silent::Bool=false) -> Int
 
 Index a single Julia file into Qdrant. Returns number of chunks indexed.
+Uses split-and-retry strategy for oversized chunks.
 Set silent=true to suppress all output (logs to file only).
 """
 function index_file(
@@ -778,71 +889,61 @@ function index_file(
 
     try
         points = Dict[]
+
+        # Get embedding config for size limits
+        embedding_config = get_embedding_config(DEFAULT_EMBEDDING_MODEL)
+        max_length = embedding_config.context_chars
+
         for (i, chunk) in enumerate(chunks)
             text = chunk["text"]
             if isempty(strip(text))
                 continue
             end
 
-            # Handle text length based on model's context window
-            embedding_config = get_embedding_config(DEFAULT_EMBEDDING_MODEL)
-            max_length = embedding_config.context_chars
-            
-            # Intelligently truncate if needed (prefer keeping function signature + docstring)
-            if length(text) > max_length
-                original_length = length(text)
-                # Try to keep the beginning (signature + docstring) and end (return statement)
-                keep_start = div(max_length * 7, 10)  # 70% from start
-                keep_end = div(max_length * 3, 10)    # 30% from end
-                if original_length > keep_start + keep_end + 50
-                    text = first(text, keep_start) * "\n# ... ($(original_length - max_length) chars omitted) ...\n" * last(text, keep_end)
-                    text = first(text, max_length)  # Ensure we don't exceed with the marker
-                else
-                    text = first(text, max_length)
-                end
-                with_index_logger(() -> @debug "Truncated chunk for embedding" file = file_path chunk = i original_length = original_length truncated_length = length(text) model = DEFAULT_EMBEDDING_MODEL)
-            end
+            # Use split-and-retry strategy for oversized chunks or embedding failures
+            embedded_chunks = split_chunk_recursive(chunk, max_length, DEFAULT_EMBEDDING_MODEL)
 
-            # Get embedding
-            embedding = get_ollama_embedding(text; model=DEFAULT_EMBEDDING_MODEL)
-            if isempty(embedding)
-                with_index_logger(() -> @warn "Failed to get embedding" file = file_path chunk = i model = DEFAULT_EMBEDDING_MODEL start_line = chunk["start_line"] end_line = chunk["end_line"])
+            if isempty(embedded_chunks)
+                with_index_logger(() -> @warn "Failed to embed chunk after splitting" file = file_path chunk = i start_line = chunk["start_line"] end_line = chunk["end_line"])
                 continue
             end
 
-            # Create point with UUID
-            point_id = string(Base.UUID(rand(UInt128)))
-            
-            # Build payload with all available metadata
-            payload = Dict(
-                "file" => chunk["file"],
-                "start_line" => chunk["start_line"],
-                "end_line" => chunk["end_line"],
-                "type" => chunk["type"],
-                "name" => chunk["name"],
-                "text" => first(text, 2000),  # Truncate for storage (Unicode-safe)
-            )
-            
-            # Add optional metadata fields if they exist
-            for key in ["signature", "parameters", "type_params", "parent_type", "is_mutable", "is_exported"]
-                if haskey(chunk, key) && !isempty(chunk[key])
-                    payload[key] = chunk[key]
-                end
-            end
-            
-            push!(
-                points,
-                Dict(
-                    "id" => point_id,
-                    "vector" => embedding,
-                    "payload" => payload,
-                ),
-            )
+            # Process each successfully embedded sub-chunk
+            for embedded_chunk in embedded_chunks
+                # Create point with UUID
+                point_id = string(Base.UUID(rand(UInt128)))
 
-            # Batch upsert every 10 points
-            if length(points) >= 10
-                QdrantClient.upsert_points(collection, points)
-                points = Dict[]
+                # Build payload with all available metadata
+                payload = Dict(
+                    "file" => embedded_chunk["file"],
+                    "start_line" => embedded_chunk["start_line"],
+                    "end_line" => embedded_chunk["end_line"],
+                    "type" => embedded_chunk["type"],
+                    "name" => embedded_chunk["name"],
+                    "text" => first(embedded_chunk["text"], 2000),  # Truncate for storage (Unicode-safe)
+                )
+
+                # Add optional metadata fields if they exist
+                for key in ["signature", "parameters", "type_params", "parent_type", "is_mutable", "is_exported"]
+                    if haskey(embedded_chunk, key) && !isempty(embedded_chunk[key])
+                        payload[key] = embedded_chunk[key]
+                    end
+                end
+
+                push!(
+                    points,
+                    Dict(
+                        "id" => point_id,
+                        "vector" => embedded_chunk["embedding"],
+                        "payload" => payload,
+                    ),
+                )
+
+                # Batch upsert every 10 points
+                if length(points) >= 10
+                    QdrantClient.upsert_points(collection, points)
+                    points = Dict[]
+                end
             end
         end
 
@@ -903,16 +1004,17 @@ function reindex_file(
 end
 
 """
-    index_directory(dir_path::String, collection::String; project_path::String=pwd(), pattern::String="*.jl", verbose::Bool=true, silent::Bool=false) -> Int
+    index_directory(dir_path::String, collection::String; project_path::String=pwd(), extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS, verbose::Bool=true, silent::Bool=false) -> Int
 
 Index all matching files in a directory. Returns total chunks indexed.
+Supports multiple file extensions (.jl, .ts, .tsx, .jsx, .md by default).
 Set silent=true to suppress all output (logs to file only).
 """
 function index_directory(
     dir_path::String,
     collection::String;
     project_path::String=pwd(),
-    pattern::String="*.jl",
+    extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS,
     verbose::Bool=true,
     silent::Bool=false,
 )
@@ -925,7 +1027,8 @@ function index_directory(
         filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
 
         for filename in filenames
-            if endswith(filename, splitext(pattern)[2])
+            # Check if file matches any of the supported extensions
+            if any(ext -> endswith(filename, ext), extensions)
                 push!(files, joinpath(root, filename))
             end
         end
@@ -950,32 +1053,60 @@ function index_directory(
 end
 
 """
-    index_project(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, recreate::Bool=false, silent::Bool=false) -> Int
+    index_project(project_path::String=pwd(); collection::Union{String,Nothing}=nothing, recreate::Bool=false, silent::Bool=false, extra_dirs::Vector{String}=String[], extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS) -> Int
 
 Index a Julia project into Qdrant. Uses project directory name as collection if not specified.
-Set silent=true to suppress all output (logs to file only).
+
+# Arguments
+- `project_path`: Path to project root (default: current directory)
+- `collection`: Collection name (default: project directory name)
+- `recreate`: Delete and recreate collection (default: false)
+- `silent`: Suppress all output (default: false)
+- `extra_dirs`: Additional directories to index beyond src/ (e.g., ["frontend/src", "dashboard-ui/src"])
+- `extensions`: File extensions to index (default: [".jl", ".ts", ".tsx", ".jsx", ".md"])
+
+# Returns
+Total number of chunks indexed across all directories.
 """
 function index_project(
     project_path::String=pwd();
     collection::Union{String,Nothing}=nothing,
     recreate::Bool=false,
     silent::Bool=false,
+    extra_dirs::Vector{String}=String[],
+    extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS,
 )
     # Use project name as collection if not specified
     col_name = String(
         collection === nothing ? get_project_collection_name(project_path) : collection,
     )
 
-    # Find src directory
+    # Build list of directories to index
+    dirs_to_index = String[]
+
+    # Add src directory if it exists
     src_dir = joinpath(project_path, "src")
-    if !isdir(src_dir)
-        src_dir = project_path
+    if isdir(src_dir)
+        push!(dirs_to_index, src_dir)
+    elseif isempty(extra_dirs)
+        # If no src/ and no extra dirs, index entire project
+        push!(dirs_to_index, project_path)
+    end
+
+    # Add extra directories (e.g., frontend, dashboard-ui)
+    for dir in extra_dirs
+        full_path = joinpath(project_path, dir)
+        if isdir(full_path)
+            push!(dirs_to_index, full_path)
+        else
+            !silent && @warn "Extra directory not found, skipping" dir = dir
+        end
     end
 
     # Get vector size for the embedding model
     embedding_config = get_embedding_config(DEFAULT_EMBEDDING_MODEL)
     vector_size = embedding_config.dims
-    
+
     if recreate
         !silent && println("Recreating collection '$col_name' (model: $DEFAULT_EMBEDDING_MODEL, dims: $vector_size)...")
         with_index_logger(() -> @info "Recreating collection" collection = col_name model = DEFAULT_EMBEDDING_MODEL vector_size = vector_size)
@@ -991,9 +1122,23 @@ function index_project(
         end
     end
 
-    !silent && println("Indexing project into collection '$col_name'...")
-    with_index_logger(() -> @info "Indexing project" collection = col_name src_dir = src_dir)
-    return index_directory(src_dir, col_name; project_path=project_path, silent=silent)
+    !silent && println("Indexing $(length(dirs_to_index)) director$(length(dirs_to_index) == 1 ? "y" : "ies") into collection '$col_name'...")
+    with_index_logger(() -> @info "Indexing project" collection = col_name dirs = dirs_to_index extensions = extensions)
+
+    # Index each directory and sum total chunks
+    total_chunks = 0
+    for dir in dirs_to_index
+        chunks = index_directory(dir, col_name; project_path=project_path, silent=silent, extensions=extensions)
+        total_chunks += chunks
+    end
+
+    # Save indexing configuration for future sync operations
+    state = load_index_state(project_path)
+    state["config"]["dirs"] = dirs_to_index
+    state["config"]["extensions"] = extensions
+    save_index_state(project_path, state)
+
+    return total_chunks
 end
 
 """
@@ -1003,6 +1148,8 @@ Sync the Qdrant index with the current state of files on disk.
 - Re-indexes files that have been modified since last index
 - Removes index entries for deleted files
 - Skips unchanged files
+
+Uses the directory and extension configuration from the initial index_project call.
 
 Returns (reindexed=N, deleted=M, chunks=K)
 Set silent=true to suppress all output (logs to file only).
@@ -1017,17 +1164,30 @@ function sync_index(
         collection === nothing ? get_project_collection_name(project_path) : collection,
     )
 
-    # Find src directory
-    src_dir = joinpath(project_path, "src")
-    if !isdir(src_dir)
-        src_dir = project_path
+    # Load indexing configuration from previous index_project call
+    state = load_index_state(project_path)
+    dirs_to_sync = state["config"]["dirs"]
+    extensions = state["config"]["extensions"]
+
+    # If no config saved, fall back to src/ or project root
+    if isempty(dirs_to_sync)
+        src_dir = joinpath(project_path, "src")
+        if isdir(src_dir)
+            push!(dirs_to_sync, src_dir)
+        else
+            push!(dirs_to_sync, project_path)
+        end
     end
 
-    !silent && verbose && println("🔄 Syncing index for collection '$col_name'...")
-    with_index_logger(() -> @info "Starting index sync" collection = col_name src_dir = src_dir)
+    !silent && verbose && println("🔄 Syncing index for collection '$col_name' ($(length(dirs_to_sync)) director$(length(dirs_to_sync) == 1 ? "y" : "ies"))...")
+    with_index_logger(() -> @info "Starting index sync" collection = col_name dirs = dirs_to_sync extensions = extensions)
 
-    # Get files that need re-indexing
-    stale_files = get_stale_files(project_path, src_dir)
+    # Get files that need re-indexing from all directories
+    stale_files = String[]
+    for dir in dirs_to_sync
+        append!(stale_files, get_stale_files(project_path, dir; extensions=extensions))
+    end
+
     deleted_files = get_deleted_files(project_path, col_name)
 
     reindexed = 0

@@ -5,8 +5,7 @@ Tools for semantic code search using Qdrant.
 """
 
 using Logging
-
-# QdrantClient will be available from parent module scope
+import ..QdrantClient
 
 # Note: Embeddings are maintained by external process
 # The search tool below requires embeddings to be generated externally or via Ollama
@@ -222,7 +221,7 @@ qdrant_search_code_tool = @mcp_tool(
             ),
             "collection" => Dict(
                 "type" => "string",
-                "description" => "Collection name to search (optional, defaults to first available)",
+                "description" => "Collection name to search (optional, defaults to current project's collection)",
             ),
             "limit" => Dict(
                 "type" => "integer",
@@ -242,7 +241,7 @@ qdrant_search_code_tool = @mcp_tool(
     ),
     function (args)
         query = get(args, "query", "")
-        limit = get(args, "limit", 5)
+        limit = Int(get(args, "limit", 5))
         chunk_type = get(args, "chunk_type", "all")
         embedding_model = get(args, "embedding_model", "snowflake-arctic-embed:latest")
 
@@ -250,14 +249,16 @@ qdrant_search_code_tool = @mcp_tool(
             return "Error: query is required"
         end
 
-        # Get collection name
+        # Get collection name - default to current project's collection
         collection = get(args, "collection", nothing)
-        if collection === nothing
+        if collection === nothing || (collection isa String && isempty(collection))
+            collection = String(get_project_collection_name(pwd()))
+
+            # Verify the collection exists
             collections = QdrantClient.list_collections()
-            if isempty(collections)
-                return "Error: No collections found"
+            if !(collection in collections)
+                return "Error: Collection '$collection' not found for current project. Available collections: $(join(collections, ", ")). Run index_project first or specify a collection name."
             end
-            collection = collections[1]
         end
 
         # Get embedding for query
@@ -281,11 +282,14 @@ qdrant_search_code_tool = @mcp_tool(
                 ],
             )
         elseif chunk_type == "windows"
-            filter = Dict("must" => [Dict("key" => "type", "match" => Dict("value" => "window"))])
+            filter = Dict(
+                "must" => [Dict("key" => "type", "match" => Dict("value" => "window"))],
+            )
         end
 
         # Search
-        results = QdrantClient.search(collection, embedding; limit = limit, filter = filter)
+        results =
+            QdrantClient.search(collection, embedding; limit = limit, filter = filter)
 
         if isempty(results)
             return "No results found for query: \"$query\""
@@ -305,7 +309,7 @@ qdrant_search_code_tool = @mcp_tool(
             end_line = get(payload, "end_line", 0)
             chunk_type = get(payload, "type", "")
             text = get(payload, "text", "")
-            
+
             # Extract rich metadata
             signature = get(payload, "signature", "")
             parameters = get(payload, "parameters", [])
@@ -320,17 +324,17 @@ qdrant_search_code_tool = @mcp_tool(
 
             # Compact format: [score] name @ file:L10-20 (type)
             output *= "[$i $(round(score, digits=2))] "
-            
+
             # Show name with signature if available
             if !isempty(signature)
                 output *= "$signature @ "
             elseif !isempty(name)
                 output *= "$name @ "
             end
-            
+
             output *= "$file:L$start_line"
             output *= start_line != end_line ? "-$end_line" : ""
-            
+
             # Show type with additional metadata
             type_info = chunk_type
             if chunk_type == "struct" && is_mutable
@@ -441,6 +445,16 @@ qdrant_index_project_tool = @mcp_tool(
                 "type" => "boolean",
                 "description" => "Recreate the collection before indexing (default: false)",
             ),
+            "extra_dirs" => Dict(
+                "type" => "array",
+                "items" => Dict("type" => "string"),
+                "description" => "Additional directories to index beyond src/ (e.g., [\"frontend/src\", \"dashboard-ui/src\"])",
+            ),
+            "extensions" => Dict(
+                "type" => "array",
+                "items" => Dict("type" => "string"),
+                "description" => "File extensions to index (default: [\".jl\", \".ts\", \".tsx\", \".jsx\", \".md\"])",
+            ),
         ),
         "required" => [],
     ),
@@ -449,23 +463,32 @@ qdrant_index_project_tool = @mcp_tool(
         collection = get(args, "collection", nothing)
         recreate = get(args, "recreate", false)
 
+        # Convert to Vector{String} (args from JSON may be Vector{Any})
+        extra_dirs = Vector{String}(get(args, "extra_dirs", String[]))
+        extensions = Vector{String}(get(args, "extensions", DEFAULT_INDEX_EXTENSIONS))
+
         if collection isa String && isempty(collection)
             collection = nothing
         end
 
-        chunks =
-            index_project(project_path; collection = collection, recreate = recreate)
+        chunks = index_project(
+            project_path;
+            collection = collection,
+            recreate = recreate,
+            extra_dirs = extra_dirs,
+            extensions = extensions,
+        )
 
         col_name =
             collection === nothing ? get_project_collection_name(project_path) : collection
 
-        return "✓ Indexed $chunks chunks into '$col_name'."
+        return "✓ Indexed $chunks chunks into '$col_name' from $(1 + length(extra_dirs)) director$(length(extra_dirs) == 0 ? "y" : "ies")."
     end
 )
 
 qdrant_sync_index_tool = @mcp_tool(
     :qdrant_sync_index,
-    "Sync Qdrant index with current files. Reindexes changed files and removes deleted ones.",
+    "Sync Qdrant index with current files. Reindexes changed files and removes deleted ones. Uses the directory and extension configuration from the initial index_project call.",
     Dict(
         "type" => "object",
         "properties" => Dict(
