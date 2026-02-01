@@ -398,7 +398,7 @@ Base.display(d::IOBufferDisplay, mime::MIME, x) = show(d.io, mime, x)
 Base.display(d::IOBufferDisplay, mime, x) = show(d.io, mime, x)
 
 """
-    remove_println_calls(expr, toplevel=true)
+    remove_println_calls(expr, toplevel=true, strip_show=true, was_stripped=Ref(false))
 
 Strip println, print, printstyled, @show, and logging macros from an AST expression.
 When quiet mode is on, agents shouldn't use these to communicate since
@@ -406,8 +406,15 @@ the user already sees code execution in their REPL.
 
 Logging macros (@error, @debug, @info, @warn) are only removed at the top level,
 not inside function definitions or other nested code.
+
+Returns the modified expression and sets was_stripped[] = true if any output functions were removed.
 """
-function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = true)
+function remove_println_calls(
+    expr,
+    toplevel::Bool = true,
+    strip_show::Bool = true,
+    was_stripped::Ref{Bool} = Ref(false),
+)
     if expr isa Expr
         # Check if this is a print-related call
         if expr.head == :call
@@ -416,6 +423,7 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
             print_funcs = [:println, :print, :printstyled]
             # Match direct calls (println, print, printstyled)
             if func in print_funcs
+                was_stripped[] = true
                 return nothing
             end
             # Match qualified calls (Base.println, Main.print, etc.)
@@ -426,12 +434,14 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
                 func.args[end] isa QuoteNode &&
                 func.args[end].value in print_funcs
             )
+                was_stripped[] = true
                 return nothing
             end
         elseif expr.head == :macrocall
             macro_name = expr.args[1]
             # Remove @show conditionally based on strip_show parameter
             if strip_show && macro_name == Symbol("@show")
+                was_stripped[] = true
                 return nothing
             end
             # Remove logging macros ONLY at top level
@@ -439,6 +449,7 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
                 logging_macros =
                     [Symbol("@error"), Symbol("@debug"), Symbol("@info"), Symbol("@warn")]
                 if macro_name in logging_macros
+                    was_stripped[] = true
                     return nothing
                 end
                 # Also handle qualified logging macros
@@ -449,6 +460,7 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
                     macro_name.args[end] isa QuoteNode &&
                     macro_name.args[end].value in [:error, :debug, :info, :warn]
                 )
+                    was_stripped[] = true
                     return nothing
                 end
             end
@@ -460,7 +472,12 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
         # Recursively process all arguments, filtering out nothings
         new_args = []
         for arg in expr.args
-            cleaned = remove_println_calls(arg, toplevel && !entering_nested, strip_show)
+            cleaned = remove_println_calls(
+                arg,
+                toplevel && !entering_nested,
+                strip_show,
+                was_stripped,
+            )
             if cleaned !== nothing
                 push!(new_args, cleaned)
             end
@@ -475,12 +492,69 @@ function remove_println_calls(expr, toplevel::Bool = true, strip_show::Bool = tr
     return expr
 end
 
+"""
+    truncate_output(output::String, max_length::Int, value=nothing)
+
+Intelligently truncate output if it exceeds max_length.
+For collections, tries to provide type info and summary.
+Otherwise, shows first 2/3 and last 1/3 with indicator.
+"""
+function truncate_output(output::String, max_length::Int, value = nothing)
+    length(output) <= max_length && return output
+
+    # Try intelligent summary for common collection types
+    if value !== nothing
+        try
+            if value isa Union{AbstractArray,AbstractDict,Set,Tuple}
+                summary_str = "Type: $(typeof(value))"
+                if applicable(length, value)
+                    summary_str *= ", Length: $(length(value))"
+                elseif applicable(size, value)
+                    summary_str *= ", Size: $(size(value))"
+                end
+
+                # If summary itself is short enough, use it with truncated display
+                if length(summary_str) < max_length ÷ 2
+                    # Still show some of the actual content
+                    remaining = max_length - length(summary_str) - 200 # Leave room for message
+                    if remaining > 100
+                        keep_start = (remaining * 2) ÷ 3
+                        keep_end = remaining ÷ 3
+                        truncated = output[1:min(keep_start, length(output))]
+                        if length(output) > keep_start + keep_end
+                            truncated *= "\n... [~$(length(output) - keep_start - keep_end) chars omitted] ...\n"
+                            end_start = max(1, length(output) - keep_end + 1)
+                            truncated *= output[end_start:end]
+                        end
+                        return summary_str * "\n" * truncated
+                    end
+                end
+            end
+        catch
+            # If anything fails, fall through to simple truncation
+        end
+    end
+
+    # Simple truncation: show first 2/3 and last 1/3
+    keep_start = (max_length * 2) ÷ 3
+    keep_end = max_length ÷ 3
+    omitted = length(output) - keep_start - keep_end
+
+    result = output[1:keep_start]
+    result *= "\n\n... [~$omitted chars omitted] ...\n\n"
+    end_start = max(1, length(output) - keep_end + 1)
+    result *= output[end_start:end]
+
+    return result
+end
+
 function execute_repllike(
     str;
     silent::Bool = false,
     quiet::Bool = true,
     description::Union{String,Nothing} = nothing,
     show_prompt::Bool = true,
+    max_output::Int = 6000,
 )
     lock(EXEC_REPLLIKE_LOCK)
     try
@@ -522,7 +596,8 @@ function execute_repllike(
 
         # Always strip println (it's never appropriate for agent communication)
         # Strip @show only in quiet mode; in verbose mode (q=false), @show is useful for debugging
-        expr = remove_println_calls(expr, true, quiet)
+        was_stripped = Ref(false)
+        expr = remove_println_calls(expr, true, quiet, was_stripped)
 
         if has_repl && !silent
             REPL.prepare_next(repl)
@@ -793,6 +868,41 @@ function execute_repllike(
         else
             # Return full output for non-quiet mode OR when there's an error
             captured_content * result_str
+        end
+
+        # Add reminder if output functions were stripped
+        if was_stripped[]
+            reminder = "\n\n⚠️  Note: println/print/logging calls were removed. Use q=false with a final expression to see values."
+            result = result * reminder
+        end
+
+        # Apply truncation if output exceeds max_output
+        original_length = length(result)
+        if original_length > max_output
+            # Get the value for intelligent truncation (if available)
+            value_for_truncation = if response isa NamedTuple && haskey(response, :value)
+                response.value
+            else
+                nothing
+            end
+
+            result = truncate_output(result, max_output, value_for_truncation)
+
+            # Add educational message about truncation
+            educational_msg = """
+
+
+⚠️  Output truncated ($max_output of $original_length chars shown).
+
+This usually means you should use a different approach:
+- Check dimensions first: length(x), size(x), summary(x)
+- Sample data: first(x, 10), x[1:100], rand(x, 5)
+- Filter before display: filter(condition, x)
+- Access specific fields: x.field or keys(x)
+
+Use max_output parameter only if you truly need more output."""
+
+            result = result * educational_msg
         end
 
         return result

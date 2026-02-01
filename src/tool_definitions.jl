@@ -273,6 +273,11 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 "type" => "boolean",
                 "description" => "Silent mode: suppresses 'agent>' prompt and real-time REPL echo (default: false). Use s=true only rarely to avoid spamming huge output.",
             ),
+            "max_output" => Dict(
+                "type" => "integer",
+                "description" => "Maximum output length in characters (default: 6000, max: 25000). Only increase if you legitimately need more output. Hitting this limit usually means you should use a different approach (check size first, sample data, filter, etc).",
+                "default" => 6000,
+            ),
         ),
         "required" => ["e"],
     ),
@@ -281,6 +286,10 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
             silent = get(args, "s", false)
             quiet = get(args, "q", true)
             expr_str = get(args, "e", "")
+            max_output = get(args, "max_output", 6000)
+
+            # Enforce hard limit
+            max_output = min(max_output, 25000)
 
             # Format long one-liners for readability (if JuliaFormatter available)
             if length(expr_str) > 80 && isdefined(Main, :JuliaFormatter)
@@ -295,7 +304,13 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 end
             end
 
-            Base.invokelatest(execute_repllike, expr_str; silent = silent, quiet = quiet)
+            Base.invokelatest(
+                execute_repllike,
+                expr_str;
+                silent = silent,
+                quiet = quiet,
+                max_output = max_output,
+            )
         catch e
             println("Error during execute_repllike", e)
             "Apparently there was an **internal** error to the MCP server: $e"
