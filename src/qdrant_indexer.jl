@@ -26,7 +26,7 @@ const DEFAULT_INDEX_EXTENSIONS = [".jl", ".ts", ".tsx", ".jsx", ".md"]
 
 # Default source directories to index (relative to project root)
 # Additional directories can be specified via index_project(extra_dirs=...)
-const DEFAULT_SOURCE_DIRS = ["src"]
+const DEFAULT_SOURCE_DIRS = ["src", "test", "scripts"]
 
 # Get embedding config for a model
 function get_embedding_config(model::String)
@@ -1062,11 +1062,18 @@ Index a Julia project into Qdrant. Uses project directory name as collection if 
 - `collection`: Collection name (default: project directory name)
 - `recreate`: Delete and recreate collection (default: false)
 - `silent`: Suppress all output (default: false)
-- `extra_dirs`: Additional directories to index beyond src/ (e.g., ["frontend/src", "dashboard-ui/src"])
-- `extensions`: File extensions to index (default: [".jl", ".ts", ".tsx", ".jsx", ".md"])
+- `extra_dirs`: Additional directories to index beyond configured defaults (e.g., ["frontend/src", "dashboard-ui/src"])
+- `extensions`: File extensions to index (default: from config or [".jl", ".ts", ".tsx", ".jsx", ".md"])
 
 # Returns
 Total number of chunks indexed across all directories.
+
+# Configuration
+Default directories and extensions can be configured in .mcprepl/security.json:
+- `index_dirs`: Array of directories relative to project root (e.g., ["src", "lib", "dashboard-ui/src"])
+- `index_extensions`: Array of file extensions to index (e.g., [".jl", ".ts", ".md"])
+
+Use `MCPRepl.set_index_dirs!()` and `MCPRepl.set_index_extensions!()` to update config.
 """
 function index_project(
     project_path::String=pwd();
@@ -1074,31 +1081,51 @@ function index_project(
     recreate::Bool=false,
     silent::Bool=false,
     extra_dirs::Vector{String}=String[],
-    extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS,
+    extensions::Union{Vector{String},Nothing}=nothing,
 )
     # Use project name as collection if not specified
     col_name = String(
         collection === nothing ? get_project_collection_name(project_path) : collection,
     )
 
+    # Load config to get default directories and extensions
+    config = load_security_config(project_path)
+    config_dirs = config !== nothing ? config.index_dirs : String[]
+    config_extensions = config !== nothing ? config.index_extensions : DEFAULT_INDEX_EXTENSIONS
+
+    # Use provided extensions or fall back to config/defaults
+    actual_extensions = extensions !== nothing ? extensions : config_extensions
+
     # Build list of directories to index
     dirs_to_index = String[]
 
-    # Add src directory if it exists
-    src_dir = joinpath(project_path, "src")
-    if isdir(src_dir)
-        push!(dirs_to_index, src_dir)
-    elseif isempty(extra_dirs)
-        # If no src/ and no extra dirs, index entire project
-        push!(dirs_to_index, project_path)
+    # If config has index_dirs set, use those as the base
+    if !isempty(config_dirs)
+        for dir in config_dirs
+            full_path = joinpath(project_path, dir)
+            if isdir(full_path)
+                push!(dirs_to_index, full_path)
+            else
+                !silent && @warn "Configured index directory not found, skipping" dir = dir
+            end
+        end
+    else
+        # Fall back to existing behavior: add src/ if it exists
+        src_dir = joinpath(project_path, "src")
+        if isdir(src_dir)
+            push!(dirs_to_index, src_dir)
+        elseif isempty(extra_dirs)
+            # If no src/ and no extra dirs, index entire project
+            push!(dirs_to_index, project_path)
+        end
     end
 
-    # Add extra directories (e.g., frontend, dashboard-ui)
+    # Add extra directories (e.g., frontend, dashboard-ui) - these are additional to config
     for dir in extra_dirs
         full_path = joinpath(project_path, dir)
-        if isdir(full_path)
+        if isdir(full_path) && !(full_path in dirs_to_index)
             push!(dirs_to_index, full_path)
-        else
+        elseif !isdir(full_path)
             !silent && @warn "Extra directory not found, skipping" dir = dir
         end
     end
@@ -1123,19 +1150,19 @@ function index_project(
     end
 
     !silent && println("Indexing $(length(dirs_to_index)) director$(length(dirs_to_index) == 1 ? "y" : "ies") into collection '$col_name'...")
-    with_index_logger(() -> @info "Indexing project" collection = col_name dirs = dirs_to_index extensions = extensions)
+    with_index_logger(() -> @info "Indexing project" collection = col_name dirs = dirs_to_index extensions = actual_extensions)
 
     # Index each directory and sum total chunks
     total_chunks = 0
     for dir in dirs_to_index
-        chunks = index_directory(dir, col_name; project_path=project_path, silent=silent, extensions=extensions)
+        chunks = index_directory(dir, col_name; project_path=project_path, silent=silent, extensions=actual_extensions)
         total_chunks += chunks
     end
 
     # Save indexing configuration for future sync operations
     state = load_index_state(project_path)
     state["config"]["dirs"] = dirs_to_index
-    state["config"]["extensions"] = extensions
+    state["config"]["extensions"] = actual_extensions
     save_index_state(project_path, state)
 
     return total_chunks
@@ -1422,10 +1449,11 @@ Get the current status of the index sync scheduler.
 function index_sync_status()
     task = INDEX_SYNC_TASK[]
     if task === nothing
-        return (running=false, state=:not_started)
-    elseif istaskdone(task)
-        return (running=false, state=:finished, failed=istaskfailed(task))
-    else
-        return (running=true, state=task.state)
+        return (running = false, state = :not_started)
     end
+    if istaskdone(task)
+        return (running = false, state = :finished, failed = istaskfailed(task))
+    end
+    current_state = task.state
+    return (running = true, state = current_state)
 end

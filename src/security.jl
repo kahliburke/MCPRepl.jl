@@ -14,8 +14,13 @@ struct SecurityConfig
     allowed_ips::Vector{String}
     port::Int
     bypass_proxy::Bool  # If true, run MCP server directly without proxy
+    index_dirs::Vector{String}  # Directories to index for semantic search (relative to project root)
+    index_extensions::Vector{String}  # File extensions to index
     created_at::Int64
 end
+
+# Default file extensions for semantic search indexing
+const DEFAULT_INDEX_EXTENSIONS = [".jl", ".ts", ".tsx", ".jsx", ".md"]
 
 function SecurityConfig(
     mode::Symbol,
@@ -23,6 +28,8 @@ function SecurityConfig(
     allowed_ips::Vector{String},
     port::Int = 0,
     bypass_proxy::Bool = false,
+    index_dirs::Vector{String} = String[],
+    index_extensions::Vector{String} = DEFAULT_INDEX_EXTENSIONS,
 )
     return SecurityConfig(
         mode,
@@ -30,6 +37,8 @@ function SecurityConfig(
         allowed_ips,
         port,
         bypass_proxy,
+        index_dirs,
+        index_extensions,
         Int64(round(time())),
     )
 end
@@ -82,9 +91,21 @@ function load_security_config(workspace_dir::String = pwd())
         allowed_ips = get(data, "allowed_ips", ["127.0.0.1", "::1"])
         port = get(data, "port", 0)  # Default to 0 (dynamic port assignment)
         bypass_proxy = get(data, "bypass_proxy", false)  # Default to false (use proxy)
+        index_dirs = Vector{String}(get(data, "index_dirs", String[]))
+        index_extensions =
+            Vector{String}(get(data, "index_extensions", DEFAULT_INDEX_EXTENSIONS))
         created_at = get(data, "created_at", time())
 
-        return SecurityConfig(mode, api_keys, allowed_ips, port, bypass_proxy, created_at)
+        return SecurityConfig(
+            mode,
+            api_keys,
+            allowed_ips,
+            port,
+            bypass_proxy,
+            index_dirs,
+            index_extensions,
+            created_at,
+        )
     catch e
         @warn "Failed to load security config" exception = e
         return nothing
@@ -129,6 +150,8 @@ function save_security_config(config::SecurityConfig, workspace_dir::String = pw
             "api_keys" => config.api_keys,
             "allowed_ips" => config.allowed_ips,
             "bypass_proxy" => config.bypass_proxy,
+            "index_dirs" => config.index_dirs,
+            "index_extensions" => config.index_extensions,
             "created_at" => config.created_at,
         )
 
@@ -248,6 +271,16 @@ function show_security_status(config::SecurityConfig)
         println("  • $ip")
     end
     println()
+    println("🔍 Semantic Search Indexing")
+    println("-"^50)
+    println("Index Directories: ", isempty(config.index_dirs) ? "(default: src/)" : "")
+    if !isempty(config.index_dirs)
+        for dir in config.index_dirs
+            println("  • $dir")
+        end
+    end
+    println("Index Extensions: ", join(config.index_extensions, ", "))
+    println()
     println("Created: ", Dates.unix2datetime(config.created_at))
     println()
 end
@@ -271,6 +304,8 @@ function add_api_key!(workspace_dir::String = pwd())
         config.allowed_ips,
         config.port,
         config.bypass_proxy,
+        config.index_dirs,
+        config.index_extensions,
         config.created_at,
     )
 
@@ -306,6 +341,8 @@ function remove_api_key!(key::String, workspace_dir::String = pwd())
         config.allowed_ips,
         config.port,
         config.bypass_proxy,
+        config.index_dirs,
+        config.index_extensions,
         config.created_at,
     )
 
@@ -340,6 +377,8 @@ function add_allowed_ip!(ip::String, workspace_dir::String = pwd())
         new_ips,
         config.port,
         config.bypass_proxy,
+        config.index_dirs,
+        config.index_extensions,
         config.created_at,
     )
 
@@ -374,6 +413,8 @@ function remove_allowed_ip!(ip::String, workspace_dir::String = pwd())
         new_ips,
         config.port,
         config.bypass_proxy,
+        config.index_dirs,
+        config.index_extensions,
         config.created_at,
     )
 
@@ -406,11 +447,78 @@ function change_security_mode!(mode::Symbol, workspace_dir::String = pwd())
         config.allowed_ips,
         config.port,
         config.bypass_proxy,
+        config.index_dirs,
+        config.index_extensions,
         config.created_at,
     )
 
     if save_security_config(new_config, workspace_dir)
         println("✅ Changed security mode to: $mode")
+        return true
+    else
+        error("Failed to save security configuration")
+    end
+end
+
+"""
+    set_index_dirs!(dirs::Vector{String}, workspace_dir::String=pwd()) -> Bool
+
+Set the directories to index for semantic search.
+Directories are relative to the project root.
+"""
+function set_index_dirs!(dirs::Vector{String}, workspace_dir::String = pwd())
+    config = load_security_config(workspace_dir)
+    if config === nothing
+        error("No security configuration found. Run MCPRepl.setup() first.")
+    end
+
+    new_config = SecurityConfig(
+        config.mode,
+        config.api_keys,
+        config.allowed_ips,
+        config.port,
+        config.bypass_proxy,
+        dirs,
+        config.index_extensions,
+        config.created_at,
+    )
+
+    if save_security_config(new_config, workspace_dir)
+        if isempty(dirs)
+            println("✅ Cleared index directories (will use default: src/)")
+        else
+            println("✅ Set index directories: $(join(dirs, ", "))")
+        end
+        return true
+    else
+        error("Failed to save security configuration")
+    end
+end
+
+"""
+    set_index_extensions!(extensions::Vector{String}, workspace_dir::String=pwd()) -> Bool
+
+Set the file extensions to index for semantic search.
+"""
+function set_index_extensions!(extensions::Vector{String}, workspace_dir::String = pwd())
+    config = load_security_config(workspace_dir)
+    if config === nothing
+        error("No security configuration found. Run MCPRepl.setup() first.")
+    end
+
+    new_config = SecurityConfig(
+        config.mode,
+        config.api_keys,
+        config.allowed_ips,
+        config.port,
+        config.bypass_proxy,
+        config.index_dirs,
+        extensions,
+        config.created_at,
+    )
+
+    if save_security_config(new_config, workspace_dir)
+        println("✅ Set index extensions: $(join(extensions, ", "))")
         return true
     else
         error("Failed to save security configuration")

@@ -414,6 +414,8 @@ function create_security_config(project_path::String, mode::Symbol, port::Int)
         "api_keys" => config.api_keys,
         "allowed_ips" => config.allowed_ips,
         "bypass_proxy" => false,  # Default to using proxy
+        "index_dirs" => config.index_dirs,
+        "index_extensions" => config.index_extensions,
         "created_at" => config.created_at,
     )
 

@@ -16,8 +16,13 @@ function main()
         # Read original content
         original_content = read(file, String)
 
-        # Format the file
-        formatted = JuliaFormatter.format_text(original_content)
+        # Format the file (skip if parser fails)
+        formatted = try
+            JuliaFormatter.format_text(original_content)
+        catch e
+            @warn "JuliaFormatter failed to parse $file, skipping" exception = e
+            continue
+        end
 
         # Only write if content actually changed
         if formatted != original_content

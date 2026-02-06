@@ -1366,6 +1366,8 @@ function start!(;
             security_config.allowed_ips,
             security_config.port,
             security_config.bypass_proxy,
+            security_config.index_dirs,
+            security_config.index_extensions,
             security_config.created_at,
         )
     end
