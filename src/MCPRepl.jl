@@ -684,6 +684,13 @@ function execute_repllike(
                         caught = nothing
                         bt = nothing
                         try
+                            # Apply REPL ast_transforms (Revise, softscope, etc.)
+                            if isdefined(Base, :active_repl_backend) &&
+                               Base.active_repl_backend !== nothing
+                                for xf in Base.active_repl_backend.ast_transforms
+                                    expr = xf(expr)
+                                end
+                            end
                             value = Core.eval(Main, expr)
                         catch e
                             caught = e
@@ -772,6 +779,13 @@ function execute_repllike(
                 caught = nothing
                 bt = nothing
                 try
+                    # Apply REPL ast_transforms (Revise, softscope, etc.)
+                    if isdefined(Base, :active_repl_backend) &&
+                       Base.active_repl_backend !== nothing
+                        for xf in Base.active_repl_backend.ast_transforms
+                            expr = xf(expr)
+                        end
+                    end
                     value = Core.eval(Main, expr)
                 catch e
                     caught = e
