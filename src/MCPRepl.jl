@@ -688,7 +688,7 @@ function execute_repllike(
                             if isdefined(Base, :active_repl_backend) &&
                                Base.active_repl_backend !== nothing
                                 for xf in Base.active_repl_backend.ast_transforms
-                                    expr = xf(expr)
+                                    expr = Base.invokelatest(xf, expr)
                                 end
                             end
                             value = Core.eval(Main, expr)
