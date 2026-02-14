@@ -207,10 +207,8 @@ end
     FLOW_ONBOARD_SCOPE         # Choose project-level vs user-level
     FLOW_ONBOARD_CONFIRM       # Modal confirmation
     FLOW_ONBOARD_RESULT        # Success/failure feedback
-    # MCP client config
-    FLOW_CLIENT_SELECT         # Choose client (Claude/VSCode/Gemini/Kilo)
-    FLOW_CLIENT_SCOPE          # Choose project vs user level
-    FLOW_CLIENT_PATH           # TextInput for project path (if project-level)
+    # MCP client config (user-level)
+    FLOW_CLIENT_SELECT         # Choose client
     FLOW_CLIENT_CONFIRM        # Modal confirmation
     FLOW_CLIENT_RESULT         # Success/failure feedback
 end
@@ -266,9 +264,7 @@ end
     onboard_scope::Symbol = :project       # :project or :user
 
     # Client config state
-    client_target::Symbol = :claude        # :claude, :vscode, :gemini, :kilo
-    client_scope::Symbol = :project
-    client_path::String = ""
+    client_target::Symbol = :claude
 
     # Flow result
     flow_message::String = ""
@@ -425,10 +421,16 @@ end
 
 # ── Config Flow: Input Handler ───────────────────────────────────────────────
 
-const CLIENT_OPTIONS = [:claude, :vscode, :gemini, :kilo]
-const CLIENT_LABELS =
-    ["Claude Code / claude.ai", "VS Code / Copilot", "Gemini CLI", "KiloCode"]
-const SCOPE_LABELS = ["Project-level", "User-level (global)"]
+const CLIENT_OPTIONS = [:claude, :gemini, :codex, :copilot, :vscode, :kilo]
+const CLIENT_LABELS = [
+    "Claude Code",
+    "Gemini CLI",
+    "OpenAI Codex",
+    "GitHub Copilot",
+    "VS Code / Copilot",
+    "KiloCode",
+]
+const SCOPE_LABELS = ["Project-level", "User-level (global)"]  # used by onboarding flow
 
 function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
     flow = m.config_flow
@@ -482,61 +484,25 @@ function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
             m.flow_selected = min(length(CLIENT_OPTIONS), m.flow_selected + 1)
         elseif evt.key == :enter
             m.client_target = CLIENT_OPTIONS[m.flow_selected]
-            m.flow_selected = 1
-            m.config_flow = FLOW_CLIENT_SCOPE
-        end
-
-        # ── Client scope ──
-    elseif flow == FLOW_CLIENT_SCOPE
-        if evt.key == :up
-            m.flow_selected = max(1, m.flow_selected - 1)
-        elseif evt.key == :down
-            m.flow_selected = min(2, m.flow_selected + 1)
-        elseif evt.key == :enter
-            m.client_scope = m.flow_selected == 1 ? :project : :user
-            if m.client_scope == :project
-                m.path_input = TextInput(text = string(pwd()), label = "Path: ")
-                m.config_flow = FLOW_CLIENT_PATH
-            else
-                # VS Code doesn't support user-level config via TUI
-                if m.client_target == :vscode
-                    m.flow_message = "VS Code MCP configs are project-scoped.\nUse project-level instead."
-                    m.flow_success = false
-                    m.config_flow = FLOW_CLIENT_RESULT
-                else
-                    m.flow_modal_selected = :confirm
-                    m.config_flow = FLOW_CLIENT_CONFIRM
-                end
-            end
-        end
-
-        # ── Client path entry ──
-    elseif flow == FLOW_CLIENT_PATH
-        if evt.key == :enter
-            m.client_path = Tachikoma.text(m.path_input)
             m.flow_modal_selected = :confirm
             m.config_flow = FLOW_CLIENT_CONFIRM
-        elseif evt.key == :tab
-            _complete_path!(m.path_input)
-        else
-            handle_key!(m.path_input, evt)
         end
 
         # ── Client confirm ──
     elseif flow == FLOW_CLIENT_CONFIRM
-        if evt.key == :left || evt.key == :right
-            m.flow_modal_selected = m.flow_modal_selected == :cancel ? :confirm : :cancel
-        elseif evt.key == :enter
-            if m.flow_modal_selected == :confirm
-                execute_client_config!(m)
-            else
-                m.config_flow = FLOW_IDLE
-            end
+        if evt.key == :enter
+            execute_client_config!(m)
+        elseif evt.char == 'r'
+            client_label = CLIENT_LABELS[findfirst(==(m.client_target), CLIENT_OPTIONS)]
+            configured = any(p -> p.first == client_label && p.second, m.client_statuses)
+            configured && remove_client_config!(m)
         end
 
         # ── Client result ──
     elseif flow == FLOW_CLIENT_RESULT
         m.config_flow = FLOW_IDLE
+        # Refresh client statuses so the Config panel reflects the change
+        _refresh_client_status_async!(m)
     end
 end
 
@@ -599,20 +565,33 @@ function execute_onboarding!(m::MCPReplModel)
     m.config_flow = FLOW_ONBOARD_RESULT
 end
 
+"""Get the first API key from security config, or `nothing` if lax/unconfigured."""
+function _get_api_key()
+    cfg = load_global_security_config()
+    cfg === nothing && return nothing
+    cfg.mode == :lax && return nothing
+    isempty(cfg.api_keys) && return nothing
+    return first(cfg.api_keys)
+end
+
 function execute_client_config!(m::MCPReplModel)
     try
         port = m.server_port
         target = m.client_target
-        scope = m.client_scope
+        api_key = _get_api_key()
 
         if target == :claude
-            _install_claude(m, port, scope)
-        elseif target == :vscode
-            _install_vscode(m, port)
+            _install_claude(m, port, api_key)
         elseif target == :gemini
-            _install_gemini(m, port, scope)
+            _install_gemini(m, port, api_key)
+        elseif target == :codex
+            _install_codex(m, port, api_key)
+        elseif target == :copilot
+            _install_copilot(m, port, api_key)
+        elseif target == :vscode
+            _install_vscode(m, port, api_key)
         elseif target == :kilo
-            _install_kilo(m, port, scope)
+            _install_kilo(m, port, api_key)
         end
     catch e
         m.flow_message = "Error: $(sprint(showerror, e))"
@@ -621,113 +600,286 @@ function execute_client_config!(m::MCPReplModel)
     m.config_flow = FLOW_CLIENT_RESULT
 end
 
-function _install_claude(m::MCPReplModel, port::Int, scope::Symbol)
-    if scope == :project
-        path = expanduser(m.client_path)
-        isdir(path) || mkpath(path)
-        # Use claude CLI to add MCP server (stderr → devnull to avoid TUI corruption)
-        cmd = pipeline(
-            `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope project`;
-            stderr = devnull,
-        )
-        cd(path) do
-            read(cmd, String)
+function remove_client_config!(m::MCPReplModel)
+    try
+        target = m.client_target
+        if target == :claude
+            _remove_claude(m)
+        elseif target == :gemini
+            _remove_gemini(m)
+        elseif target == :codex
+            _remove_codex(m)
+        elseif target == :copilot
+            _remove_copilot(m)
+        elseif target == :vscode
+            _remove_vscode(m)
+        elseif target == :kilo
+            _remove_kilo(m)
         end
-        m.flow_message = "Added julia-repl to Claude (project)\nin $(_short_path(path))"
-        m.flow_success = true
-    else
-        cmd = pipeline(
-            `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope user`;
-            stderr = devnull,
+    catch e
+        m.flow_message = "Error: $(sprint(showerror, e))"
+        m.flow_success = false
+    end
+    m.config_flow = FLOW_CLIENT_RESULT
+end
+
+# ── Remove helpers ────────────────────────────────────────────────────────────
+
+function _remove_claude(m::MCPReplModel)
+    try
+        read(
+            pipeline(`claude mcp remove julia-repl --scope user`; stderr = devnull),
+            String,
         )
-        read(cmd, String)
-        m.flow_message = "Added julia-repl to Claude (user scope)"
-        m.flow_success = true
+    catch
+    end
+    m.flow_message = "Removed julia-repl from Claude Code"
+    m.flow_success = true
+end
+
+function _remove_gemini(m::MCPReplModel)
+    try
+        read(
+            pipeline(`gemini mcp remove --scope user julia-repl`; stderr = devnull),
+            String,
+        )
+    catch
+    end
+    m.flow_message = "Removed julia-repl from Gemini CLI"
+    m.flow_success = true
+end
+
+function _remove_codex(m::MCPReplModel)
+    try
+        read(pipeline(`codex mcp remove julia-repl`; stderr = devnull), String)
+    catch
+    end
+    _codex_env_remove!("MCPREPL_API_KEY")
+    m.flow_message = "Removed julia-repl from Codex CLI"
+    m.flow_success = true
+end
+
+function _remove_copilot(m::MCPReplModel)
+    target_file = joinpath(homedir(), ".copilot", "mcp-config.json")
+    _remove_server_from_json!(target_file, "mcpServers")
+    m.flow_message = "Removed julia-repl from\n$(_short_path(target_file))"
+    m.flow_success = true
+end
+
+function _remove_vscode(m::MCPReplModel)
+    mcp_dir = if Sys.isapple()
+        joinpath(homedir(), "Library", "Application Support", "Code", "User")
+    elseif Sys.iswindows()
+        joinpath(get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")), "Code", "User")
+    else
+        joinpath(get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")), "Code", "User")
+    end
+    target_file = joinpath(mcp_dir, "mcp.json")
+    _remove_server_from_json!(target_file, "servers")
+    m.flow_message = "Removed julia-repl from\n$(_short_path(target_file))"
+    m.flow_success = true
+end
+
+function _remove_kilo(m::MCPReplModel)
+    target_file = joinpath(_kilo_settings_dir(), "mcp_settings.json")
+    _remove_server_from_json!(target_file, "mcpServers")
+    m.flow_message = "Removed julia-repl from\n$(_short_path(target_file))"
+    m.flow_success = true
+end
+
+"""Remove `julia-repl` from a JSON config file under the given servers key."""
+function _remove_server_from_json!(path::String, servers_key::String)
+    isfile(path) || error("Config file not found: $path")
+    data = JSON.parsefile(path)
+    servers = get(data, servers_key, nothing)
+    servers === nothing && error("No $servers_key section in $path")
+    haskey(servers, "julia-repl") || error("julia-repl not found in $path")
+    delete!(servers, "julia-repl")
+    data[servers_key] = servers
+    write(path, _to_json(data))
+end
+
+"""Set or update `key=value` in `~/.codex/.env`, preserving other lines."""
+function _codex_env_set!(key::String, value::String)
+    env_file = joinpath(homedir(), ".codex", ".env")
+    lines = isfile(env_file) ? readlines(env_file) : String[]
+    # Remove any existing line for this key
+    filter!(l -> !startswith(l, "$key="), lines)
+    push!(lines, "$key=$value")
+    write(env_file, join(lines, "\n") * "\n")
+end
+
+"""Remove `key` from `~/.codex/.env`, preserving other lines."""
+function _codex_env_remove!(key::String)
+    env_file = joinpath(homedir(), ".codex", ".env")
+    isfile(env_file) || return
+    lines = readlines(env_file)
+    filter!(l -> !startswith(l, "$key="), lines)
+    if isempty(lines)
+        rm(env_file)
+    else
+        write(env_file, join(lines, "\n") * "\n")
     end
 end
 
-function _install_vscode(m::MCPReplModel, port::Int)
-    path = expanduser(m.client_path)
-    isdir(path) || mkpath(path)
-    vscode_dir = joinpath(path, ".vscode")
-    isdir(vscode_dir) || mkpath(vscode_dir)
-    mcp_file = joinpath(vscode_dir, "mcp.json")
+# ── Install helpers ───────────────────────────────────────────────────────────
 
-    content = Dict{String,Any}(
-        "servers" => Dict{String,Any}(
-            "julia-repl" => Dict{String,Any}(
-                "type" => "http",
-                "url" => "http://localhost:$port/mcp",
-            ),
-        ),
-    )
-    write(mcp_file, _to_json(content))
+function _install_claude(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    try
+        read(
+            pipeline(`claude mcp remove julia-repl --scope user`; stderr = devnull),
+            String,
+        )
+    catch
+    end
+    args = `claude mcp add julia-repl --transport http --url $url --scope user`
+    if api_key !== nothing
+        args = `$args -H "Authorization: Bearer $api_key"`
+    end
+    read(pipeline(args; stderr = devnull), String)
+    m.flow_message = "Added julia-repl to Claude Code\n(~/.claude/settings.json)"
+    m.flow_success = true
+end
+
+function _install_vscode(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    # VS Code user-level MCP config
+    mcp_dir = if Sys.isapple()
+        joinpath(homedir(), "Library", "Application Support", "Code", "User")
+    elseif Sys.iswindows()
+        joinpath(get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")), "Code", "User")
+    else
+        joinpath(get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")), "Code", "User")
+    end
+    isdir(mcp_dir) || mkpath(mcp_dir)
+    mcp_file = joinpath(mcp_dir, "mcp.json")
+
+    # Merge with existing config to preserve other servers
+    existing = if isfile(mcp_file)
+        try
+            JSON.parsefile(mcp_file)
+        catch
+            Dict{String,Any}()
+        end
+    else
+        Dict{String,Any}()
+    end
+    servers = get(existing, "servers", Dict{String,Any}())
+    entry = Dict{String,Any}("type" => "http", "url" => url)
+    if api_key !== nothing
+        entry["headers"] = Dict{String,Any}("Authorization" => "Bearer $api_key")
+    end
+    servers["julia-repl"] = entry
+    existing["servers"] = servers
+    write(mcp_file, _to_json(existing))
     m.flow_message = "Wrote $(_short_path(mcp_file))"
     m.flow_success = true
 end
 
-function _install_gemini(m::MCPReplModel, port::Int, scope::Symbol)
-    if scope == :project
-        path = expanduser(m.client_path)
-        isdir(path) || mkpath(path)
-        gemini_dir = joinpath(path, ".gemini")
-        isdir(gemini_dir) || mkpath(gemini_dir)
-        target_file = joinpath(gemini_dir, "settings.json")
-    else
-        gemini_dir = joinpath(homedir(), ".gemini")
-        isdir(gemini_dir) || mkpath(gemini_dir)
-        target_file = joinpath(gemini_dir, "settings.json")
+function _install_gemini(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    try
+        read(
+            pipeline(`gemini mcp remove --scope user julia-repl`; stderr = devnull),
+            String,
+        )
+    catch
     end
+    args = `gemini mcp add --transport http --scope user julia-repl $url`
+    if api_key !== nothing
+        args = `$args -H "Authorization: Bearer $api_key"`
+    end
+    read(pipeline(args; stderr = devnull), String)
+    m.flow_message = "Added julia-repl to Gemini CLI\n(~/.gemini/settings.json)"
+    m.flow_success = true
+end
 
-    content = Dict{String,Any}(
-        "mcpServers" => Dict{String,Any}(
-            "julia-repl" => Dict{String,Any}(
-                "type" => "http",
-                "url" => "http://localhost:$port/mcp",
-            ),
-        ),
-    )
-    write(target_file, _to_json(content))
+function _install_kilo(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    kilo_dir = _kilo_settings_dir()
+    isdir(kilo_dir) || mkpath(kilo_dir)
+    target_file = joinpath(kilo_dir, "mcp_settings.json")
+
+    # Merge with existing config to preserve other servers
+    existing = if isfile(target_file)
+        try
+            JSON.parsefile(target_file)
+        catch
+            Dict{String,Any}()
+        end
+    else
+        Dict{String,Any}()
+    end
+    servers = get(existing, "mcpServers", Dict{String,Any}())
+    entry = Dict{String,Any}("type" => "streamable-http", "url" => url)
+    if api_key !== nothing
+        entry["headers"] = Dict{String,Any}("Authorization" => "Bearer $api_key")
+    end
+    servers["julia-repl"] = entry
+    existing["mcpServers"] = servers
+    write(target_file, _to_json(existing))
     m.flow_message = "Wrote $(_short_path(target_file))"
     m.flow_success = true
 end
 
-function _install_kilo(m::MCPReplModel, port::Int, scope::Symbol)
-    if scope == :project
-        path = expanduser(m.client_path)
-        isdir(path) || mkpath(path)
-        kilo_dir = joinpath(path, ".kilocode")
-        isdir(kilo_dir) || mkpath(kilo_dir)
-        target_file = joinpath(kilo_dir, "mcp.json")
-    else
-        kilo_dir = joinpath(homedir(), ".kilocode")
-        isdir(kilo_dir) || mkpath(kilo_dir)
-        target_file = joinpath(kilo_dir, "mcp.json")
+function _install_codex(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    try
+        read(pipeline(`codex mcp remove julia-repl`; stderr = devnull), String)
+    catch
     end
+    args = if api_key !== nothing
+        `codex mcp add --url $url --bearer-token-env-var MCPREPL_API_KEY julia-repl`
+    else
+        `codex mcp add --url $url julia-repl`
+    end
+    read(pipeline(args; stderr = devnull), String)
+    if api_key !== nothing
+        _codex_env_set!("MCPREPL_API_KEY", api_key)
+    end
+    m.flow_message = "Added julia-repl to Codex CLI\n(~/.codex/config.toml)"
+    m.flow_success = true
+end
 
-    content = Dict{String,Any}(
-        "mcpServers" => Dict{String,Any}(
-            "julia-repl" => Dict{String,Any}(
-                "type" => "streamable-http",
-                "url" => "http://localhost:$port/mcp",
-            ),
-        ),
-    )
-    write(target_file, _to_json(content))
+function _install_copilot(m::MCPReplModel, port::Int, api_key)
+    url = "http://localhost:$port/mcp"
+    copilot_dir = joinpath(homedir(), ".copilot")
+    isdir(copilot_dir) || mkpath(copilot_dir)
+    target_file = joinpath(copilot_dir, "mcp-config.json")
+
+    # Merge with existing config to preserve other servers
+    existing = if isfile(target_file)
+        try
+            JSON.parsefile(target_file)
+        catch
+            Dict{String,Any}()
+        end
+    else
+        Dict{String,Any}()
+    end
+    servers = get(existing, "mcpServers", Dict{String,Any}())
+    entry = Dict{String,Any}("type" => "http", "url" => url)
+    if api_key !== nothing
+        entry["headers"] = Dict{String,Any}("Authorization" => "Bearer $api_key")
+    end
+    servers["julia-repl"] = entry
+    existing["mcpServers"] = servers
+    write(target_file, _to_json(existing))
     m.flow_message = "Wrote $(_short_path(target_file))"
     m.flow_success = true
 end
 
 # ── Minimal JSON helpers (no dependency on JSON3) ────────────────────────────
 
-function _to_json(d::Dict; indent::Int = 2)
+function _to_json(d::AbstractDict; indent::Int = 2)
     io = IOBuffer()
     _write_json(io, d, 0, indent)
     write(io, '\n')
     String(take!(io))
 end
 
-function _write_json(io::IO, d::Dict, level::Int, indent::Int)
+function _write_json(io::IO, d::AbstractDict, level::Int, indent::Int)
     write(io, "{\n")
     entries = collect(pairs(d))
     for (i, (k, v)) in enumerate(entries)
@@ -760,6 +912,23 @@ end
 
 _write_json(io::IO, b::Bool, ::Int, ::Int) = write(io, b ? "true" : "false")
 _write_json(io::IO, n::Number, ::Int, ::Int) = write(io, string(n))
+_write_json(io::IO, ::Nothing, ::Int, ::Int) = write(io, "null")
+
+function _write_json(io::IO, arr::AbstractVector, level::Int, indent::Int)
+    if isempty(arr)
+        write(io, "[]")
+        return
+    end
+    write(io, "[\n")
+    for (i, v) in enumerate(arr)
+        write(io, ' '^((level + 1) * indent))
+        _write_json(io, v, level + 1, indent)
+        i < length(arr) && write(io, ',')
+        write(io, '\n')
+    end
+    write(io, ' '^(level * indent))
+    write(io, ']')
+end
 
 function _parse_json_simple(s::AbstractString)
     # Minimal recursive-descent JSON parser for settings files.
@@ -1603,44 +1772,49 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
             "[↑↓] select  [Enter] confirm  [Esc] cancel",
         )
 
-    elseif flow == FLOW_CLIENT_SCOPE
-        _render_selection_modal(
-            buf,
-            area,
-            " Scope ",
-            SCOPE_LABELS,
-            m.flow_selected,
-            "[↑↓] select  [Enter] confirm  [Esc] cancel",
-        )
-
-    elseif flow == FLOW_CLIENT_PATH
-        client_label = CLIENT_LABELS[findfirst(==(m.client_target), CLIENT_OPTIONS)]
-        _render_text_input_modal(
-            buf,
-            area,
-            " $client_label ",
-            "Enter project path:",
-            m.path_input,
-            "[Enter] confirm  [Esc] cancel",
-        )
-
     elseif flow == FLOW_CLIENT_CONFIRM
         client_label = CLIENT_LABELS[findfirst(==(m.client_target), CLIENT_OPTIONS)]
-        scope_label = m.client_scope == :project ? "project-level" : "user-level (global)"
-        path_info =
-            m.client_scope == :project ? "\nPath: $(_short_path(m.client_path))" : ""
-        msg = "Configure $client_label?\n$path_info\nScope: $scope_label"
-        render(
-            Modal(
-                title = "Confirm",
-                message = msg,
-                confirm_label = "Install",
-                cancel_label = "Cancel",
-                selected = m.flow_modal_selected,
-            ),
-            area,
-            buf,
+        # Check if already configured
+        configured = any(p -> p.first == client_label && p.second, m.client_statuses)
+        status_text = configured ? "● configured" : "○ not configured"
+        status_style = configured ? tstyle(:success) : tstyle(:text_dim)
+
+        w = min(44, area.width - 4)
+        h = 8
+        rect = center(area, w, h)
+        block = Block(
+            title = " $client_label ",
+            border_style = tstyle(:accent, bold = true),
+            title_style = tstyle(:accent, bold = true),
+            box = BOX_HEAVY,
         )
+        inner = render(block, rect, buf)
+        if inner.width >= 4
+            for row = inner.y:bottom(inner)
+                for col = inner.x:right(inner)
+                    set_char!(buf, col, row, ' ', Style())
+                end
+            end
+            y = inner.y
+            x = inner.x + 1
+            set_string!(buf, x, y, "Status: ", tstyle(:text_dim))
+            set_string!(buf, x + 8, y, status_text, status_style)
+            y += 1
+            set_string!(buf, x, y, "Scope:  user-level (global)", tstyle(:text_dim))
+            y += 2
+            set_string!(
+                buf,
+                x,
+                y,
+                configured ? "[Enter] Update" : "[Enter] Install",
+                tstyle(:accent),
+            )
+            if configured
+                set_string!(buf, x + 24, y, "[r] Remove", tstyle(:error))
+            end
+            y += 1
+            set_string!(buf, x, y, "[Esc] Cancel", tstyle(:text_dim))
+        end
 
     elseif flow == FLOW_CLIENT_RESULT
         _render_result_modal(buf, area, m.flow_success, m.flow_message)
@@ -1779,6 +1953,18 @@ end
 
 # ── Client Status Detection ──────────────────────────────────────────────────
 
+"""Check if any of the given files contain "julia-repl"."""
+function _detect_in_files(paths::String...)
+    for p in paths
+        isfile(p) || continue
+        try
+            occursin("julia-repl", read(p, String)) && return true
+        catch
+        end
+    end
+    return false
+end
+
 # Client detection runs async; results land in model.client_statuses.
 const _CLIENT_STATUS_PENDING = Ref{Bool}(false)
 
@@ -1789,53 +1975,72 @@ function _refresh_client_status_async!(m::MCPReplModel)
         try
             statuses = Pair{String,Bool}[]
 
-            # Claude: check config files directly (don't shell out to `claude`
-            # which would connect to our MCP server and create spurious sessions)
-            claude_ok = false
-            for cfg_path in (
-                joinpath(homedir(), ".claude", "settings.json"),
-                joinpath(pwd(), ".mcp.json"),
-                joinpath(pwd(), ".claude", "settings.local.json"),
+            # Check each client's config files for "julia-repl" presence.
+            # All checks are file-based to avoid spawning CLI processes.
+
+            # Claude: ~/.claude/settings.json, .mcp.json, .claude/settings.local.json
+            push!(
+                statuses,
+                "Claude Code" => _detect_in_files(
+                    joinpath(homedir(), ".claude", "settings.json"),
+                    joinpath(pwd(), ".mcp.json"),
+                    joinpath(pwd(), ".claude", "settings.local.json"),
+                ),
             )
-                if isfile(cfg_path)
-                    try
-                        content = read(cfg_path, String)
-                        if occursin("julia-repl", content)
-                            claude_ok = true
-                            break
-                        end
-                    catch
-                    end
-                end
-            end
-            push!(statuses, "Claude" => claude_ok)
 
-            # VS Code: project-specific, can't detect globally
-            push!(statuses, "VS Code" => false)
+            # Gemini: ~/.gemini/settings.json and project .gemini/settings.json
+            push!(
+                statuses,
+                "Gemini CLI" => _detect_in_files(
+                    joinpath(homedir(), ".gemini", "settings.json"),
+                    joinpath(pwd(), ".gemini", "settings.json"),
+                ),
+            )
 
-            # Gemini: check ~/.gemini/settings.json
-            gemini_settings = joinpath(homedir(), ".gemini", "settings.json")
-            gemini_ok = false
-            if isfile(gemini_settings)
-                try
-                    content = read(gemini_settings, String)
-                    gemini_ok = occursin("julia-repl", content)
-                catch
-                end
-            end
-            push!(statuses, "Gemini" => gemini_ok)
+            # Codex: ~/.codex/config.toml
+            push!(
+                statuses,
+                "OpenAI Codex" =>
+                    _detect_in_files(joinpath(homedir(), ".codex", "config.toml")),
+            )
 
-            # KiloCode: check ~/.kilocode/mcp.json
-            kilo_settings = joinpath(homedir(), ".kilocode", "mcp.json")
-            kilo_ok = false
-            if isfile(kilo_settings)
-                try
-                    content = read(kilo_settings, String)
-                    kilo_ok = occursin("julia-repl", content)
-                catch
-                end
+            # Copilot: ~/.copilot/mcp-config.json
+            push!(
+                statuses,
+                "GitHub Copilot" =>
+                    _detect_in_files(joinpath(homedir(), ".copilot", "mcp-config.json")),
+            )
+
+            # VS Code: user-level mcp.json + project-level .vscode/mcp.json
+            vscode_user_dir = if Sys.isapple()
+                joinpath(homedir(), "Library", "Application Support", "Code", "User")
+            elseif Sys.iswindows()
+                joinpath(
+                    get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")),
+                    "Code",
+                    "User",
+                )
+            else
+                joinpath(
+                    get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")),
+                    "Code",
+                    "User",
+                )
             end
-            push!(statuses, "KiloCode" => kilo_ok)
+            push!(
+                statuses,
+                "VS Code" => _detect_in_files(
+                    joinpath(vscode_user_dir, "mcp.json"),
+                    joinpath(pwd(), ".vscode", "mcp.json"),
+                ),
+            )
+
+            # KiloCode: VS Code globalStorage settings
+            push!(
+                statuses,
+                "KiloCode" =>
+                    _detect_in_files(joinpath(_kilo_settings_dir(), "mcp_settings.json")),
+            )
 
             m.client_statuses = statuses
         catch
@@ -1904,6 +2109,28 @@ function _complete_path!(input::TextInput)
             Tachikoma.set_text!(input, completed)
         end
     end
+end
+
+"""KiloCode settings directory inside VS Code's globalStorage."""
+function _kilo_settings_dir()
+    gs = if Sys.isapple()
+        joinpath(homedir(), "Library", "Application Support", "Code", "User", "globalStorage")
+    elseif Sys.iswindows()
+        joinpath(
+            get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")),
+            "Code",
+            "User",
+            "globalStorage",
+        )
+    else
+        joinpath(
+            get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")),
+            "Code",
+            "User",
+            "globalStorage",
+        )
+    end
+    joinpath(gs, "kilocode.kilo-code", "settings")
 end
 
 function _short_path(path::String)
