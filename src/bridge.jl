@@ -22,6 +22,7 @@ const BRIDGE_LOCK = ReentrantLock()
 const _BRIDGE_TASK = Ref{Union{Task,Nothing}}(nothing)
 const _BRIDGE_CONTEXT = Ref{Union{ZMQ.Context,Nothing}}(nothing)
 const _BRIDGE_SOCKET = Ref{Union{ZMQ.Socket,Nothing}}(nothing)
+const _STREAM_SOCKET = Ref{Union{ZMQ.Socket,Nothing}}(nothing)  # PUB for streaming output
 const _SESSION_ID = Ref{String}("")
 const _RUNNING = Ref{Bool}(false)
 const _START_TIME = Ref{Float64}(0.0)
@@ -76,6 +77,18 @@ function bridge_eval(code::String; _mod::Module = Main)
     end
 end
 
+function _publish_stream(channel::String, data::String)
+    pub = _STREAM_SOCKET[]
+    pub === nothing && return
+    try
+        io = IOBuffer()
+        serialize(io, (channel = channel, data = data))
+        send(pub, Message(take!(io)))
+    catch
+        # Non-critical — subscriber may not be connected
+    end
+end
+
 function _eval_with_capture(expr)
     orig_stdout = stdout
     orig_stderr = stderr
@@ -94,6 +107,8 @@ function _eval_with_capture(expr)
                 # Echo to original stdout for REPL visibility
                 write(orig_stdout, line)
                 flush(orig_stdout)
+                # Publish to TUI stream
+                _publish_stream("stdout", line)
             end
         catch e
             e isa EOFError || @debug "stdout read error" exception = e
@@ -107,6 +122,7 @@ function _eval_with_capture(expr)
                 push!(stderr_content, line)
                 write(orig_stderr, line)
                 flush(orig_stderr)
+                _publish_stream("stderr", line)
             end
         catch e
             e isa EOFError || @debug "stderr read error" exception = e
@@ -173,7 +189,12 @@ end
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 
-function write_metadata(session_id::String, name::String, endpoint::String)
+function write_metadata(
+    session_id::String,
+    name::String,
+    endpoint::String,
+    stream_endpoint::String = "",
+)
     meta_path = joinpath(SOCK_DIR, "$(session_id).json")
     meta = Dict(
         "session_id" => session_id,
@@ -182,6 +203,7 @@ function write_metadata(session_id::String, name::String, endpoint::String)
         "julia_version" => string(VERSION),
         "project_path" => dirname(Base.active_project()),
         "endpoint" => endpoint,
+        "stream_endpoint" => stream_endpoint,
         "started_at" => string(now()),
     )
     open(meta_path, "w") do io
@@ -199,7 +221,7 @@ function write_metadata(session_id::String, name::String, endpoint::String)
 end
 
 function cleanup_files(session_id::String)
-    for ext in [".sock", ".json"]
+    for ext in [".sock", "-stream.sock", ".json"]
         path = joinpath(SOCK_DIR, "$(session_id)$(ext)")
         isfile(path) && rm(path; force = true)
     end
@@ -301,7 +323,7 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     _SESSION_ID[] = session_id
     _START_TIME[] = time()
 
-    # Create ZMQ context and socket
+    # Create ZMQ context and sockets
     ctx = Context()
     socket = Socket(ctx, REP)
     _BRIDGE_CONTEXT[] = ctx
@@ -315,13 +337,20 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     endpoint = "ipc://$(sock_path)"
     bind(socket, endpoint)
 
+    # Create PUB socket for streaming stdout/stderr to TUI
+    pub_socket = Socket(ctx, PUB)
+    stream_path = joinpath(SOCK_DIR, "$(session_id)-stream.sock")
+    stream_endpoint = "ipc://$(stream_path)"
+    bind(pub_socket, stream_endpoint)
+    _STREAM_SOCKET[] = pub_socket
+
     # Optionally bind TCP
     if port !== nothing
         bind(socket, "tcp://127.0.0.1:$port")
     end
 
     # Write metadata file
-    write_metadata(session_id, name, endpoint)
+    write_metadata(session_id, name, endpoint, stream_endpoint)
 
     # Register cleanup
     atexit(() -> stop())
@@ -338,7 +367,14 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
         end
     end
 
-    @info "MCPRepl bridge started" name = name session_id = session_id endpoint = endpoint
+    emoticon = try
+        parentmodule(@__MODULE__).load_personality()
+    catch
+        "⚡"
+    end
+    printstyled("  $emoticon MCPRepl bridge "; color = :green, bold = true)
+    printstyled("connected"; color = :green)
+    printstyled(" ($name)\n"; color = :light_black)
     return session_id
 end
 
@@ -364,11 +400,12 @@ function stop()
     end
 
     _cleanup()
-    @info "MCPRepl bridge stopped"
+    printstyled("  MCPRepl bridge "; color = :yellow, bold = true)
+    printstyled("disconnected\n"; color = :yellow)
 end
 
 function _cleanup()
-    # Close socket
+    # Close REP socket
     socket = _BRIDGE_SOCKET[]
     if socket !== nothing
         try
@@ -376,6 +413,16 @@ function _cleanup()
         catch
         end
         _BRIDGE_SOCKET[] = nothing
+    end
+
+    # Close PUB socket
+    pub = _STREAM_SOCKET[]
+    if pub !== nothing
+        try
+            close(pub)
+        catch
+        end
+        _STREAM_SOCKET[] = nothing
     end
 
     # Close context

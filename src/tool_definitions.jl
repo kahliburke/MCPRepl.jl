@@ -16,7 +16,12 @@ Reduces duplication across debug step tools (step_over, step_into, step_out, con
 # Returns
 Success or error message string
 """
-function vscode_debug_command(command::String, success_message::String; args = nothing)
+function vscode_debug_command(
+    command::String,
+    success_message::String;
+    args = nothing,
+    session::String = "",
+)
     try
         # Check if caller wants to wait for response (only step_over supports this)
         if args !== nothing && get(args, "wait_for_response", false)
@@ -24,6 +29,7 @@ function vscode_debug_command(command::String, success_message::String; args = n
                 """execute_vscode_command("$command", wait_for_response=true, timeout=10.0)""";
                 silent = false,
                 quiet = false,
+                session = session,
             )
             return result
         else
@@ -49,7 +55,7 @@ Reduces duplication between pkg_add_tool and pkg_rm_tool.
 # Returns
 Success message with result or error string
 """
-function pkg_operation_tool(operation::String, verb::String, args)
+function pkg_operation_tool(operation::String, verb::String, args; session::String = "")
     try
         packages = get(args, "packages", String[])
         if isempty(packages)
@@ -66,7 +72,7 @@ function pkg_operation_tool(operation::String, verb::String, args)
         end
         """
 
-        execute_repllike(code; silent = false, quiet = false)
+        execute_repllike(code; silent = false, quiet = false, session = session)
 
         return """$verb packages: $(join(packages, ", "))
 
@@ -91,7 +97,12 @@ Reduces duplication between code_lowered_tool and code_typed_tool.
 # Returns
 Result of code introspection or error string
 """
-function code_introspection_tool(macro_name::String, description_prefix::String, args)
+function code_introspection_tool(
+    macro_name::String,
+    description_prefix::String,
+    args;
+    session::String = "",
+)
     try
         func_expr = get(args, "function_expr", "")
         types_expr = get(args, "types", "")
@@ -108,6 +119,7 @@ function code_introspection_tool(macro_name::String, description_prefix::String,
             code;
             description = "[$description_prefix: $func_expr with types $types_expr]",
             quiet = false,
+            session = session,
         )
     catch e
         return "Error getting $macro_name: $e"
@@ -278,6 +290,10 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 "description" => "Maximum output length in characters (default: 6000, max: 25000). Only increase if you legitimately need more output. Hitting this limit usually means you should use a different approach (check size first, sample data, filter, etc).",
                 "default" => 6000,
             ),
+            "ses" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["e"],
     ),
@@ -287,6 +303,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
             quiet = get(args, "q", true)
             expr_str = get(args, "e", "")
             max_output = get(args, "max_output", 6000)
+            ses = get(args, "ses", "")
 
             # Enforce hard limit
             max_output = min(max_output, 25000)
@@ -312,6 +329,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                     quiet = quiet,
                     silent = silent,
                     max_output = max_output,
+                    session = ses,
                 )
             else
                 Base.invokelatest(
@@ -320,6 +338,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                     silent = silent,
                     quiet = quiet,
                     max_output = max_output,
+                    session = ses,
                 )
             end
         catch e
@@ -677,13 +696,24 @@ investigate_tool = @mcp_tool(
 search_methods_tool = @mcp_tool(
     :search_methods,
     "Search for all methods of a function or methods matching a type signature.",
-    MCPRepl.text_parameter(
-        "query",
-        "Function name or type to search (e.g., 'println', 'String', 'Base.sort')",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "query" => Dict(
+                "type" => "string",
+                "description" => "Function name or type to search (e.g., 'println', 'String', 'Base.sort')",
+            ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
+        ),
+        "required" => ["query"],
     ),
     args -> begin
         try
             query = get(args, "query", "")
+            ses = get(args, "session", "")
             if isempty(query)
                 return "Error: query parameter is required"
             end
@@ -704,6 +734,7 @@ search_methods_tool = @mcp_tool(
                 code;
                 description = "[Searching methods for: $query]",
                 quiet = false,
+                session = ses,
             )
         catch e
             "Error searching methods: $e"
@@ -714,13 +745,24 @@ search_methods_tool = @mcp_tool(
 macro_expand_tool = @mcp_tool(
     :macro_expand,
     "Expand a macro to see the generated code.",
-    MCPRepl.text_parameter(
-        "expression",
-        "Macro expression to expand (e.g., '@time sleep(1)')",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "expression" => Dict(
+                "type" => "string",
+                "description" => "Macro expression to expand (e.g., '@time sleep(1)')",
+            ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
+        ),
+        "required" => ["expression"],
     ),
     args -> begin
         try
             expr = get(args, "expression", "")
+            ses = get(args, "session", "")
             if isempty(expr)
                 return "Error: expression parameter is required"
             end
@@ -729,7 +771,12 @@ macro_expand_tool = @mcp_tool(
             using InteractiveUtils
             @macroexpand $expr
             """
-            execute_repllike(code; description = "[Expanding macro: $expr]", quiet = false)
+            execute_repllike(
+                code;
+                description = "[Expanding macro: $expr]",
+                quiet = false,
+                session = ses,
+            )
         catch e
             "Error expanding macro: \$e"
         end
@@ -739,13 +786,24 @@ macro_expand_tool = @mcp_tool(
 type_info_tool = @mcp_tool(
     :type_info,
     "Get type information: hierarchy, fields, parameters, and properties.",
-    MCPRepl.text_parameter(
-        "type_expr",
-        "Type expression to inspect (e.g., 'String', 'Vector{Int}', 'AbstractArray')",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "type_expr" => Dict(
+                "type" => "string",
+                "description" => "Type expression to inspect (e.g., 'String', 'Vector{Int}', 'AbstractArray')",
+            ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
+        ),
+        "required" => ["type_expr"],
     ),
     args -> begin
         try
             type_expr = get(args, "type_expr", "")
+            ses = get(args, "session", "")
             if isempty(type_expr)
                 return "Error: type_expr parameter is required"
             end
@@ -753,47 +811,41 @@ type_info_tool = @mcp_tool(
             code = """
             using InteractiveUtils
             T = $type_expr
-            println("Type Information for: \$T")
-            println("=" ^ 60)
-            println()
-
-            # Basic type info
-            println("Abstract: ", isabstracttype(T))
-            println("Primitive: ", isprimitivetype(T))
-            println("Mutable: ", ismutabletype(T))
-            println()
-
-            # Type hierarchy
-            println("Supertype: ", supertype(T))
+            _buf = IOBuffer()
+            print(_buf, "Type Information for: \$T\\n")
+            print(_buf, "=" ^ 60, "\\n\\n")
+            print(_buf, "Abstract: ", isabstracttype(T), "\\n")
+            print(_buf, "Primitive: ", isprimitivetype(T), "\\n")
+            print(_buf, "Mutable: ", ismutabletype(T), "\\n\\n")
+            print(_buf, "Supertype: ", supertype(T), "\\n")
             if !isabstracttype(T)
-                println()
-                println("Fields:")
+                print(_buf, "\\nFields:\\n")
                 if fieldcount(T) > 0
                     for (i, fname) in enumerate(fieldnames(T))
                         ftype = fieldtype(T, i)
-                        println("  \$i. \$fname :: \$ftype")
+                        print(_buf, "  \$i. \$fname :: \$ftype\\n")
                     end
                 else
-                    println("  (no fields)")
+                    print(_buf, "  (no fields)\\n")
                 end
             end
-
-            println()
-            println("Direct subtypes:")
+            print(_buf, "\\nDirect subtypes:\\n")
             subs = subtypes(T)
             if isempty(subs)
-                println("  (no direct subtypes)")
+                print(_buf, "  (no direct subtypes)\\n")
             else
                 for sub in subs
-                    println("  - \$sub")
+                    print(_buf, "  - \$sub\\n")
                 end
             end
+            String(take!(_buf))
             """
             execute_repllike(
                 code;
                 description = "[Getting type info for: $type_expr]",
                 quiet = false,
                 show_prompt = false,
+                session = ses,
             )
         catch e
             "Error getting type info: $e"
@@ -804,10 +856,22 @@ type_info_tool = @mcp_tool(
 profile_tool = @mcp_tool(
     :profile_code,
     "Profile Julia code to identify performance bottlenecks.",
-    MCPRepl.text_parameter("code", "Julia code to profile"),
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "code" =>
+                Dict("type" => "string", "description" => "Julia code to profile"),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
+        ),
+        "required" => ["code"],
+    ),
     args -> begin
         try
             code_to_profile = get(args, "code", "")
+            ses = get(args, "session", "")
             if isempty(code_to_profile)
                 return "Error: code parameter is required"
             end
@@ -820,7 +884,12 @@ profile_tool = @mcp_tool(
             end
             Profile.print(format=:flat, sortedby=:count)
             """
-            execute_repllike(wrapper; description = "[Profiling code]", quiet = false)
+            execute_repllike(
+                wrapper;
+                description = "[Profiling code]",
+                quiet = false,
+                session = ses,
+            )
         catch e
             "Error profiling code: \$e"
         end
@@ -841,6 +910,10 @@ list_names_tool = @mcp_tool(
                 "type" => "boolean",
                 "description" => "Include non-exported names (default: false)",
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["module_name"],
     ),
@@ -848,6 +921,7 @@ list_names_tool = @mcp_tool(
         try
             module_name = get(args, "module_name", "")
             show_all = get(args, "all", false)
+            ses = get(args, "session", "")
 
             if isempty(module_name)
                 return "Error: module_name parameter is required"
@@ -855,20 +929,22 @@ list_names_tool = @mcp_tool(
 
             code = """
             mod = $module_name
-            println("Names in \$mod" * (($show_all) ? " (all=true)" : " (exported only)") * ":")
-            println("=" ^ 60)
+            _buf = IOBuffer()
+            print(_buf, "Names in \$mod" * (($show_all) ? " (all=true)" : " (exported only)") * ":\\n")
+            print(_buf, "=" ^ 60, "\\n")
             name_list = names(mod, all=$show_all)
             for name in sort(name_list)
-                println("  ", name)
+                print(_buf, "  ", name, "\\n")
             end
-            println()
-            println("Total: ", length(name_list), " names")
+            print(_buf, "\\nTotal: ", length(name_list), " names\\n")
+            String(take!(_buf))
             """
             execute_repllike(
                 code;
                 description = "[Listing names in: $module_name]",
                 quiet = false,
                 show_prompt = false,
+                session = ses,
             )
         catch e
             "Error listing names: \$e"
@@ -890,10 +966,19 @@ code_lowered_tool = @mcp_tool(
                 "type" => "string",
                 "description" => "Argument types as tuple (e.g., '(Float64,)', '(Int, Int)')",
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["function_expr", "types"],
     ),
-    args -> code_introspection_tool("code_lowered", "Getting lowered code for", args)
+    args -> code_introspection_tool(
+        "code_lowered",
+        "Getting lowered code for",
+        args;
+        session = get(args, "session", ""),
+    )
 )
 
 code_typed_tool = @mcp_tool(
@@ -910,10 +995,19 @@ code_typed_tool = @mcp_tool(
                 "type" => "string",
                 "description" => "Argument types as tuple (e.g., '(Float64,)', '(Int, Int)')",
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["function_expr", "types"],
     ),
-    args -> code_introspection_tool("code_typed", "Getting typed code for", args)
+    args -> code_introspection_tool(
+        "code_typed",
+        "Getting typed code for",
+        args;
+        session = get(args, "session", ""),
+    )
 )
 
 # Optional formatting tool (requires JuliaFormatter.jl)
@@ -937,6 +1031,10 @@ format_tool = @mcp_tool(
                 "description" => "Show formatting progress",
                 "default" => true,
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["path"],
     ),
@@ -954,6 +1052,7 @@ format_tool = @mcp_tool(
             path = get(args, "path", "")
             overwrite = get(args, "overwrite", true)
             verbose = get(args, "verbose", true)
+            ses = get(args, "session", "")
 
             if isempty(path)
                 return "Error: path parameter is required"
@@ -994,6 +1093,7 @@ format_tool = @mcp_tool(
                 code;
                 description = "[Formatting code at: $abs_path]",
                 quiet = false,
+                session = ses,
             )
         catch e
             "Error formatting code: $e"
@@ -1012,6 +1112,10 @@ lint_tool = @mcp_tool(
                 "type" => "string",
                 "description" => "Package name to test (defaults to current project)",
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => [],
     ),
@@ -1027,6 +1131,7 @@ lint_tool = @mcp_tool(
             end
 
             pkg_name = get(args, "package_name", nothing)
+            ses = get(args, "session", "")
 
             if pkg_name === nothing
                 # Use current project
@@ -1068,6 +1173,7 @@ lint_tool = @mcp_tool(
                 code;
                 description = "[Running Aqua quality tests]",
                 quiet = false,
+                session = ses,
             )
         catch e
             "Error running Aqua tests: $e"
@@ -1481,10 +1587,15 @@ pkg_add_tool = @mcp_tool(
                 "description" => "Array of package names to add",
                 "items" => Dict("type" => "string"),
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["packages"],
     ),
-    args -> pkg_operation_tool("add", "Added", args)
+    args ->
+        pkg_operation_tool("add", "Added", args; session = get(args, "session", ""))
 )
 
 pkg_rm_tool = @mcp_tool(
@@ -1498,10 +1609,15 @@ pkg_rm_tool = @mcp_tool(
                 "description" => "Array of package names to remove",
                 "items" => Dict("type" => "string"),
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["packages"],
     ),
-    args -> pkg_operation_tool("rm", "Removed", args)
+    args ->
+        pkg_operation_tool("rm", "Removed", args; session = get(args, "session", ""))
 )
 
 run_tests_tool = @mcp_tool(

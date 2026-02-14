@@ -408,6 +408,28 @@ Base.display(d::IOBufferDisplay, mime::MIME, x) = show(d.io, mime, x)
 Base.display(d::IOBufferDisplay, mime, x) = show(d.io, mime, x)
 
 """
+    _serialize_expr(expr) -> String
+
+Serialize a (possibly-modified) AST back to valid Julia code.
+`Base.parse_input_line` wraps multi-line code in `:toplevel`, and
+`string(Expr(:toplevel, ...))` falls back to `\$(Expr(:toplevel, ...))`,
+injecting literal `\$` that corrupts the code. This function handles
+`:toplevel` by joining each child expression as a separate statement.
+"""
+function _serialize_expr(expr)
+    if expr isa Expr && expr.head == :toplevel
+        parts = String[]
+        for arg in expr.args
+            arg isa LineNumberNode && continue
+            push!(parts, string(arg))
+        end
+        return join(parts, "\n")
+    else
+        return string(expr)
+    end
+end
+
+"""
     remove_println_calls(expr, toplevel=true, strip_show=true, was_stripped=Ref(false))
 
 Strip println, print, printstyled, @show, and logging macros from an AST expression.
@@ -565,6 +587,7 @@ function execute_repllike(
     description::Union{String,Nothing} = nothing,
     show_prompt::Bool = true,
     max_output::Int = 6000,
+    session::String = "",
 )
     # Route through bridge when running in TUI server mode.
     # This makes ALL tools that call execute_repllike bridge-aware automatically.
@@ -574,6 +597,7 @@ function execute_repllike(
             quiet = quiet,
             silent = silent,
             max_output = max_output,
+            session = session,
         )
     end
 
@@ -968,27 +992,47 @@ function execute_via_bridge(
     quiet::Bool = true,
     silent::Bool = false,
     max_output::Int = 6000,
+    session::String = "",
 )
     mgr = BRIDGE_CONN_MGR[]
     if mgr === nothing
         return "ERROR: Bridge mode active but no ConnectionManager configured"
     end
 
-    conn = get_default_connection(mgr)
+    conn = if isempty(session)
+        # Backward compat: auto-select if exactly one session
+        conns = connected_sessions(mgr)
+        if length(conns) == 1
+            conns[1]
+        else
+            nothing
+        end
+    else
+        get_connection_by_key(mgr, session)
+    end
     if conn === nothing
-        return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+        available =
+            join(["$(short_key(c)) ($(c.name))" for c in connected_sessions(mgr)], ", ")
+        if isempty(available)
+            return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+        end
+        return "ERROR: No session matched '$(session)'. Available: $available"
     end
 
-    # Apply println stripping (stays server-side)
+    # Apply println stripping (stays server-side — keeps LLM results clean)
     was_stripped = Ref(false)
     expr = Base.parse_input_line(code)
     expr = remove_println_calls(expr, true, quiet, was_stripped)
-    # Re-serialize the cleaned expression back to code string
+    # Re-serialize only if stripping actually happened. Use _serialize_expr
+    # instead of string(expr) because parse_input_line wraps multi-line code
+    # in :toplevel, and string(:toplevel) emits $(Expr(...)) with literal $
+    # that corrupts the code on the remote REPL.
     cleaned_code = if expr === nothing
         ""  # Entire expression was stripped
+    elseif was_stripped[]
+        _serialize_expr(expr)
     else
-        # Use the original code if expr is unchanged, otherwise sprint the expr
-        string(expr)
+        code  # keep original — no stripping means no need to re-serialize
     end
 
     # Auto-append semicolon in quiet mode

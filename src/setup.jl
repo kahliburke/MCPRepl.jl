@@ -806,53 +806,26 @@ function setup(; gentle::Bool = false)
     # FIRST: Check security configuration
     security_config = load_security_config()
 
+    # Also check global config
     if security_config === nothing
-        printstyled(
-            "\n╔═══════════════════════════════════════════════════════════╗\n",
-            color = :cyan,
-            bold = true,
-        )
-        printstyled(
-            "║                                                           ║\n",
-            color = :cyan,
-            bold = true,
-        )
-        printstyled(
-            "║         🔒 MCPRepl Security Setup Required 🔒             ║\n",
-            color = :yellow,
-            bold = true,
-        )
-        printstyled(
-            "║                                                           ║\n",
-            color = :cyan,
-            bold = true,
-        )
-        printstyled(
-            "╚═══════════════════════════════════════════════════════════╝\n",
-            color = :cyan,
-            bold = true,
-        )
-        println()
-        println("MCPRepl now requires security configuration before use.")
-        println("This includes API key authentication and IP allowlisting.")
-        println()
-        print("Run security setup wizard now? [Y/n]: ")
-        response = strip(lowercase(readline()))
+        security_config = load_global_security_config()
+    end
 
-        if isempty(response) || response == "y" || response == "yes"
-            security_config = security_setup_wizard(pwd(); gentle = gentle)
-            println()
-            printstyled("✅ Security configuration complete!\n", color = :green, bold = true)
-            println()
-        else
+    if security_config === nothing
+        # Launch the TUI setup wizard
+        security_config = setup_wizard_tui()
+        if security_config === nothing
             println()
             printstyled(
-                "⚠️  Setup incomplete. Run MCPRepl.setup_security() later.\n",
+                "Setup incomplete. Run MCPRepl.setup_security() later.\n",
                 color = :yellow,
             )
             println()
             return
         end
+        println()
+        printstyled("Security configuration complete!\n", color = :green, bold = true)
+        println()
     else
         printstyled(
             "\n✅ Security configured (mode: $(security_config.mode))\n",

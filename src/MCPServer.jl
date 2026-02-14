@@ -128,7 +128,9 @@ function get_or_create_session(session_id::Union{String,Nothing}, is_initialize:
         if is_initialize
             # Check if client provided an existing session ID
             if session_id !== nothing
-                # Try to restore from persisted sessions (allows reconnection after restart)
+                # Try to restore from persisted sessions (allows reconnection after restart).
+                # We intentionally don't check STANDALONE_SESSIONS here: the restored
+                # MCPSession must be in UNINITIALIZED state for initialize_session!() to work.
                 persisted_sessions = load_persisted_sessions()
                 if haskey(persisted_sessions, session_id)
                     # Valid persisted session found - restore it
@@ -199,6 +201,53 @@ using .Prompts
 
 # Import Dashboard for standalone mode
 import ..Dashboard
+
+# ============================================================================
+# REPL Resource Helpers (for MCP resources/list and resources/read)
+# ============================================================================
+
+function _list_repl_resources()
+    mgr = BRIDGE_CONN_MGR[]
+    mgr === nothing && return Dict{String,Any}[]
+    resources = Dict{String,Any}[]
+    for conn in connected_sessions(mgr)
+        key = short_key(conn)
+        proj = isempty(conn.project_path) ? "unknown" : basename(conn.project_path)
+        push!(
+            resources,
+            Dict{String,Any}(
+                "uri" => "repl://$(key)",
+                "name" => key,
+                "title" => "$(conn.name) — $proj",
+                "description" => "Julia $(conn.julia_version) (PID $(conn.pid)) | Project: $(conn.project_path) | Session: $(key)",
+                "mimeType" => "application/json",
+            ),
+        )
+    end
+    return resources
+end
+
+function _read_repl_resource(uri::String)
+    key = replace(uri, "repl://" => "")
+    mgr = BRIDGE_CONN_MGR[]
+    mgr === nothing && return JSON.json(Dict("error" => "No connection manager"))
+    conn = get_connection_by_key(mgr, key)
+    conn === nothing && return JSON.json(Dict("error" => "Session not found: $key"))
+    return JSON.json(
+        Dict(
+            "key" => short_key(conn),
+            "name" => conn.name,
+            "session_id" => conn.session_id,
+            "status" => string(conn.status),
+            "project_path" => conn.project_path,
+            "julia_version" => conn.julia_version,
+            "pid" => conn.pid,
+            "connected_at" => string(conn.connected_at),
+            "last_seen" => string(conn.last_seen),
+            "tool_call_count" => conn.tool_call_count,
+        ),
+    )
+end
 
 # Import types and functions from parent module
 import ..MCPRepl:
@@ -794,7 +843,46 @@ function create_handler(
                 response = Dict(
                     "jsonrpc" => "2.0",
                     "id" => request["id"],
-                    "result" => Dict("resources" => []),
+                    "result" => Dict("resources" => _list_repl_resources()),
+                )
+                return HTTP.Response(
+                    200,
+                    ["Content-Type" => "application/json"],
+                    JSON.json(response),
+                )
+            end
+
+            # Handle resources/read request
+            if request["method"] == "resources/read"
+                uri = get(get(request, "params", Dict()), "uri", "")
+                if isempty(uri)
+                    error_response = Dict(
+                        "jsonrpc" => "2.0",
+                        "id" => request["id"],
+                        "error" => Dict(
+                            "code" => -32602,
+                            "message" => "Missing required parameter: uri",
+                        ),
+                    )
+                    return HTTP.Response(
+                        400,
+                        ["Content-Type" => "application/json"],
+                        JSON.json(error_response),
+                    )
+                end
+                content_text = _read_repl_resource(uri)
+                response = Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request["id"],
+                    "result" => Dict(
+                        "contents" => [
+                            Dict(
+                                "uri" => uri,
+                                "mimeType" => "application/json",
+                                "text" => content_text,
+                            ),
+                        ],
+                    ),
                 )
                 return HTTP.Response(
                     200,
@@ -972,37 +1060,84 @@ function create_handler(
                         "code_typed",
                     ]
                     show_timing = !(tool.name in excluded_tools)
+                    # In bridge/TUI mode, never print to stdout — log instead
+                    tui_mode = BRIDGE_MODE[]
 
                     # Show tool start indicator (stays on same line)
-                    if show_timing
+                    if show_timing && !tui_mode
                         print("🔧 ")
                         printstyled(tool.name, color = :light_blue)
                         flush(stdout)
                     end
 
+                    # Always push activity events in TUI mode (including ex, etc.)
+                    if tui_mode
+                        _push_activity!(:tool_start, tool.name, "", "")
+                    end
+
                     start_time = time()
+                    tool_ok = true
+                    time_str = ""
 
                     # Non-streaming mode (streaming handled in hybrid_handler)
                     # Use invokelatest to pick up Revise changes to tool handlers
                     result_text = try
                         Base.invokelatest(tool.handler, args)
+                    catch
+                        tool_ok = false
+                        rethrow()
                     finally
-                        # Show completion with timing (updates the line or adds new line)
-                        if show_timing
-                            elapsed = time() - start_time
-                            # Format time nicely
-                            time_str = if elapsed < 1.0
-                                @sprintf("%.0fms", elapsed * 1000)
-                            else
-                                @sprintf("%.1fs", elapsed)
+                        elapsed = time() - start_time
+                        # Format time nicely
+                        time_str = if elapsed < 1.0
+                            @sprintf("%.0fms", elapsed * 1000)
+                        else
+                            @sprintf("%.1fs", elapsed)
+                        end
+                        if tui_mode
+                            # Always push activity events in TUI mode
+                            _push_activity!(
+                                :tool_done,
+                                tool.name,
+                                "",
+                                time_str;
+                                success = tool_ok,
+                            )
+                            if show_timing
+                                marker = tool_ok ? "✓" : "✗"
+                                @info "$(tool.name) $marker ($time_str)"
                             end
-                            # Use carriage return to overwrite the line if no output, or write on current line if there was output
+                        elseif show_timing
                             print("\r\033[K🔧 ")
                             printstyled(tool.name, color = :light_blue)
-                            printstyled(" ✓ ", color = :green)
+                            if tool_ok
+                                printstyled(" ✓ ", color = :green)
+                            else
+                                printstyled(" ✗ ", color = :red)
+                            end
                             printstyled("($time_str)\n", color = :light_black)
                             flush(stdout)
                         end
+                    end
+
+                    # Push full tool result for TUI Activity inspection
+                    if tui_mode
+                        rt = string(result_text)
+                        # Detect error strings returned without throwing
+                        ok = tool_ok && !startswith(rt, "ERROR:")
+                        # Extract session key from tool args (ses for ex, session for others)
+                        sk = string(get(args, "ses", get(args, "session", "")))
+                        _push_tool_result!(
+                            ToolCallResult(
+                                now(),
+                                tool.name,
+                                JSON.json(args),
+                                rt,
+                                time_str,
+                                ok,
+                                sk,
+                            ),
+                        )
                     end
 
                     response = Dict(
@@ -1048,8 +1183,12 @@ function create_handler(
             )
 
         catch e
-            # Internal error - show in REPL and return to client
-            printstyled("\nMCP Server error: $e\n", color = :red)
+            # Internal error - log and return to client
+            if BRIDGE_MODE[]
+                @error "MCP Server error: $e"
+            else
+                printstyled("\nMCP Server error: $e\n", color = :red)
+            end
 
             # Try to get the original request ID for proper JSON-RPC error response
             request_id = 0  # Default to 0 instead of nothing to satisfy JSON-RPC schema
@@ -1088,6 +1227,7 @@ function start_mcp_server(
     verbose::Bool = true,
     security_config::Union{SecurityConfig,Nothing} = nothing,
     session_uuid::Union{String,Nothing} = nothing,
+    dashboard::Bool = true,
 )
     # Use provided UUID or generate a new one (persists across reconnections)
     session_uuid = session_uuid !== nothing ? session_uuid : string(UUIDs.uuid4())
@@ -1544,15 +1684,17 @@ function start_mcp_server(
                 end
 
                 # Dashboard UI static files (must be last to avoid catching API routes)
-                # Serve root, /dashboard/*, and static assets like /vite.svg, /*.js, /*.css
-                if req.target == "/" ||
-                   startswith(req.target, "/dashboard") ||
-                   endswith(req.target, ".svg") ||
-                   endswith(req.target, ".js") ||
-                   endswith(req.target, ".css") ||
-                   endswith(req.target, ".png") ||
-                   endswith(req.target, ".jpg") ||
-                   endswith(req.target, ".ico")
+                # Skipped when dashboard=false (TUI mode — no web dashboard needed)
+                if dashboard && (
+                    req.target == "/" ||
+                    startswith(req.target, "/dashboard") ||
+                    endswith(req.target, ".svg") ||
+                    endswith(req.target, ".js") ||
+                    endswith(req.target, ".css") ||
+                    endswith(req.target, ".png") ||
+                    endswith(req.target, ".jpg") ||
+                    endswith(req.target, ".ico")
+                )
 
                     # Check if Vite dev server is running on port 3001
                     vite_running = try
@@ -1730,48 +1872,57 @@ function start_mcp_server(
 
     # Start server with stream=true to enable streaming responses
     # Temporarily suppress HTTP.jl's "Listening on" info message
+    # In TUI mode, keep the TUILogger active (don't swap to ConsoleLogger
+    # which would write to raw stderr and corrupt the terminal)
     old_logger = global_logger()
-    global_logger(ConsoleLogger(stderr, Logging.Warn))
-
-    # Auto-start Vite dev server in development mode for hot-reloading
-    try
-        dashboard_src = abspath(joinpath(@__DIR__, "..", "dashboard-ui", "src"))
-        if isdir(dashboard_src)
-            # Check if Vite is already running
-            vite_running = try
-                sock = connect("localhost", 3001)
-                close(sock)
-                true
-            catch
-                false
-            end
-
-            if !vite_running
-                dashboard_dir = abspath(joinpath(@__DIR__, "..", "dashboard-ui"))
-                if isdir(joinpath(dashboard_dir, "node_modules"))
-                    @info "Starting Vite dev server for hot-reloading..."
-                    log_file = joinpath(dashboard_dir, ".vite-dev.log")
-                    cd(dashboard_dir) do
-                        log_io = open(log_file, "w")
-                        run(
-                            pipeline(`npm run dev`, stdout = log_io, stderr = log_io),
-                            wait = false,
-                        )
-                    end
-                    sleep(2)  # Give Vite time to start
-                    @info "✅ Vite dev server started on port 3001 (dashboard will hot-reload)"
-                end
-            else
-                @info "Vite dev server already running on port 3001"
-            end
-        end
-    catch e
-        @debug "Could not start Vite dev server (development features disabled)" exception =
-            e
+    if !BRIDGE_MODE[]
+        global_logger(ConsoleLogger(stderr, Logging.Warn))
     end
 
+    # Auto-start Vite dev server in development mode for hot-reloading
+    # Skipped when dashboard=false (e.g. TUI mode — the TUI is the dashboard)
+    if dashboard
+        try
+            dashboard_src = abspath(joinpath(@__DIR__, "..", "dashboard-ui", "src"))
+            if isdir(dashboard_src)
+                # Check if Vite is already running
+                vite_running = try
+                    sock = connect("localhost", 3001)
+                    close(sock)
+                    true
+                catch
+                    false
+                end
+
+                if !vite_running
+                    dashboard_dir = abspath(joinpath(@__DIR__, "..", "dashboard-ui"))
+                    if isdir(joinpath(dashboard_dir, "node_modules"))
+                        @info "Starting Vite dev server for hot-reloading..."
+                        log_file = joinpath(dashboard_dir, ".vite-dev.log")
+                        cd(dashboard_dir) do
+                            log_io = open(log_file, "w")
+                            run(
+                                pipeline(`npm run dev`, stdout = log_io, stderr = log_io),
+                                wait = false,
+                            )
+                        end
+                        sleep(2)  # Give Vite time to start
+                        @info "✅ Vite dev server started on port 3001 (dashboard will hot-reload)"
+                    end
+                else
+                    @info "Vite dev server already running on port 3001"
+                end
+            end
+        catch e
+            @debug "Could not start Vite dev server (development features disabled)" exception =
+                e
+        end
+    end # dashboard
+
     server = HTTP.serve!(hybrid_handler, port; verbose = false, stream = true)
-    global_logger(old_logger)
+    if !BRIDGE_MODE[]
+        global_logger(old_logger)
+    end
 
     # Server started successfully (session is now managed per-request via STANDALONE_SESSIONS)
     return MCPServer(session_uuid, port, server, tools_dict, name_to_id, nothing)
@@ -1791,5 +1942,4 @@ function stop_mcp_server(server::MCPServer)
     end
 
     HTTP.close(server.server)
-    println("MCP Server stopped")
 end

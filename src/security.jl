@@ -78,6 +78,26 @@ function get_global_security_config_path()
     return joinpath(config_dir, "security.json")
 end
 
+const PERSONALITY_EMOTICONS = Dict("dragon" => "🐉", "butterfly" => "🦋", "l33t" => "👾")
+
+"""
+    load_personality() -> String
+
+Load the wizard personality emoticon from the global security config.
+Returns a default if not set.
+"""
+function load_personality()
+    config_path = get_global_security_config_path()
+    isfile(config_path) || return "⚡"
+    try
+        data = JSON.parse(read(config_path, String); dicttype = Dict{String,Any})
+        p = get(data, "personality", "")
+        return get(PERSONALITY_EMOTICONS, p, "⚡")
+    catch
+        return "⚡"
+    end
+end
+
 """
     load_global_security_config() -> Union{SecurityConfig, Nothing}
 

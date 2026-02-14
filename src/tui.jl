@@ -9,7 +9,19 @@
 # Exported: Model, Block, StatusBar, Span, Layout, etc.
 # Non-exported widgets need explicit import:
 import Tachikoma:
-    TabBar, SelectableList, ListItem, Table, Gauge, Sparkline, Modal, TextInput, BOX_HEAVY
+    TabBar,
+    SelectableList,
+    ListItem,
+    Table,
+    Gauge,
+    Sparkline,
+    Modal,
+    TextInput,
+    BOX_HEAVY,
+    ResizableLayout,
+    split_layout,
+    render_resize_handles!,
+    handle_resize!
 # Tachikoma.split (for layouts) is not Base.split, so we alias it.
 const tsplit = Tachikoma.split
 
@@ -82,6 +94,91 @@ function _push_log!(level::Symbol, message::String)
     end
 end
 
+# ── Activity Feed ─────────────────────────────────────────────────────────────
+# Unified timeline of tool calls and streaming REPL output. The MCPServer
+# tool handler pushes :tool_start / :tool_done events here, and the view()
+# loop drains bridge SUB messages into :stdout / :stderr events.
+
+struct ActivityEvent
+    timestamp::DateTime
+    kind::Symbol         # :tool_start, :tool_done, :stdout, :stderr
+    tool_name::String    # tool name for tool events, "" for stream
+    session_name::String # bridge session name
+    data::String         # output text for stream, time_str for tool_done
+    success::Bool        # meaningful only for :tool_done
+end
+
+const _TUI_ACTIVITY_BUFFER = ActivityEvent[]
+const _TUI_ACTIVITY_LOCK = ReentrantLock()
+
+"""
+    _push_activity!(kind, tool_name, session_name, data; success=true)
+
+Thread-safe push of an activity event. Called from the MCPServer tool handler.
+"""
+function _push_activity!(
+    kind::Symbol,
+    tool_name::String,
+    session_name::String,
+    data::String;
+    success::Bool = true,
+)
+    lock(_TUI_ACTIVITY_LOCK) do
+        push!(
+            _TUI_ACTIVITY_BUFFER,
+            ActivityEvent(now(), kind, tool_name, session_name, data, success),
+        )
+        while length(_TUI_ACTIVITY_BUFFER) > 500
+            popfirst!(_TUI_ACTIVITY_BUFFER)
+        end
+    end
+end
+
+function _drain_activity_buffer!(dest::Vector{ActivityEvent})
+    lock(_TUI_ACTIVITY_LOCK) do
+        append!(dest, _TUI_ACTIVITY_BUFFER)
+        empty!(_TUI_ACTIVITY_BUFFER)
+    end
+    while length(dest) > 2000
+        popfirst!(dest)
+    end
+end
+
+# ── Tool Call Results (inspectable) ──────────────────────────────────────
+# Full tool call records with args + output for the Activity tab detail panel.
+
+struct ToolCallResult
+    timestamp::DateTime
+    tool_name::String
+    args_json::String      # JSON-encoded tool arguments
+    result_text::String    # full result returned by tool handler
+    duration_str::String   # "125ms" or "1.2s"
+    success::Bool
+    session_key::String    # 8-char short key for session routing ("" if none)
+end
+
+const _TUI_TOOL_RESULTS_BUFFER = ToolCallResult[]
+const _TUI_TOOL_RESULTS_LOCK = ReentrantLock()
+
+function _push_tool_result!(r::ToolCallResult)
+    lock(_TUI_TOOL_RESULTS_LOCK) do
+        push!(_TUI_TOOL_RESULTS_BUFFER, r)
+        while length(_TUI_TOOL_RESULTS_BUFFER) > 500
+            popfirst!(_TUI_TOOL_RESULTS_BUFFER)
+        end
+    end
+end
+
+function _drain_tool_results!(dest::Vector{ToolCallResult})
+    lock(_TUI_TOOL_RESULTS_LOCK) do
+        append!(dest, _TUI_TOOL_RESULTS_BUFFER)
+        empty!(_TUI_TOOL_RESULTS_BUFFER)
+    end
+    while length(dest) > 500
+        popfirst!(dest)
+    end
+end
+
 # ── Data types ────────────────────────────────────────────────────────────────
 
 struct ToolCallRecord
@@ -122,9 +219,10 @@ end
 
 @kwdef mutable struct MCPReplModel <: Model
     quit::Bool = false
+    shutting_down::Bool = false
     tick::Int = 0
 
-    # Tabs: 1=Sessions, 2=Agents, 3=Activity, 4=Config, 5=Server
+    # Tabs: 1=Server, 2=Sessions, 3=Agents, 4=Activity, 5=Config
     active_tab::Int = 1
 
     # REPL connections (managed by ConnectionManager)
@@ -135,9 +233,16 @@ end
     agents::Vector{AgentInfo} = AgentInfo[]
     selected_agent::Int = 1
 
-    # Activity log
+    # Activity feed — unified timeline of tool calls + streaming output
+    activity_feed::Vector{ActivityEvent} = ActivityEvent[]
     recent_tool_calls::Vector{ToolCallRecord} = ToolCallRecord[]
     tool_call_history::Vector{Float64} = zeros(120)  # calls per second, last 2 min
+
+    # Tool call results — inspectable from Activity tab
+    tool_results::Vector{ToolCallResult} = ToolCallResult[]
+    selected_result::Int = 0       # 0 = none, 1+ = index into tool_results (newest-first)
+    result_scroll::Int = 0         # vertical scroll in detail panel
+    activity_layout::ResizableLayout = ResizableLayout(Vertical, [Percent(35), Fill()])
 
     # Server state
     server_port::Int = 2828
@@ -168,6 +273,9 @@ end
     # Flow result
     flow_message::String = ""
     flow_success::Bool = false
+
+    # Client detection (populated async on tab switch)
+    client_statuses::Vector{Pair{String,Bool}} = Pair{String,Bool}[]
 end
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -225,7 +333,17 @@ Tachikoma.should_quit(m::MCPReplModel) = m.quit
 
 # ── Update ────────────────────────────────────────────────────────────────────
 
+function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
+    # Route mouse events to resizable layouts
+    if m.active_tab == 4
+        handle_resize!(m.activity_layout, evt)
+    end
+end
+
 function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
+    # Ignore input while shutting down
+    m.shutting_down && return
+
     # When a modal flow is active, route all input there
     if m.config_flow != FLOW_IDLE
         evt.key == :escape && (m.config_flow = FLOW_IDLE; return)
@@ -234,39 +352,60 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
     end
 
     if evt.key == :char
-        evt.char == 'q' && (m.quit = true)
-        evt.char == '1' && (m.active_tab = 1)
-        evt.char == '2' && (m.active_tab = 2)
-        evt.char == '3' && (m.active_tab = 3)
-        evt.char == '4' && (m.active_tab = 4)
-        evt.char == '5' && (m.active_tab = 5)
-        # Theme cycling
-        evt.char == 'k' && set_theme!(KOKAKU)
-        evt.char == 'e' && set_theme!(ESPER)
-        evt.char == 'm' && set_theme!(MOTOKO)
-        evt.char == 'n' && set_theme!(NEUROMANCER)
-        # Config tab actions
-        if m.active_tab == 4
+        evt.char == 'q' && (m.shutting_down = true; return)
+        evt.char == '1' && _switch_tab!(m, 1)
+        evt.char == '2' && _switch_tab!(m, 2)
+        evt.char == '3' && _switch_tab!(m, 3)
+        evt.char == '4' && _switch_tab!(m, 4)
+        evt.char == '5' && _switch_tab!(m, 5)
+        # Config tab actions (tab 5)
+        if m.active_tab == 5
             evt.char == 'a' && begin_onboarding!(m)
             evt.char == 'c' && begin_client_config!(m)
         end
     elseif evt.key == :tab
-        m.active_tab = mod1(m.active_tab + 1, 5)
+        _switch_tab!(m, mod1(m.active_tab + 1, 5))
     elseif evt.key == :up
-        if m.active_tab == 1
+        if m.active_tab == 2
             m.selected_connection = max(1, m.selected_connection - 1)
-        elseif m.active_tab == 2
+        elseif m.active_tab == 3
             m.selected_agent = max(1, m.selected_agent - 1)
+        elseif m.active_tab == 4 && !isempty(m.tool_results)
+            # List is newest-first; up = toward newer = increase selected_result
+            m.selected_result = min(length(m.tool_results), m.selected_result + 1)
+            m.result_scroll = 0
         end
     elseif evt.key == :down
-        if m.active_tab == 1 && m.conn_mgr !== nothing
+        if m.active_tab == 2 && m.conn_mgr !== nothing
             n = length(m.conn_mgr.connections)
             m.selected_connection = min(max(1, n), m.selected_connection + 1)
-        elseif m.active_tab == 2
+        elseif m.active_tab == 3
             m.selected_agent = min(max(1, length(m.agents)), m.selected_agent + 1)
+        elseif m.active_tab == 4 && !isempty(m.tool_results)
+            # List is newest-first; down = toward older = decrease selected_result
+            m.selected_result = max(1, m.selected_result - 1)
+            m.result_scroll = 0
+        end
+    elseif evt.key == :pageup
+        if m.active_tab == 4
+            m.result_scroll = max(0, m.result_scroll - 5)
+        end
+    elseif evt.key == :pagedown
+        if m.active_tab == 4
+            m.result_scroll += 5
         end
     end
-    evt.key == :escape && (m.quit = true)
+    evt.key == :escape && (m.shutting_down = true)
+end
+
+# ── Tab switching ────────────────────────────────────────────────────────────
+
+function _switch_tab!(m::MCPReplModel, tab::Int)
+    m.active_tab = tab
+    # Trigger async client detection when entering the Config tab
+    if tab == 5
+        _refresh_client_status_async!(m)
+    end
 end
 
 # ── Config Flow: Begin ───────────────────────────────────────────────────────
@@ -486,16 +625,21 @@ function _install_claude(m::MCPReplModel, port::Int, scope::Symbol)
     if scope == :project
         path = expanduser(m.client_path)
         isdir(path) || mkpath(path)
-        # Use claude CLI to add MCP server
-        cmd = `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope project`
+        # Use claude CLI to add MCP server (stderr → devnull to avoid TUI corruption)
+        cmd = pipeline(
+            `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope project`;
+            stderr = devnull,
+        )
         cd(path) do
             read(cmd, String)
         end
         m.flow_message = "Added julia-repl to Claude (project)\nin $(_short_path(path))"
         m.flow_success = true
     else
-        # Use claude CLI to add MCP server at user scope
-        cmd = `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope user`
+        cmd = pipeline(
+            `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope user`;
+            stderr = devnull,
+        )
         read(cmd, String)
         m.flow_message = "Added julia-repl to Claude (user scope)"
         m.flow_success = true
@@ -725,15 +869,73 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     m.tick += 1
     buf = f.buffer
 
+    # Shutdown overlay — render one frame showing the message, then quit
+    if m.shutting_down
+        _dim_area!(buf, f.area)
+        w = 36
+        h = 5
+        rect = center(f.area, w, h)
+        block = Block(
+            title = " Shutting Down ",
+            border_style = tstyle(:warning, bold = true),
+            title_style = tstyle(:warning, bold = true),
+            box = BOX_HEAVY,
+        )
+        inner = render(block, rect, buf)
+        if inner.width >= 4
+            for row = inner.y:bottom(inner)
+                for col = inner.x:right(inner)
+                    set_char!(buf, col, row, ' ', Style())
+                end
+            end
+            si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+            set_string!(
+                buf,
+                inner.x + 2,
+                inner.y + 1,
+                "$(SPINNER_BRAILLE[si]) Stopping server...",
+                tstyle(:warning),
+            )
+        end
+        m.quit = true
+        return
+    end
+
     # Drain captured log messages into the model each frame
     _drain_log_buffer!(m.server_log)
+
+    # Drain activity events (tool calls from MCPServer hook)
+    _drain_activity_buffer!(m.activity_feed)
+
+    # Drain tool call results for Activity tab inspection
+    _drain_tool_results!(m.tool_results)
+
+    # Drain streaming REPL output from bridge SUB sockets
+    if m.conn_mgr !== nothing
+        for msg in drain_stream_messages!(m.conn_mgr)
+            kind = msg.channel == "stderr" ? :stderr : :stdout
+            push!(
+                m.activity_feed,
+                ActivityEvent(now(), kind, "", msg.session_name, msg.data, true),
+            )
+        end
+        while length(m.activity_feed) > 2000
+            popfirst!(m.activity_feed)
+        end
+    end
+
+    # Reap stale MCP agent sessions every ~30s (450 ticks at 15fps).
+    # Sessions with no activity for 5 minutes are closed and removed.
+    if m.tick % 450 == 0
+        _reap_stale_sessions!(300.0)  # 5 min threshold
+    end
 
     # Deferred server start — kick off on first frame so the TUI is already
     # rendering and can report startup status in the Server tab.
     if !m.server_started
         m.server_started = true
         _push_log!(:info, "Starting MCP server on port $(m.server_port)...")
-        @async try
+        Threads.@spawn try
             security_config = load_global_security_config()
             tools = collect_tools()
             m.mcp_server = start_mcp_server(
@@ -741,9 +943,12 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                 m.server_port;
                 verbose = false,
                 security_config = security_config,
+                dashboard = false,
             )
             m.server_running = true
             _push_log!(:info, "MCP server listening on port $(m.server_port)")
+            # Re-hide cursor in case HTTP.jl or a dependency showed it
+            print(stdout, "\e[?25l")
         catch e
             m.server_running = false
             _push_log!(:error, "Server failed: $(sprint(showerror, e))")
@@ -772,7 +977,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     # ── Tab bar ──
     render(
         TabBar(
-            ["Sessions", "Agents", "Activity", "Config", "Server"];
+            ["Server", "Sessions", "Agents", "Activity", "Config"];
             active = m.active_tab,
         ),
         tab_area,
@@ -781,21 +986,23 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
 
     # ── Content by tab ──
     if m.active_tab == 1
-        view_sessions(m, content_area, buf)
-    elseif m.active_tab == 2
-        view_agents(m, content_area, buf)
-    elseif m.active_tab == 3
-        view_activity(m, content_area, buf)
-    elseif m.active_tab == 4
-        view_config(m, content_area, buf)
-    else
         view_server(m, content_area, buf)
+    elseif m.active_tab == 2
+        view_sessions(m, content_area, buf)
+    elseif m.active_tab == 3
+        view_agents(m, content_area, buf)
+    elseif m.active_tab == 4
+        view_activity(m, content_area, buf)
+    else
+        view_config(m, content_area, buf)
     end
 
     # ── Status bar ──
     n_conns = m.conn_mgr !== nothing ? length(connected_sessions(m.conn_mgr)) : 0
     n_total = m.conn_mgr !== nothing ? length(m.conn_mgr.connections) : 0
-    n_agents = length(m.agents)
+    n_agents = lock(STANDALONE_SESSIONS_LOCK) do
+        count(s -> s.state == Session.INITIALIZED, values(STANDALONE_SESSIONS))
+    end
     uptime = format_uptime(time() - m.start_time)
 
     si = mod1(m.tick ÷ 3, length(SPINNER_BRAILLE))
@@ -895,7 +1102,7 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             ("Path", _short_path(conn.project_path)),
             ("Julia", conn.julia_version),
             ("PID", string(conn.pid)),
-            ("Uptime", _time_ago(conn.connected_at)),
+            ("Uptime", _time_ago(conn.last_seen)),
             ("Tool calls", string(conn.tool_call_count)),
             ("Session", conn.session_id[1:min(8, length(conn.session_id))] * "..."),
         ]
@@ -939,7 +1146,14 @@ end
 # ── Agents Tab ────────────────────────────────────────────────────────────────
 
 function view_agents(m::MCPReplModel, area::Rect, buf::Buffer)
-    if isempty(m.agents)
+    # Pull live MCP sessions from the server's session registry
+    sessions = lock(STANDALONE_SESSIONS_LOCK) do
+        collect(values(STANDALONE_SESSIONS))
+    end
+    # Only show initialized (active) sessions
+    filter!(s -> s.state == Session.INITIALIZED, sessions)
+
+    if isempty(sessions)
         block = Block(
             title = " Agent Sessions ",
             border_style = tstyle(:border),
@@ -959,18 +1173,19 @@ function view_agents(m::MCPReplModel, area::Rect, buf::Buffer)
         return
     end
 
-    # Agent table
-    header = ["CLIENT", "PROTOCOL", "CONNECTED", "CALLS", "REPL"]
+    # Agent table from live session data
+    header = ["CLIENT", "PROTOCOL", "SESSION", "CONNECTED", "LAST ACTIVE"]
     rows = Vector{String}[]
-    for a in m.agents
+    for s in sessions
+        client_name = get(s.client_info, "name", "unknown")
         push!(
             rows,
             [
-                a.client_name,
-                a.protocol_version,
-                _time_ago(a.connected_at),
-                string(a.tool_calls),
-                a.bound_repl,
+                string(client_name),
+                s.protocol_version,
+                s.id[1:min(8, length(s.id))] * "…",
+                _time_ago(s.created_at),
+                _time_ago(s.last_activity),
             ],
         )
     end
@@ -980,7 +1195,7 @@ function view_agents(m::MCPReplModel, area::Rect, buf::Buffer)
             header,
             rows;
             block = Block(
-                title = " Agent Sessions ($(length(m.agents))) ",
+                title = " Agent Sessions ($(length(sessions))) ",
                 border_style = tstyle(:border),
                 title_style = tstyle(:text_dim),
             ),
@@ -994,61 +1209,141 @@ end
 # ── Activity Tab ──────────────────────────────────────────────────────────────
 
 function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
-    rows = tsplit(Layout(Vertical, [Fixed(5), Fill()]), area)
-    length(rows) < 2 && return
+    panes = split_layout(m.activity_layout, area)
+    length(panes) < 2 && return
 
-    # Top: tool call rate sparkline
-    spark_block = Block(
-        title = " Tool Call Rate ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
-    )
-    spark_inner = render(spark_block, rows[1], buf)
-    if spark_inner.width >= 4 && spark_inner.height >= 1
-        render(Sparkline(m.tool_call_history; style = tstyle(:accent)), spark_inner, buf)
+    # ── Top pane: tool call list (newest first) ──
+    n = length(m.tool_results)
+
+    # Auto-select newest entry when results arrive and nothing selected
+    if n > 0 && m.selected_result == 0
+        m.selected_result = n
     end
 
-    # Bottom: recent tool calls log
-    if isempty(m.recent_tool_calls)
-        log_block = Block(
-            title = " Recent Activity ",
-            border_style = tstyle(:border),
-            title_style = tstyle(:text_dim),
-        )
-        inner = render(log_block, rows[2], buf)
-        set_string!(buf, inner.x + 2, inner.y + 1, "No tool calls yet", tstyle(:text_dim))
-        return
+    items = ListItem[]
+    for i = n:-1:1
+        r = m.tool_results[i]
+        ts = Dates.format(r.timestamp, "HH:MM:SS")
+        marker = r.success ? "✓" : "✗"
+        style = r.success ? tstyle(:success) : tstyle(:error)
+        label = "$ts $marker $(r.tool_name) ($(r.duration_str))"
+        push!(items, ListItem(label, style))
     end
 
-    header = ["TIME", "TOOL", "SESSION", "AGENT", "MS", "OK"]
-    log_rows = Vector{String}[]
-    for tc in reverse(m.recent_tool_calls[max(1, end - 50):end])
-        push!(
-            log_rows,
-            [
-                Dates.format(tc.timestamp, "HH:MM:SS"),
-                tc.tool_name,
-                tc.session_name,
-                tc.agent_id[1:min(8, length(tc.agent_id))],
-                string(tc.duration_ms),
-                tc.success ? "✓" : "✗",
-            ],
-        )
+    if isempty(items)
+        push!(items, ListItem("  No tool calls yet", tstyle(:text_dim)))
     end
+
+    # Map selected_result (1-based into tool_results) to display index (reversed)
+    display_sel = n > 0 ? (n - m.selected_result + 1) : 0
 
     render(
-        Table(
-            header,
-            log_rows;
+        SelectableList(
+            items;
+            selected = display_sel,
             block = Block(
-                title = " Recent Activity ($(length(m.recent_tool_calls)) total) ",
+                title = " Tool Calls ($n) ",
                 border_style = tstyle(:border),
                 title_style = tstyle(:text_dim),
             ),
+            highlight_style = tstyle(:accent, bold = true),
         ),
-        rows[2],
+        panes[1],
         buf,
     )
+
+    # ── Bottom pane: detail panel ──
+    if n == 0 || m.selected_result < 1 || m.selected_result > n
+        empty_block = Block(
+            title = " Details ",
+            border_style = tstyle(:border),
+            title_style = tstyle(:text_dim),
+        )
+        ei = render(empty_block, panes[2], buf)
+        if ei.width >= 4
+            set_string!(
+                buf,
+                ei.x + 2,
+                ei.y + 1,
+                "Select a tool call to inspect",
+                tstyle(:text_dim),
+            )
+        end
+        render_resize_handles!(buf, m.activity_layout)
+        return
+    end
+
+    r = m.tool_results[m.selected_result]
+    detail_block = Block(
+        title = " $(r.tool_name) ",
+        border_style = tstyle(:border),
+        title_style = tstyle(:accent, bold = true),
+    )
+    di = render(detail_block, panes[2], buf)
+    di.width < 4 && return
+
+    # Build detail lines
+    lines = String[]
+    push!(lines, "Status:   $(r.success ? "✓ Success" : "✗ Failed")")
+    push!(lines, "Duration: $(r.duration_str)")
+    push!(lines, "Time:     $(Dates.format(r.timestamp, "HH:MM:SS"))")
+    # Show session routing info if present
+    if !isempty(r.session_key) && BRIDGE_CONN_MGR[] !== nothing
+        conn = get_connection_by_key(BRIDGE_CONN_MGR[], r.session_key)
+        session_label =
+            conn !== nothing ? "$(conn.name) ($(short_key(conn)))" : r.session_key
+        push!(lines, "Session:  $session_label")
+    end
+    push!(lines, "")
+    push!(lines, "── Arguments ──")
+    # Pretty-print JSON args (one key per line)
+    try
+        args_dict = JSON.parse(r.args_json)
+        for (k, v) in args_dict
+            val_str = if v isa AbstractString
+                repr(v)
+            else
+                JSON.json(v)
+            end
+            push!(lines, "  $k: $val_str")
+        end
+    catch
+        push!(lines, "  $(r.args_json)")
+    end
+    push!(lines, "")
+    push!(lines, "── Result ──")
+    for ln in split(r.result_text, '\n')
+        push!(lines, "  " * string(ln))
+    end
+
+    # Apply scroll and render
+    max_w = di.width - 2
+    visible = bottom(di) - di.y + 1
+    offset = min(m.result_scroll, max(0, length(lines) - visible))
+    m.result_scroll = offset  # clamp
+
+    y = di.y
+    for i = (offset+1):length(lines)
+        y > bottom(di) && break
+        line = lines[i]
+        if length(line) > max_w && max_w > 1
+            line = first(line, max_w - 1) * "…"
+        end
+        style = if startswith(lines[i], "──")
+            tstyle(:text_dim)
+        elseif startswith(lines[i], "Status:") && r.success
+            tstyle(:success)
+        elseif startswith(lines[i], "Status:")
+            tstyle(:error)
+        else
+            tstyle(:text)
+        end
+        set_string!(buf, di.x + 1, y, line, style)
+        y += 1
+    end
+
+    # Render the draggable divider between panes
+    render_resize_handles!(buf, m.activity_layout)
 end
 
 # ── Server Tab ────────────────────────────────────────────────────────────────
@@ -1128,7 +1423,7 @@ function view_server(m::MCPReplModel, area::Rect, buf::Buffer)
     x = log_inner.x + 1
     visible = log_inner.height
     start_idx = max(1, length(m.server_log) - visible + 1)
-    for i = start_idx:length(m.server_log)
+    for i = length(m.server_log):-1:start_idx
         y > bottom(log_inner) && break
         entry = m.server_log[i]
         time_str = Dates.format(entry.timestamp, "HH:MM:SS")
@@ -1168,8 +1463,8 @@ function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
     length(cols) < 2 && return
 
     # ── Left column: Server + Actions ──
-    left_rows = tsplit(Layout(Vertical, [Fixed(8), Fixed(5), Fill()]), cols[1])
-    length(left_rows) < 3 && return
+    left_rows = tsplit(Layout(Vertical, [Fixed(8), Fill()]), cols[1])
+    length(left_rows) < 2 && return
 
     # Server info
     srv_block = Block(
@@ -1200,30 +1495,13 @@ function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
         set_string!(buf, x + 14, y, "~/.cache/mcprepl/sock", tstyle(:text))
     end
 
-    # Theme
-    theme_block = Block(
-        title = " Theme ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
-    )
-    theme_inner = render(theme_block, left_rows[2], buf)
-    if theme_inner.width >= 4
-        set_string!(
-            buf,
-            theme_inner.x + 1,
-            theme_inner.y,
-            "[k]kokaku [e]esper [m]motoko [n]neuro",
-            tstyle(:text_dim),
-        )
-    end
-
     # Actions
     act_block = Block(
         title = " Actions ",
         border_style = tstyle(:accent),
         title_style = tstyle(:accent),
     )
-    act = render(act_block, left_rows[3], buf)
+    act = render(act_block, left_rows[2], buf)
     if act.width >= 4
         y = act.y
         x = act.x + 1
@@ -1243,11 +1521,10 @@ function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
     client_inner = render(client_block, cols[2], buf)
     client_inner.width < 4 && return
 
-    statuses = detect_client_status()
     y = client_inner.y
     x = client_inner.x + 1
 
-    for (label, configured) in statuses
+    for (label, configured) in m.client_statuses
         y > bottom(client_inner) && break
         icon = configured ? "●" : "○"
         icon_style = configured ? tstyle(:success) : tstyle(:text_dim)
@@ -1496,46 +1773,57 @@ end
 
 # ── Client Status Detection ──────────────────────────────────────────────────
 
-function detect_client_status()
-    statuses = Pair{String,Bool}[]
+# Client detection runs async; results land in model.client_statuses.
+const _CLIENT_STATUS_PENDING = Ref{Bool}(false)
 
-    # Claude: use `claude mcp list` to check for julia-repl
-    claude_ok = try
-        output = read(`claude mcp list`, String)
-        occursin("julia-repl", output)
-    catch
-        false
-    end
-    push!(statuses, "Claude" => claude_ok)
-
-    # VS Code: project-specific, can't detect globally
-    push!(statuses, "VS Code" => false)  # always show as unconfigured at TUI level
-
-    # Gemini: check ~/.gemini/settings.json
-    gemini_settings = joinpath(homedir(), ".gemini", "settings.json")
-    gemini_ok = false
-    if isfile(gemini_settings)
+function _refresh_client_status_async!(m::MCPReplModel)
+    _CLIENT_STATUS_PENDING[] && return   # already in flight
+    _CLIENT_STATUS_PENDING[] = true
+    Threads.@spawn begin
         try
-            content = read(gemini_settings, String)
-            gemini_ok = occursin("julia-repl", content)
+            statuses = Pair{String,Bool}[]
+
+            # Claude: use `claude mcp list` to check for julia-repl
+            claude_ok = try
+                output = read(pipeline(`claude mcp list`; stderr = devnull), String)
+                occursin("julia-repl", output)
+            catch
+                false
+            end
+            push!(statuses, "Claude" => claude_ok)
+
+            # VS Code: project-specific, can't detect globally
+            push!(statuses, "VS Code" => false)
+
+            # Gemini: check ~/.gemini/settings.json
+            gemini_settings = joinpath(homedir(), ".gemini", "settings.json")
+            gemini_ok = false
+            if isfile(gemini_settings)
+                try
+                    content = read(gemini_settings, String)
+                    gemini_ok = occursin("julia-repl", content)
+                catch
+                end
+            end
+            push!(statuses, "Gemini" => gemini_ok)
+
+            # KiloCode: check ~/.kilocode/mcp.json
+            kilo_settings = joinpath(homedir(), ".kilocode", "mcp.json")
+            kilo_ok = false
+            if isfile(kilo_settings)
+                try
+                    content = read(kilo_settings, String)
+                    kilo_ok = occursin("julia-repl", content)
+                catch
+                end
+            end
+            push!(statuses, "KiloCode" => kilo_ok)
+
+            m.client_statuses = statuses
         catch
         end
+        _CLIENT_STATUS_PENDING[] = false
     end
-    push!(statuses, "Gemini" => gemini_ok)
-
-    # KiloCode: check ~/.kilocode/mcp.json
-    kilo_settings = joinpath(homedir(), ".kilocode", "mcp.json")
-    kilo_ok = false
-    if isfile(kilo_settings)
-        try
-            content = read(kilo_settings, String)
-            kilo_ok = occursin("julia-repl", content)
-        catch
-        end
-    end
-    push!(statuses, "KiloCode" => kilo_ok)
-
-    statuses
 end
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1620,6 +1908,40 @@ function _time_ago(dt::DateTime)
     end
 end
 
+# ── Session Reaping ───────────────────────────────────────────────────────────
+
+"""Remove MCP agent sessions that have been idle longer than `max_idle_secs`."""
+function _reap_stale_sessions!(max_idle_secs::Float64)
+    cutoff = now() - Dates.Second(round(Int, max_idle_secs))
+    reaped = lock(STANDALONE_SESSIONS_LOCK) do
+        stale = String[]
+        for (sid, sess) in STANDALONE_SESSIONS
+            if sess.last_activity < cutoff
+                push!(stale, sid)
+            end
+        end
+        for sid in stale
+            try
+                close_session!(STANDALONE_SESSIONS[sid])
+            catch
+            end
+            delete!(STANDALONE_SESSIONS, sid)
+        end
+        stale
+    end
+    # Also prune the persistence file so it doesn't grow unbounded
+    if !isempty(reaped)
+        try
+            persisted = load_persisted_sessions()
+            for sid in reaped
+                delete!(persisted, sid)
+            end
+            save_persisted_sessions(persisted)
+        catch
+        end
+    end
+end
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 """
@@ -1635,6 +1957,11 @@ connections in `~/.cache/mcprepl/sock/`.
 - `theme::Symbol=:kokaku`: Tachikoma theme name
 """
 function tui(; port::Int = 2828, theme_name::Symbol = :kokaku)
+    if Threads.nthreads() < 2
+        @warn """MCPRepl TUI running with only 1 thread — UI may be unresponsive.
+                 Start Julia with: julia -t auto
+                 Or set: JULIA_NUM_THREADS=auto"""
+    end
     set_theme!(theme_name)
     model = MCPReplModel(server_port = port)
     app(model; fps = 15)
