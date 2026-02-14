@@ -13,6 +13,75 @@ import Tachikoma:
 # Tachikoma.split (for layouts) is not Base.split, so we alias it.
 const tsplit = Tachikoma.split
 
+# ── Server Log Capture ────────────────────────────────────────────────────────
+# Redirect Julia's logging system into a ring buffer so @info/@warn/@error
+# from the MCP server, HTTP.jl, etc. appear in the Server tab instead of
+# corrupting the TUI's terminal output.
+
+struct ServerLogEntry
+    timestamp::DateTime
+    level::Symbol      # :debug, :info, :warn, :error
+    message::String
+end
+
+const _TUI_LOG_BUFFER = ServerLogEntry[]
+const _TUI_LOG_LOCK = ReentrantLock()
+const _TUI_OLD_LOGGER = Ref{Any}(nothing)
+
+struct TUILogger <: Logging.AbstractLogger end
+
+Logging.min_enabled_level(::TUILogger) = Logging.Info
+Logging.shouldlog(::TUILogger, level, _module, group, id) = true
+Logging.catch_exceptions(::TUILogger) = true
+
+function Logging.handle_message(
+    ::TUILogger,
+    level,
+    message,
+    _module,
+    group,
+    id,
+    filepath,
+    line;
+    kwargs...,
+)
+    lvl = if level >= Logging.Error
+        :error
+    elseif level >= Logging.Warn
+        :warn
+    else
+        :info
+    end
+    msg = string(message)
+    if !isempty(kwargs)
+        parts = String[string(k, "=", repr(v)) for (k, v) in kwargs]
+        msg *= "  " * join(parts, " ")
+    end
+    lock(_TUI_LOG_LOCK) do
+        push!(_TUI_LOG_BUFFER, ServerLogEntry(now(), lvl, msg))
+        while length(_TUI_LOG_BUFFER) > 500
+            popfirst!(_TUI_LOG_BUFFER)
+        end
+    end
+    return nothing
+end
+
+function _drain_log_buffer!(dest::Vector{ServerLogEntry})
+    lock(_TUI_LOG_LOCK) do
+        append!(dest, _TUI_LOG_BUFFER)
+        empty!(_TUI_LOG_BUFFER)
+    end
+    while length(dest) > 500
+        popfirst!(dest)
+    end
+end
+
+function _push_log!(level::Symbol, message::String)
+    lock(_TUI_LOG_LOCK) do
+        push!(_TUI_LOG_BUFFER, ServerLogEntry(now(), level, message))
+    end
+end
+
 # ── Data types ────────────────────────────────────────────────────────────────
 
 struct ToolCallRecord
@@ -55,7 +124,7 @@ end
     quit::Bool = false
     tick::Int = 0
 
-    # Tabs: 1=Sessions, 2=Agents, 3=Activity, 4=Config
+    # Tabs: 1=Sessions, 2=Agents, 3=Activity, 4=Config, 5=Server
     active_tab::Int = 1
 
     # REPL connections (managed by ConnectionManager)
@@ -73,7 +142,9 @@ end
     # Server state
     server_port::Int = 2828
     server_running::Bool = false
-    mcp_server::Any = nothing  # MCPServer reference
+    server_started::Bool = false   # true once we've attempted to start
+    mcp_server::Any = nothing      # MCPServer reference
+    server_log::Vector{ServerLogEntry} = ServerLogEntry[]
 
     # Status
     total_tool_calls::Int = 0
@@ -104,6 +175,11 @@ end
 function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
     set_theme!(KOKAKU)
 
+    # Redirect logging into the TUI ring buffer so @info/@warn from the MCP
+    # server, HTTP.jl, etc. show up in the Server tab instead of on stderr.
+    _TUI_OLD_LOGGER[] = global_logger()
+    global_logger(TUILogger())
+
     # Start connection manager (discovers REPL bridges)
     m.conn_mgr = ConnectionManager()
     start!(m.conn_mgr)
@@ -112,21 +188,8 @@ function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
     BRIDGE_MODE[] = true
     BRIDGE_CONN_MGR[] = m.conn_mgr
 
-    # Start MCP HTTP server
-    try
-        security_config = load_global_security_config()
-        tools = collect_tools()
-        m.mcp_server = start_mcp_server(
-            tools,
-            m.server_port;
-            verbose = false,
-            security_config = security_config,
-        )
-        m.server_running = true
-    catch e
-        m.server_running = false
-        @debug "MCP server failed to start" exception = e
-    end
+    # MCP server is started on the first view() tick so the TUI is already
+    # rendering and can report status in the Server tab.
 
     m.start_time = time()
 end
@@ -150,6 +213,12 @@ function Tachikoma.cleanup!(m::MCPReplModel)
     if m.conn_mgr !== nothing
         stop!(m.conn_mgr)
     end
+
+    # Restore original logger so post-TUI Julia session isn't silenced
+    if _TUI_OLD_LOGGER[] !== nothing
+        global_logger(_TUI_OLD_LOGGER[])
+        _TUI_OLD_LOGGER[] = nothing
+    end
 end
 
 Tachikoma.should_quit(m::MCPReplModel) = m.quit
@@ -170,6 +239,7 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         evt.char == '2' && (m.active_tab = 2)
         evt.char == '3' && (m.active_tab = 3)
         evt.char == '4' && (m.active_tab = 4)
+        evt.char == '5' && (m.active_tab = 5)
         # Theme cycling
         evt.char == 'k' && set_theme!(KOKAKU)
         evt.char == 'e' && set_theme!(ESPER)
@@ -181,7 +251,7 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             evt.char == 'c' && begin_client_config!(m)
         end
     elseif evt.key == :tab
-        m.active_tab = mod1(m.active_tab + 1, 4)
+        m.active_tab = mod1(m.active_tab + 1, 5)
     elseif evt.key == :up
         if m.active_tab == 1
             m.selected_connection = max(1, m.selected_connection - 1)
@@ -655,6 +725,31 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     m.tick += 1
     buf = f.buffer
 
+    # Drain captured log messages into the model each frame
+    _drain_log_buffer!(m.server_log)
+
+    # Deferred server start — kick off on first frame so the TUI is already
+    # rendering and can report startup status in the Server tab.
+    if !m.server_started
+        m.server_started = true
+        _push_log!(:info, "Starting MCP server on port $(m.server_port)...")
+        @async try
+            security_config = load_global_security_config()
+            tools = collect_tools()
+            m.mcp_server = start_mcp_server(
+                tools,
+                m.server_port;
+                verbose = false,
+                security_config = security_config,
+            )
+            m.server_running = true
+            _push_log!(:info, "MCP server listening on port $(m.server_port)")
+        catch e
+            m.server_running = false
+            _push_log!(:error, "Server failed: $(sprint(showerror, e))")
+        end
+    end
+
     # Simulate tool call rate for sparkline
     push!(m.tool_call_history, 0.0)
     length(m.tool_call_history) > 120 && popfirst!(m.tool_call_history)
@@ -676,7 +771,10 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
 
     # ── Tab bar ──
     render(
-        TabBar(["Sessions", "Agents", "Activity", "Config"]; active = m.active_tab),
+        TabBar(
+            ["Sessions", "Agents", "Activity", "Config", "Server"];
+            active = m.active_tab,
+        ),
         tab_area,
         buf,
     )
@@ -688,8 +786,10 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
         view_agents(m, content_area, buf)
     elseif m.active_tab == 3
         view_activity(m, content_area, buf)
-    else
+    elseif m.active_tab == 4
         view_config(m, content_area, buf)
+    else
+        view_server(m, content_area, buf)
     end
 
     # ── Status bar ──
@@ -699,7 +799,13 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     uptime = format_uptime(time() - m.start_time)
 
     si = mod1(m.tick ÷ 3, length(SPINNER_BRAILLE))
-    server_status = m.server_running ? "localhost:$(m.server_port)" : "stopped"
+    server_status = if m.server_running
+        "localhost:$(m.server_port)"
+    elseif !m.server_started
+        "starting…"
+    else
+        "stopped"
+    end
 
     render(
         StatusBar(
@@ -707,7 +813,9 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                 Span(" $(SPINNER_BRAILLE[si]) ", tstyle(:accent)),
                 Span(
                     "Server: $server_status",
-                    tstyle(m.server_running ? :success : :error),
+                    tstyle(
+                        m.server_running ? :success : m.server_started ? :error : :warning,
+                    ),
                 ),
                 Span("  $(DOT) ", tstyle(:border)),
                 Span("$(n_conns)/$(n_total) sessions", tstyle(:primary)),
@@ -941,6 +1049,109 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
         rows[2],
         buf,
     )
+end
+
+# ── Server Tab ────────────────────────────────────────────────────────────────
+
+function view_server(m::MCPReplModel, area::Rect, buf::Buffer)
+    rows = tsplit(Layout(Vertical, [Fixed(9), Fill()]), area)
+    length(rows) < 2 && return
+
+    # ── Top: Server status panel ──
+    status_block = Block(
+        title = " Server Status ",
+        border_style = tstyle(:border),
+        title_style = tstyle(:text_dim),
+    )
+    si = render(status_block, rows[1], buf)
+    if si.width >= 4
+        y = si.y
+        x = si.x + 1
+
+        status_icon = if m.server_running
+            "●"
+        elseif m.server_started
+            "○"
+        else
+            "◌"
+        end
+        status_text = if m.server_running
+            "running"
+        elseif m.server_started
+            "stopped"
+        else
+            "starting…"
+        end
+        status_style = m.server_running ? tstyle(:success) : tstyle(:error)
+
+        set_string!(buf, x, y, "$status_icon ", status_style)
+        set_string!(buf, x + 2, y, "MCP Server", tstyle(:text))
+        y += 1
+        set_string!(buf, x, y, rpad("Port", 14), tstyle(:text_dim))
+        set_string!(buf, x + 14, y, string(m.server_port), tstyle(:text))
+        y += 1
+        set_string!(buf, x, y, rpad("Status", 14), tstyle(:text_dim))
+        set_string!(buf, x + 14, y, status_text, status_style)
+        y += 1
+        n_conns = m.conn_mgr !== nothing ? length(connected_sessions(m.conn_mgr)) : 0
+        set_string!(buf, x, y, rpad("Bridge", 14), tstyle(:text_dim))
+        set_string!(buf, x + 14, y, "$n_conns REPL sessions", tstyle(:text))
+        y += 1
+        set_string!(buf, x, y, rpad("Uptime", 14), tstyle(:text_dim))
+        set_string!(buf, x + 14, y, format_uptime(time() - m.start_time), tstyle(:text))
+        y += 1
+        set_string!(buf, x, y, rpad("Tool Calls", 14), tstyle(:text_dim))
+        set_string!(buf, x + 14, y, string(m.total_tool_calls), tstyle(:text))
+    end
+
+    # ── Bottom: Server log ──
+    log_block = Block(
+        title = " Server Log ($(length(m.server_log))) ",
+        border_style = tstyle(:border),
+        title_style = tstyle(:text_dim),
+    )
+    log_inner = render(log_block, rows[2], buf)
+    log_inner.width < 4 && return
+
+    if isempty(m.server_log)
+        set_string!(
+            buf,
+            log_inner.x + 1,
+            log_inner.y,
+            "No log entries yet",
+            tstyle(:text_dim),
+        )
+        return
+    end
+
+    y = log_inner.y
+    x = log_inner.x + 1
+    visible = log_inner.height
+    start_idx = max(1, length(m.server_log) - visible + 1)
+    for i = start_idx:length(m.server_log)
+        y > bottom(log_inner) && break
+        entry = m.server_log[i]
+        time_str = Dates.format(entry.timestamp, "HH:MM:SS")
+        level_str = rpad(string(entry.level), 5)
+        level_style = if entry.level == :error
+            tstyle(:error)
+        elseif entry.level == :warn
+            tstyle(:warning)
+        else
+            tstyle(:text_dim)
+        end
+
+        set_string!(buf, x, y, time_str, tstyle(:text_dim))
+        set_string!(buf, x + 9, y, level_str, level_style)
+        # Truncate message to fit available width
+        max_msg = log_inner.width - 16
+        msg = entry.message
+        if length(msg) > max_msg
+            msg = first(msg, max_msg - 1) * "…"
+        end
+        set_string!(buf, x + 15, y, msg, tstyle(:text))
+        y += 1
+    end
 end
 
 # ── Config Tab ────────────────────────────────────────────────────────────────
