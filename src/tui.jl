@@ -544,7 +544,7 @@ end
 
 function execute_onboarding!(m::MCPReplModel)
     try
-        path = expanduser(m.onboard_path)
+        path = rstrip(expanduser(m.onboard_path), ['/', '\\'])
         if m.onboard_scope == :project
             # Write .julia-startup.jl in the project directory
             isdir(path) || mkpath(path)
@@ -1045,8 +1045,14 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
     cols = tsplit(Layout(Horizontal, [Percent(45), Fill()]), area)
     length(cols) < 2 && return
 
-    # Left: connection list
-    connections = m.conn_mgr !== nothing ? m.conn_mgr.connections : REPLConnection[]
+    # Left: connection list (snapshot under lock to avoid races with health checker)
+    connections = if m.conn_mgr !== nothing
+        lock(m.conn_mgr.lock) do
+            copy(m.conn_mgr.connections)
+        end
+    else
+        REPLConnection[]
+    end
 
     items = ListItem[]
     for conn in connections
@@ -1783,12 +1789,24 @@ function _refresh_client_status_async!(m::MCPReplModel)
         try
             statuses = Pair{String,Bool}[]
 
-            # Claude: use `claude mcp list` to check for julia-repl
-            claude_ok = try
-                output = read(pipeline(`claude mcp list`; stderr = devnull), String)
-                occursin("julia-repl", output)
-            catch
-                false
+            # Claude: check config files directly (don't shell out to `claude`
+            # which would connect to our MCP server and create spurious sessions)
+            claude_ok = false
+            for cfg_path in (
+                joinpath(homedir(), ".claude", "settings.json"),
+                joinpath(pwd(), ".mcp.json"),
+                joinpath(pwd(), ".claude", "settings.local.json"),
+            )
+                if isfile(cfg_path)
+                    try
+                        content = read(cfg_path, String)
+                        if occursin("julia-repl", content)
+                            claude_ok = true
+                            break
+                        end
+                    catch
+                    end
+                end
             end
             push!(statuses, "Claude" => claude_ok)
 
@@ -1866,7 +1884,7 @@ function _complete_path!(input::TextInput)
         if startswith(Tachikoma.text(input), "~")
             completed = replace(completed, homedir() => "~"; count = 1)
         end
-        set_text!(input, completed)
+        Tachikoma.set_text!(input, completed)
     elseif length(entries) > 1
         # Complete common prefix
         common = entries[1]
@@ -1883,7 +1901,7 @@ function _complete_path!(input::TextInput)
             if startswith(Tachikoma.text(input), "~")
                 completed = replace(completed, homedir() => "~"; count = 1)
             end
-            set_text!(input, completed)
+            Tachikoma.set_text!(input, completed)
         end
     end
 end

@@ -85,10 +85,105 @@ function ConnectionManager(;
     )
 end
 
+# ── PID & Stale Session Helpers ──────────────────────────────────────────────
+
+"""
+    _is_pid_alive(pid::Int) -> Bool
+
+Cross-platform check whether a process with the given PID exists.
+Uses signal 0 (no actual signal sent) via libuv.
+"""
+function _is_pid_alive(pid::Int)
+    pid > 0 || return false
+    ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == 0
+end
+
+"""
+    _remove_session_files(sock_dir, session_id)
+
+Delete .json, .sock, and -stream.sock files for a session.
+"""
+function _remove_session_files(sock_dir::String, session_id::String)
+    for suffix in (".json", ".sock", "-stream.sock")
+        f = joinpath(sock_dir, session_id * suffix)
+        isfile(f) && try
+            rm(f)
+        catch
+        end
+    end
+end
+
+const _cleanup_done = Ref(false)
+const _orphan_contexts = ZMQ.Context[]
+
+"""
+    cleanup_stale_sessions!(sock_dir)
+
+Scan the sock directory and remove files belonging to dead PIDs.
+Also removes orphan `.sock` files with no corresponding `.json`.
+"""
+function cleanup_stale_sessions!(sock_dir::String)
+    isdir(sock_dir) || return
+
+    # Collect known session IDs from .json files
+    json_sessions = Set{String}()
+
+    for f in readdir(sock_dir)
+        endswith(f, ".json") || continue
+        session_id = replace(f, ".json" => "")
+        push!(json_sessions, session_id)
+
+        meta = try
+            JSON.parsefile(joinpath(sock_dir, f))
+        catch
+            # Corrupt/unreadable JSON — remove it
+            _remove_session_files(sock_dir, session_id)
+            continue
+        end
+
+        pid = try
+            parse(Int, string(get(meta, "pid", "0")))
+        catch
+            0
+        end
+
+        if !_is_pid_alive(pid)
+            @debug "Cleaning stale session" session_id pid
+            _remove_session_files(sock_dir, session_id)
+            delete!(json_sessions, session_id)
+        end
+    end
+
+    # Sweep orphan .sock files with no corresponding .json
+    for f in readdir(sock_dir)
+        endswith(f, ".sock") || continue
+        # Derive session_id: strip both "-stream.sock" and ".sock"
+        session_id = if endswith(f, "-stream.sock")
+            replace(f, "-stream.sock" => "")
+        else
+            replace(f, ".sock" => "")
+        end
+        if session_id ∉ json_sessions
+            @debug "Removing orphan socket" f
+            try
+                rm(joinpath(sock_dir, f))
+            catch
+            end
+        end
+    end
+end
+
 # ── Socket Discovery ─────────────────────────────────────────────────────────
 
 function discover_sessions(mgr::ConnectionManager)
     isdir(mgr.sock_dir) || return REPLConnection[]
+
+    # One-time cleanup of stale sessions from previous crashes
+    if !_cleanup_done[]
+        _cleanup_done[] = true
+        cleanup_stale_sessions!(mgr.sock_dir)
+    end
+
     new_connections = REPLConnection[]
 
     known_ids = lock(mgr.lock) do
@@ -108,6 +203,18 @@ function discover_sessions(mgr::ConnectionManager)
             continue
         end
 
+        pid = try
+            parse(Int, string(get(meta, "pid", "0")))
+        catch
+            0
+        end
+
+        # Skip and clean up sessions whose PID is no longer alive
+        if !_is_pid_alive(pid)
+            _remove_session_files(mgr.sock_dir, session_id)
+            continue
+        end
+
         conn = REPLConnection(
             session_id = session_id,
             name = get(meta, "name", "julia"),
@@ -120,7 +227,7 @@ function discover_sessions(mgr::ConnectionManager)
             stream_endpoint = get(meta, "stream_endpoint", ""),
             project_path = get(meta, "project_path", ""),
             julia_version = get(meta, "julia_version", ""),
-            pid = parse(Int, get(meta, "pid", "0")),
+            pid = pid,
         )
         push!(new_connections, conn)
     end
@@ -134,6 +241,7 @@ function connect!(mgr::ConnectionManager, conn::REPLConnection)
         socket = Socket(mgr.zmq_context, REQ)
         socket.rcvtimeo = 5000   # 5s timeout for responses
         socket.sndtimeo = 2000   # 2s timeout for sends
+        socket.linger = 0        # don't block on close
         connect(socket, conn.endpoint)
         conn.req_socket = socket
 
@@ -142,6 +250,7 @@ function connect!(mgr::ConnectionManager, conn::REPLConnection)
             try
                 sub = Socket(mgr.zmq_context, SUB)
                 sub.rcvtimeo = 0  # non-blocking recv
+                sub.linger = 0    # don't block on close
                 subscribe(sub, "")  # receive all messages
                 connect(sub, conn.stream_endpoint)
                 conn.sub_socket = sub
@@ -187,14 +296,17 @@ never send again. The only fix is to close and reconnect.
 function _reconnect_req!(conn::REPLConnection)
     old = conn.req_socket
     try
+        old.linger = 0
         close(old)
     catch
     end
     try
         ctx = Context()
+        push!(_orphan_contexts, ctx)
         socket = Socket(ctx, REQ)
         socket.rcvtimeo = 5000
         socket.sndtimeo = 2000
+        socket.linger = 0
         connect(socket, conn.endpoint)
         conn.req_socket = socket
     catch
@@ -339,36 +451,48 @@ function start!(mgr::ConnectionManager)
         end
     end
 
-    # Health checker — pings connected sessions, removes stale ones
+    # Health checker — pings connected sessions, removes stale ones.
+    # IMPORTANT: We snapshot connections under the lock, then ping WITHOUT
+    # holding the lock so we don't block the TUI render loop or stream drain.
     mgr.health_task = Threads.@spawn begin
         while mgr.running
             try
-                lock(mgr.lock) do
-                    to_remove = Int[]
-                    for (i, conn) in enumerate(mgr.connections)
-                        if conn.status == :connected
-                            result = ping(conn)
-                            if result === nothing
-                                @debug "Bridge unresponsive, disconnecting" name = conn.name
-                                disconnect!(conn)
-                                # Check if socket file still exists
-                                if !isfile(conn.socket_path)
-                                    push!(to_remove, i)
-                                end
-                            end
-                        elseif conn.status == :disconnected
-                            # Try reconnect if socket file exists
-                            if isfile(conn.socket_path)
-                                connect!(mgr, conn)
-                            else
-                                push!(to_remove, i)
+                # Snapshot current connections (cheap copy of references)
+                conns = lock(mgr.lock) do
+                    copy(mgr.connections)
+                end
+
+                to_remove = REPLConnection[]
+                for conn in conns
+                    if conn.status == :connected
+                        result = ping(conn)
+                        if result === nothing
+                            @debug "Bridge unresponsive, disconnecting" name = conn.name
+                            disconnect!(conn)
+                            if !isfile(conn.socket_path)
+                                push!(to_remove, conn)
                             end
                         end
+                    elseif conn.status == :disconnected
+                        if isfile(conn.socket_path)
+                            connect!(mgr, conn)
+                        else
+                            push!(to_remove, conn)
+                        end
                     end
-                    # Remove dead sessions (reverse order to preserve indices)
-                    for i in reverse(to_remove)
-                        disconnect!(mgr.connections[i])
-                        deleteat!(mgr.connections, i)
+                end
+
+                # Remove dead sessions under the lock
+                if !isempty(to_remove)
+                    lock(mgr.lock) do
+                        for conn in to_remove
+                            idx = findfirst(c -> c === conn, mgr.connections)
+                            if idx !== nothing
+                                disconnect!(conn)
+                                _remove_session_files(mgr.sock_dir, conn.session_id)
+                                deleteat!(mgr.connections, idx)
+                            end
+                        end
                     end
                 end
             catch e
@@ -384,15 +508,28 @@ end
 function stop!(mgr::ConnectionManager)
     mgr.running = false
 
-    # Disconnect all sockets immediately
+    # Disconnect all sockets immediately (linger=0 ensures close doesn't block)
     lock(mgr.lock) do
         for conn in mgr.connections
             disconnect!(conn)
         end
     end
 
-    # Clean up tasks and ZMQ context in the background so we don't block
-    # terminal restoration (health_task sleeps 5s between checks).
+    # Close the main ZMQ context and any orphans from _reconnect_req!.
+    # All sockets have linger=0 so this should return promptly.
+    try
+        close(mgr.zmq_context)
+    catch
+    end
+    for ctx in _orphan_contexts
+        try
+            close(ctx)
+        catch
+        end
+    end
+    empty!(_orphan_contexts)
+
+    # Let background tasks finish (they'll exit on next loop since running=false)
     Threads.@spawn begin
         for task in [mgr.watcher_task, mgr.health_task]
             if task !== nothing && !istaskdone(task)
@@ -401,10 +538,6 @@ function stop!(mgr::ConnectionManager)
                 catch
                 end
             end
-        end
-        try
-            close(mgr.zmq_context)
-        catch
         end
     end
 end
