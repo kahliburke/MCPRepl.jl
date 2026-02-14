@@ -16,6 +16,9 @@ using Pkg
 using Sockets
 using TOML
 using LoggingExtras
+using Serialization
+using ZMQ
+using Tachikoma
 
 export @mcp_tool, MCPTool
 export start!, stop!, test_server
@@ -27,6 +30,9 @@ include("proxy.jl")
 include("qdrant_client.jl")
 include("tools.jl")
 include("Generate.jl")
+include("bridge.jl")
+include("bridge_client.jl")
+include("tui.jl")
 
 # Export public API functions
 export start!, stop!, setup, test_server, reset
@@ -35,7 +41,9 @@ export allow_ip, deny_ip, set_security_mode, quick_setup, gentle_setup
 export call_tool, list_tools, tool_help
 export start_proxy, stop_proxy  # Proxy server functions
 export register_tool!, registry  # Project hook API
+export tui  # TUI server entry point
 export Proxy  # Proxy server module
+export MCPReplBridge  # Eval bridge module
 # export Generate  # Project template generator module
 # export Dashboard
 # export Database
@@ -927,6 +935,90 @@ end
 
 SERVER = Ref{Union{Nothing,MCPServer}}(nothing)
 ALL_TOOLS = Ref{Union{Nothing,Vector{MCPTool}}}(nothing)
+
+# ── Bridge mode globals ──────────────────────────────────────────────────────
+# When running in TUI server mode, tool calls route through the bridge client
+# instead of executing in-process.
+
+const BRIDGE_MODE = Ref{Bool}(false)
+const BRIDGE_CONN_MGR = Ref{Union{Nothing,ConnectionManager}}(nothing)
+
+"""
+    execute_via_bridge(code; quiet=true, max_output=6000)
+
+Execute code on a remote REPL via the bridge client. Used when BRIDGE_MODE is
+active (TUI server process). Falls back to in-process eval if no bridge is
+connected.
+"""
+function execute_via_bridge(
+    code::String;
+    quiet::Bool = true,
+    silent::Bool = false,
+    max_output::Int = 6000,
+)
+    mgr = BRIDGE_CONN_MGR[]
+    if mgr === nothing
+        return "ERROR: Bridge mode active but no ConnectionManager configured"
+    end
+
+    conn = get_default_connection(mgr)
+    if conn === nothing
+        return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+    end
+
+    # Apply println stripping (stays server-side)
+    was_stripped = Ref(false)
+    expr = Base.parse_input_line(code)
+    expr = remove_println_calls(expr, true, quiet, was_stripped)
+    # Re-serialize the cleaned expression back to code string
+    cleaned_code = if expr === nothing
+        ""  # Entire expression was stripped
+    else
+        # Use the original code if expr is unchanged, otherwise sprint the expr
+        string(expr)
+    end
+
+    # Auto-append semicolon in quiet mode
+    show_return_value = !quiet && !REPL.ends_with_semicolon(code)
+    if quiet && !REPL.ends_with_semicolon(cleaned_code)
+        cleaned_code = cleaned_code * ";"
+    end
+
+    response = eval_remote(conn, cleaned_code)
+
+    # Format response matching execute_repllike output format
+    captured = ""
+    if hasproperty(response, :stdout) && hasproperty(response, :stderr)
+        captured = string(response.stdout) * string(response.stderr)
+    end
+
+    result_str = ""
+    if hasproperty(response, :exception) && response.exception !== nothing
+        result_str = "ERROR: " * string(response.exception)
+    elseif show_return_value && hasproperty(response, :value_repr)
+        result_str = string(response.value_repr)
+    end
+
+    has_error = hasproperty(response, :exception) && response.exception !== nothing
+    result = if quiet && !has_error
+        ""
+    else
+        captured * result_str
+    end
+
+    # Stripping reminder
+    if was_stripped[]
+        result *= "\n\n⚠️  Note: println/print/logging calls were removed. Use q=false with a final expression to see values."
+    end
+
+    # Truncation
+    if length(result) > max_output
+        result = truncate_output(result, max_output, nothing)
+        result *= "\n\n⚠️  Output truncated ($max_output of $(length(result)) chars shown)."
+    end
+
+    return result
+end
 
 # ============================================================================
 # Tool Configuration Management

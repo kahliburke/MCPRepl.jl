@@ -304,13 +304,24 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 end
             end
 
-            Base.invokelatest(
-                execute_repllike,
-                expr_str;
-                silent = silent,
-                quiet = quiet,
-                max_output = max_output,
-            )
+            # Route through bridge if in TUI server mode
+            if BRIDGE_MODE[]
+                Base.invokelatest(
+                    execute_via_bridge,
+                    expr_str;
+                    quiet = quiet,
+                    silent = silent,
+                    max_output = max_output,
+                )
+            else
+                Base.invokelatest(
+                    execute_repllike,
+                    expr_str;
+                    silent = silent,
+                    quiet = quiet,
+                    max_output = max_output,
+                )
+            end
         catch e
             println("Error during execute_repllike", e)
             "Apparently there was an **internal** error to the MCP server: $e"
