@@ -566,6 +566,17 @@ function execute_repllike(
     show_prompt::Bool = true,
     max_output::Int = 6000,
 )
+    # Route through bridge when running in TUI server mode.
+    # This makes ALL tools that call execute_repllike bridge-aware automatically.
+    if BRIDGE_MODE[] && BRIDGE_CONN_MGR[] !== nothing
+        return execute_via_bridge(
+            str;
+            quiet = quiet,
+            silent = silent,
+            max_output = max_output,
+        )
+    end
+
     lock(EXEC_REPLLIKE_LOCK)
     try
         # Check for Pkg.activate usage
@@ -1101,6 +1112,53 @@ function filter_tools_by_config(enabled_tools::Union{Set{Symbol},Nothing})
     return filter(tool -> tool.id in enabled_tools, ALL_TOOLS[])
 end
 
+"""
+    collect_tools() -> Vector{MCPTool}
+
+Assemble all MCP tools (core, LSP, Qdrant) into a single vector.
+Used by both `start!()` and the TUI to build the tool list for the MCP server.
+"""
+function collect_tools()::Vector{MCPTool}
+    lsp_tools = create_lsp_tools()
+    qdrant_tools = create_qdrant_tools()
+
+    return MCPTool[
+        ping_tool,
+        usage_instructions_tool,
+        usage_quiz_tool,
+        tool_help_tool,
+        repl_tool,
+        manage_repl_tool,
+        vscode_command_tool,
+        list_vscode_commands_tool,
+        investigate_tool,
+        search_methods_tool,
+        macro_expand_tool,
+        type_info_tool,
+        profile_tool,
+        list_names_tool,
+        code_lowered_tool,
+        code_typed_tool,
+        format_tool,
+        lint_tool,
+        navigate_to_file_tool,
+        open_and_breakpoint_tool,
+        start_debug_session_tool,
+        add_watch_expression_tool,
+        copy_debug_value_tool,
+        debug_step_over_tool,
+        debug_step_into_tool,
+        debug_step_out_tool,
+        debug_continue_tool,
+        debug_stop_tool,
+        pkg_add_tool,
+        pkg_rm_tool,
+        run_tests_tool,
+        lsp_tools...,
+        qdrant_tools...,
+    ]
+end
+
 # ============================================================================
 # Project Hook API for Tool Registration
 # ============================================================================
@@ -1493,53 +1551,11 @@ function start!(;
         println()
     end
 
-    # Create LSP tools
-    lsp_tools = create_lsp_tools()
-
-    # Create Qdrant tools
-    qdrant_tools = create_qdrant_tools()
+    all_tools = collect_tools()
+    MCPRepl.ALL_TOOLS[] = all_tools
 
     # Load tools configuration from workspace directory
     enabled_tools = load_tools_config(".mcprepl/tools.json", workspace_dir)
-
-    # Collect all tools (defined in tool_definitions.jl and lsp_tool_definitions.jl)
-    all_tools = [
-        ping_tool,
-        usage_instructions_tool,
-        usage_quiz_tool,
-        tool_help_tool,
-        repl_tool,
-        manage_repl_tool,
-        vscode_command_tool,
-        list_vscode_commands_tool,
-        investigate_tool,
-        search_methods_tool,
-        macro_expand_tool,
-        type_info_tool,
-        profile_tool,
-        list_names_tool,
-        code_lowered_tool,
-        code_typed_tool,
-        format_tool,
-        lint_tool,
-        navigate_to_file_tool,
-        open_and_breakpoint_tool,
-        start_debug_session_tool,
-        add_watch_expression_tool,
-        copy_debug_value_tool,
-        debug_step_over_tool,
-        debug_step_into_tool,
-        debug_step_out_tool,
-        debug_continue_tool,
-        debug_stop_tool,
-        pkg_add_tool,
-        pkg_rm_tool,
-        run_tests_tool,
-        lsp_tools...,  # LSP tools from lsp_tool_definitions.jl
-        qdrant_tools...,  # Qdrant vector database tools
-    ]
-
-    MCPRepl.ALL_TOOLS[] = all_tools
 
     # Filter tools based on configuration
     active_tools = filter_tools_by_config(enabled_tools)

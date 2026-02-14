@@ -104,25 +104,51 @@ end
 function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
     set_theme!(KOKAKU)
 
-    # Start connection manager
+    # Start connection manager (discovers REPL bridges)
     m.conn_mgr = ConnectionManager()
     start!(m.conn_mgr)
+
+    # Enable bridge mode — tool evals route to connected REPLs
+    BRIDGE_MODE[] = true
+    BRIDGE_CONN_MGR[] = m.conn_mgr
+
+    # Start MCP HTTP server
+    try
+        security_config = load_global_security_config()
+        tools = collect_tools()
+        m.mcp_server = start_mcp_server(
+            tools,
+            m.server_port;
+            verbose = false,
+            security_config = security_config,
+        )
+        m.server_running = true
+    catch e
+        m.server_running = false
+        @debug "MCP server failed to start" exception = e
+    end
 
     m.start_time = time()
 end
 
 function Tachikoma.cleanup!(m::MCPReplModel)
-    # Stop connection manager
-    if m.conn_mgr !== nothing
-        stop!(m.conn_mgr)
-    end
+    # Disable bridge mode
+    BRIDGE_MODE[] = false
+    BRIDGE_CONN_MGR[] = nothing
 
-    # Stop MCP server if running
+    # Stop MCP server
     if m.mcp_server !== nothing
         try
             stop_mcp_server(m.mcp_server)
         catch
         end
+        m.mcp_server = nothing
+        m.server_running = false
+    end
+
+    # Stop connection manager
+    if m.conn_mgr !== nothing
+        stop!(m.conn_mgr)
     end
 end
 
@@ -179,13 +205,13 @@ function begin_onboarding!(m::MCPReplModel)
     m.config_flow = FLOW_ONBOARD_PATH
     m.path_input = TextInput(text = string(pwd()), label = "Path: ")
     m.flow_selected = 1
-    m.flow_modal_selected = :cancel
+    m.flow_modal_selected = :confirm
 end
 
 function begin_client_config!(m::MCPReplModel)
     m.config_flow = FLOW_CLIENT_SELECT
     m.flow_selected = 1
-    m.flow_modal_selected = :cancel
+    m.flow_modal_selected = :confirm
 end
 
 # ── Config Flow: Input Handler ───────────────────────────────────────────────
@@ -204,6 +230,8 @@ function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
             m.onboard_path = Tachikoma.text(m.path_input)
             m.flow_selected = 1
             m.config_flow = FLOW_ONBOARD_SCOPE
+        elseif evt.key == :tab
+            _complete_path!(m.path_input)
         else
             handle_key!(m.path_input, evt)
         end
@@ -216,7 +244,7 @@ function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
             m.flow_selected = min(2, m.flow_selected + 1)
         elseif evt.key == :enter
             m.onboard_scope = m.flow_selected == 1 ? :project : :user
-            m.flow_modal_selected = :cancel
+            m.flow_modal_selected = :confirm
             m.config_flow = FLOW_ONBOARD_CONFIRM
         end
 
@@ -267,7 +295,7 @@ function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
                     m.flow_success = false
                     m.config_flow = FLOW_CLIENT_RESULT
                 else
-                    m.flow_modal_selected = :cancel
+                    m.flow_modal_selected = :confirm
                     m.config_flow = FLOW_CLIENT_CONFIRM
                 end
             end
@@ -277,8 +305,10 @@ function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
     elseif flow == FLOW_CLIENT_PATH
         if evt.key == :enter
             m.client_path = Tachikoma.text(m.path_input)
-            m.flow_modal_selected = :cancel
+            m.flow_modal_selected = :confirm
             m.config_flow = FLOW_CLIENT_CONFIRM
+        elseif evt.key == :tab
+            _complete_path!(m.path_input)
         else
             handle_key!(m.path_input, evt)
         end
@@ -312,7 +342,7 @@ function execute_onboarding!(m::MCPReplModel)
             projname = basename(path)
             startup_file = joinpath(path, ".julia-startup.jl")
             content = """
-            # MCPRepl Bridge — auto-connect this project's REPL to the TUI server
+            # MCPRepl Bridge — auto-connect this REPL to the TUI server
             try
                 using MCPRepl
                 MCPReplBridge.serve(name=$(repr(projname)))
@@ -394,21 +424,10 @@ function _install_claude(m::MCPReplModel, port::Int, scope::Symbol)
         m.flow_message = "Added julia-repl to Claude (project)\nin $(_short_path(path))"
         m.flow_success = true
     else
-        # Write to ~/.claude/settings.local.json
-        settings_dir = joinpath(homedir(), ".claude")
-        isdir(settings_dir) || mkpath(settings_dir)
-        settings_file = joinpath(settings_dir, "settings.local.json")
-
-        settings = if isfile(settings_file)
-            _parse_json_simple(read(settings_file, String))
-        else
-            Dict{String,Any}()
-        end
-        servers = get!(settings, "mcpServers", Dict{String,Any}())
-        servers["julia-repl"] =
-            Dict{String,Any}("type" => "http", "url" => "http://localhost:$port/mcp")
-        write(settings_file, _to_json(settings))
-        m.flow_message = "Wrote $(_short_path(settings_file))"
+        # Use claude CLI to add MCP server at user scope
+        cmd = `claude mcp add julia-repl --transport http --url http://localhost:$port/mcp --scope user`
+        read(cmd, String)
+        m.flow_message = "Added julia-repl to Claude (user scope)"
         m.flow_success = true
     end
 end
@@ -768,7 +787,7 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             ("Path", _short_path(conn.project_path)),
             ("Julia", conn.julia_version),
             ("PID", string(conn.pid)),
-            ("Uptime", _time_ago(conn.last_seen)),
+            ("Uptime", _time_ago(conn.connected_at)),
             ("Tool calls", string(conn.tool_call_count)),
             ("Session", conn.session_id[1:min(8, length(conn.session_id))] * "..."),
         ]
@@ -1168,7 +1187,7 @@ function _render_text_input_modal(
     # Clear interior
     for row = inner.y:bottom(inner)
         for col = inner.x:right(inner)
-            set_char!(buf, col, row, ' ', RESET)
+            set_char!(buf, col, row, ' ', Style())
         end
     end
 
@@ -1207,7 +1226,7 @@ function _render_selection_modal(
     # Clear interior
     for row = inner.y:bottom(inner)
         for col = inner.x:right(inner)
-            set_char!(buf, col, row, ' ', RESET)
+            set_char!(buf, col, row, ' ', Style())
         end
     end
 
@@ -1246,7 +1265,7 @@ function _render_result_modal(buf::Buffer, area::Rect, success::Bool, message::S
     # Clear interior
     for row = inner.y:bottom(inner)
         for col = inner.x:right(inner)
-            set_char!(buf, col, row, ' ', RESET)
+            set_char!(buf, col, row, ' ', Style())
         end
     end
 
@@ -1269,15 +1288,12 @@ end
 function detect_client_status()
     statuses = Pair{String,Bool}[]
 
-    # Claude: check for ~/.claude/settings.local.json with julia-repl
-    claude_settings = joinpath(homedir(), ".claude", "settings.local.json")
-    claude_ok = false
-    if isfile(claude_settings)
-        try
-            content = read(claude_settings, String)
-            claude_ok = occursin("julia-repl", content)
-        catch
-        end
+    # Claude: use `claude mcp list` to check for julia-repl
+    claude_ok = try
+        output = read(`claude mcp list`, String)
+        occursin("julia-repl", output)
+    catch
+        false
     end
     push!(statuses, "Claude" => claude_ok)
 
@@ -1323,6 +1339,53 @@ function format_uptime(seconds::Float64)
         h = s ÷ 3600
         m = (s % 3600) ÷ 60
         return "$(h)h $(m)m"
+    end
+end
+
+function _complete_path!(input::TextInput)
+    partial = expanduser(Tachikoma.text(input))
+    isempty(partial) && return
+
+    dir, prefix = if isdir(partial) && endswith(partial, '/')
+        (partial, "")
+    else
+        (dirname(partial), basename(partial))
+    end
+
+    isdir(dir) || return
+    entries = try
+        filter(readdir(dir)) do name
+            startswith(name, prefix) && isdir(joinpath(dir, name))
+        end
+    catch
+        return
+    end
+
+    if length(entries) == 1
+        completed = joinpath(dir, entries[1]) * "/"
+        # Collapse home dir back to ~ if original used it
+        if startswith(Tachikoma.text(input), "~")
+            completed = replace(completed, homedir() => "~"; count = 1)
+        end
+        set_text!(input, completed)
+    elseif length(entries) > 1
+        # Complete common prefix
+        common = entries[1]
+        for e in entries[2:end]
+            i = 0
+            for (a, b) in zip(common, e)
+                a == b || break
+                i += 1
+            end
+            common = common[1:i]
+        end
+        if length(common) > length(prefix)
+            completed = joinpath(dir, common)
+            if startswith(Tachikoma.text(input), "~")
+                completed = replace(completed, homedir() => "~"; count = 1)
+            end
+            set_text!(input, completed)
+        end
     end
 end
 
