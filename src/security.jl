@@ -68,6 +68,98 @@ function get_security_config_path(workspace_dir::String = pwd())
 end
 
 """
+    get_global_security_config_path() -> String
+
+Get the path to the global security configuration file.
+Returns `~/.config/mcprepl/security.json`.
+"""
+function get_global_security_config_path()
+    config_dir = joinpath(homedir(), ".config", "mcprepl")
+    return joinpath(config_dir, "security.json")
+end
+
+"""
+    load_global_security_config() -> Union{SecurityConfig, Nothing}
+
+Load the global security configuration from `~/.config/mcprepl/security.json`.
+"""
+function load_global_security_config()
+    config_path = get_global_security_config_path()
+
+    if !isfile(config_path)
+        return nothing
+    end
+
+    try
+        content = read(config_path, String)
+        data = JSON.parse(content; dicttype = Dict{String,Any})
+
+        mode = Symbol(get(data, "mode", "strict"))
+        api_keys = get(data, "api_keys", String[])
+        allowed_ips = get(data, "allowed_ips", ["127.0.0.1", "::1"])
+        port = get(data, "port", 0)
+        bypass_proxy = get(data, "bypass_proxy", false)
+        index_dirs = Vector{String}(get(data, "index_dirs", String[]))
+        index_extensions =
+            Vector{String}(get(data, "index_extensions", DEFAULT_INDEX_EXTENSIONS))
+        created_at = get(data, "created_at", time())
+
+        return SecurityConfig(
+            mode,
+            api_keys,
+            allowed_ips,
+            port,
+            bypass_proxy,
+            index_dirs,
+            index_extensions,
+            created_at,
+        )
+    catch e
+        @warn "Failed to load global security config" exception = e
+        return nothing
+    end
+end
+
+"""
+    save_global_security_config(config::SecurityConfig) -> Bool
+
+Save security configuration to the global path `~/.config/mcprepl/security.json`.
+"""
+function save_global_security_config(config::SecurityConfig)
+    config_path = get_global_security_config_path()
+    config_dir = dirname(config_path)
+
+    if !isdir(config_dir)
+        mkpath(config_dir)
+    end
+
+    try
+        data = Dict(
+            "mode" => string(config.mode),
+            "api_keys" => config.api_keys,
+            "allowed_ips" => config.allowed_ips,
+            "port" => config.port,
+            "bypass_proxy" => config.bypass_proxy,
+            "index_dirs" => config.index_dirs,
+            "index_extensions" => config.index_extensions,
+            "created_at" => config.created_at,
+        )
+
+        json_str = JSON.json(data, 2)
+        write(config_path, json_str)
+
+        if !Sys.iswindows()
+            chmod(config_path, 0o600)
+        end
+
+        return true
+    catch e
+        @warn "Failed to save global security config" exception = e
+        return false
+    end
+end
+
+"""
     load_security_config(workspace_dir::String=pwd()) -> Union{SecurityConfig, Nothing}
 
 Load security configuration from workspace .mcprepl/security.json file.

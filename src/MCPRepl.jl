@@ -42,6 +42,7 @@ export call_tool, list_tools, tool_help
 export start_proxy, stop_proxy  # Proxy server functions
 export register_tool!, registry  # Project hook API
 export tui  # TUI server entry point
+export setup_wizard_tui  # Animated security setup wizard
 export Proxy  # Proxy server module
 export MCPReplBridge  # Eval bridge module
 # export Generate  # Project template generator module
@@ -190,6 +191,7 @@ end
 
 include("security.jl")
 include("security_wizard.jl")
+include("setup_wizard_tui.jl")
 include("repl_status.jl")
 include("tool_definitions.jl")
 include("MCPServer.jl")
@@ -1395,19 +1397,22 @@ function start!(;
     @debug "Loading security config" workspace_dir = workspace_dir
     security_config = load_security_config(workspace_dir)
 
+    # Fall back to global config
     if security_config === nothing
-        # Stop spinner before showing error
+        security_config = load_global_security_config()
+    end
+
+    if security_config === nothing
+        # Stop spinner before launching wizard
         spinner_active[] = false
         wait(spinner_task)
         global_logger(old_logger)
 
         print("\r\033[K")  # Clear spinner line
-        printstyled("\n⚠️  NO SECURITY CONFIGURATION FOUND\n", color = :red, bold = true)
-        println()
-        println("MCPRepl requires security configuration before starting.")
-        println("Run MCPRepl.setup() to configure API keys and security settings.")
-        println()
-        error("Security configuration required. Run MCPRepl.setup() first.")
+        security_config = setup_wizard_tui()
+        if security_config === nothing
+            error("Security configuration required. Run MCPRepl.setup() first.")
+        end
     else
         @debug "Security config loaded successfully" port = security_config.port mode =
             security_config.mode
@@ -2003,8 +2008,26 @@ end
 
 Launch the security setup wizard.
 """
-function setup_security(; force::Bool = false, gentle::Bool = false)
-    return security_setup_wizard(pwd(); force = force, gentle = gentle)
+function setup_security(; force::Bool = false, mode::Symbol = :auto)
+    if !force
+        existing = load_global_security_config()
+        if existing === nothing
+            existing = load_security_config()
+        end
+        if existing !== nothing
+            println()
+            printstyled(
+                "Security configuration already exists (mode: $(existing.mode))\n",
+                color = :green,
+            )
+            print("Reconfigure? [y/N]: ")
+            response = strip(lowercase(readline()))
+            if !(response == "y" || response == "yes")
+                return existing
+            end
+        end
+    end
+    return setup_wizard_tui(; mode = mode)
 end
 
 """

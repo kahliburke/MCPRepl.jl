@@ -9,7 +9,24 @@
 #
 
 using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
+
+const PROJECT_DIR = joinpath(@__DIR__, "..")
+Pkg.activate(PROJECT_DIR)
+
+# Auto-instantiate if Manifest is missing or stale
+let manifest = joinpath(PROJECT_DIR, "Manifest.toml")
+    project  = joinpath(PROJECT_DIR, "Project.toml")
+    if !isfile(manifest)
+        @info "First run — installing dependencies (Pkg.instantiate)..."
+        Pkg.instantiate()
+    elseif mtime(project) > mtime(manifest)
+        @info "Project.toml changed — resolving dependencies..."
+        Pkg.resolve()
+    end
+end
+
+# Precompile if needed (Pkg.precompile is a no-op when up to date)
+Pkg.precompile()
 
 using MCPRepl
 
@@ -51,5 +68,16 @@ function parse_args()
 end
 
 (; port, theme) = parse_args()
+
+# First-time setup: launch security wizard if no config exists
+has_config = MCPRepl.load_security_config() !== nothing ||
+             MCPRepl.load_global_security_config() !== nothing
+
+if !has_config
+    result = setup_wizard_tui()
+    if result === nothing
+        exit(0)
+    end
+end
 
 tui(; port, theme_name=theme)
