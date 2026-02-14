@@ -1,0 +1,55 @@
+#!/usr/bin/env julia
+#
+# MCPRepl TUI launcher
+#
+# Usage:
+#   ./bin/mcprepl              # default port 2828, kokaku theme
+#   ./bin/mcprepl --port 3000  # custom port
+#   ./bin/mcprepl --theme esper
+#
+
+using Pkg
+Pkg.activate(joinpath(@__DIR__, ".."))
+
+using MCPRepl
+
+# Parse args
+function parse_args()
+    port = 2828
+    theme = :kokaku
+
+    i = 1
+    while i <= length(ARGS)
+        if ARGS[i] in ("--port", "-p") && i + 1 <= length(ARGS)
+            port = parse(Int, ARGS[i + 1])
+            i += 2
+        elseif ARGS[i] in ("--theme", "-t") && i + 1 <= length(ARGS)
+            theme = Symbol(ARGS[i + 1])
+            i += 2
+        elseif ARGS[i] in ("--help", "-h")
+            println("""
+            MCPRepl TUI — persistent MCP server with terminal dashboard
+
+            Usage: mcprepl [options]
+
+            Options:
+              -p, --port PORT    MCP HTTP server port (default: 2828)
+              -t, --theme NAME   Theme: kokaku, esper, motoko, neuromancer (default: kokaku)
+              -h, --help         Show this help
+
+            Start a bridge in your Julia REPL:
+              using MCPRepl
+              MCPReplBridge.serve(name="myproject")
+            """)
+            exit(0)
+        else
+            println("Unknown argument: $(ARGS[i])")
+            exit(1)
+        end
+    end
+    return (; port, theme)
+end
+
+(; port, theme) = parse_args()
+
+tui(; port, theme_name=theme)
