@@ -1221,6 +1221,166 @@ function create_handler(
 end
 
 
+"""
+Handle a bridge-mode tool call with SSE progress notifications.
+
+Sends `Content-Type: text/event-stream` and streams:
+1. `notifications/progress` events with stdout/stderr chunks as they arrive
+2. A heartbeat every 5 seconds of silence to keep the connection alive
+3. The final JSON-RPC result as the last SSE event
+"""
+function _handle_bridge_tool_sse(
+    http::HTTP.Stream,
+    request::Dict{String,Any},
+    tools_dict::Dict{Symbol,MCPTool},
+    name_to_id::Dict{String,Symbol},
+    session,
+)
+    request_id = get(request, "id", 0)
+    tool_name_str = request["params"]["name"]
+    tool_id = get(name_to_id, tool_name_str, nothing)
+    args = get(request["params"], "arguments", Dict())
+
+    if tool_id === nothing || !haskey(tools_dict, tool_id)
+        HTTP.setstatus(http, 404)
+        HTTP.setheader(http, "Content-Type" => "application/json")
+        HTTP.startwrite(http)
+        write(
+            http,
+            JSON.json(
+                Dict(
+                    "jsonrpc" => "2.0",
+                    "id" => request_id,
+                    "error" => Dict(
+                        "code" => -32602,
+                        "message" => "Tool not found: $tool_name_str",
+                    ),
+                ),
+            ),
+        )
+        return nothing
+    end
+
+    tool = tools_dict[tool_id]
+
+    # Start SSE response
+    HTTP.setstatus(http, 200)
+    HTTP.setheader(http, "Content-Type" => "text/event-stream")
+    HTTP.setheader(http, "Cache-Control" => "no-cache")
+    HTTP.setheader(http, "Connection" => "keep-alive")
+    HTTP.startwrite(http)
+
+    progress_token = "tool-$(tool_name_str)-$(round(Int, time()))"
+    step_counter = Ref(0)
+    last_event_time = Ref(time())
+
+    # Write an SSE event (JSON-RPC notification)
+    function send_sse_event(data::Dict)
+        try
+            event_json = JSON.json(data)
+            write(http, "data: $(event_json)\n\n")
+            flush(http)
+            last_event_time[] = time()
+        catch
+            # Connection may have closed
+        end
+    end
+
+    # Send progress notification
+    function send_progress(message::String)
+        step_counter[] += 1
+        send_sse_event(
+            Dict(
+                "jsonrpc" => "2.0",
+                "method" => "notifications/progress",
+                "params" => Dict(
+                    "progressToken" => progress_token,
+                    "progress" => step_counter[],
+                    "message" =>
+                        length(message) > 200 ? first(message, 200) * "..." : message,
+                ),
+            ),
+        )
+    end
+
+    # Start heartbeat task
+    heartbeat_done = Ref(false)
+    heartbeat_task = @async begin
+        while !heartbeat_done[]
+            sleep(1.0)
+            heartbeat_done[] && break
+            if time() - last_event_time[] >= 5.0
+                send_progress("Still executing...")
+            end
+        end
+    end
+
+    # Push activity events in TUI mode
+    _push_activity!(:tool_start, tool.name, "", "")
+    start_time = time()
+    tool_ok = true
+
+    result_text = try
+        # Call tool handler with progress callback piped through
+        # The tool handler calls execute_via_bridge_streaming which accepts on_progress
+        # We inject on_progress into the args dict as a special key that execute_via_bridge_streaming
+        # will pick up. However, tool handlers don't pass on_progress directly.
+        # Instead, we'll call the tool handler normally — the progress comes from
+        # execute_via_bridge_streaming being called within the tool handler.
+        # For the `ex` tool specifically, we can call execute_via_bridge_streaming directly.
+        if tool_name_str == "ex"
+            # Direct streaming path for the ex tool
+            code = get(args, "e", "")
+            quiet = get(args, "q", true)
+            silent = get(args, "s", false)
+            max_output = get(args, "max_output", 6000)
+            ses = get(args, "ses", "")
+            execute_via_bridge_streaming(
+                code;
+                quiet = quiet,
+                silent = silent,
+                max_output = max_output,
+                session = ses,
+                on_progress = send_progress,
+            )
+        else
+            # Other bridge tools: call handler normally (no streaming progress)
+            Base.invokelatest(tool.handler, args)
+        end
+    catch e
+        tool_ok = false
+        "ERROR: $(sprint(showerror, e))"
+    finally
+        heartbeat_done[] = true
+        elapsed = time() - start_time
+        time_str =
+            elapsed < 1.0 ? @sprintf("%.0fms", elapsed * 1000) : @sprintf("%.1fs", elapsed)
+        _push_activity!(:tool_done, tool.name, "", time_str; success = tool_ok)
+    end
+
+    # Push tool result for TUI Activity inspection
+    elapsed = time() - start_time
+    time_str =
+        elapsed < 1.0 ? @sprintf("%.0fms", elapsed * 1000) : @sprintf("%.1fs", elapsed)
+    rt = string(result_text)
+    ok = tool_ok && !startswith(rt, "ERROR:")
+    sk = string(get(args, "ses", get(args, "session", "")))
+    _push_tool_result!(
+        ToolCallResult(now(), tool.name, JSON.json(args), rt, time_str, ok, sk),
+    )
+
+    # Send final JSON-RPC result as last SSE event
+    send_sse_event(
+        Dict(
+            "jsonrpc" => "2.0",
+            "id" => request_id,
+            "result" => Dict("content" => [Dict("type" => "text", "text" => result_text)]),
+        ),
+    )
+
+    return nothing
+end
+
 function start_mcp_server(
     tools::Vector{MCPTool},
     port::Int = 3000;
@@ -1812,9 +1972,15 @@ function start_mcp_server(
             # Get or create session
             session, is_new_session = get_or_create_session(session_id, is_initialize)
 
-            # For non-initialize requests without a valid session, return error
+            # Update activity timestamp so the reaper doesn't kill active sessions
+            if session !== nothing
+                Session.update_activity!(session)
+            end
+
+            # For non-initialize requests without a valid session, return 404 per
+            # MCP Streamable HTTP spec — signals the client to re-initialize.
             if !is_initialize && session === nothing
-                HTTP.setstatus(http, 400)
+                HTTP.setstatus(http, 404)
                 HTTP.setheader(http, "Content-Type" => "application/json")
                 HTTP.startwrite(http)
                 error_response = Dict(
@@ -1823,19 +1989,37 @@ function start_mcp_server(
                         parsed_request !== nothing ? get(parsed_request, "id", 0) : 0,
                     "error" => Dict(
                         "code" => -32600,
-                        "message" => "Invalid Request - missing or invalid Mcp-Session-Id header. Send initialize request first.",
+                        "message" => "Session not found. Send initialize request to start a new session.",
                     ),
                 )
                 write(http, JSON.json(error_response))
                 return nothing
             end
 
-            # All requests go to create_handler
-            # create_handler handles:
-            # - Security checks (already done above, but also in create_handler for direct calls)
-            # - OAuth endpoints
-            # - VS Code response endpoint
-            # - initialize, tools/list, and tools/call
+            # ── SSE Progress for bridge-mode tool calls ───────────────────
+            # When running in bridge mode (TUI server), long-running tool calls
+            # that execute code via the bridge can stream progress notifications
+            # back to the MCP client as SSE events, preventing HTTP timeouts.
+            if BRIDGE_MODE[] &&
+               parsed_request !== nothing &&
+               get(parsed_request, "method", "") == "tools/call"
+
+                tool_name_str = get(get(parsed_request, "params", Dict()), "name", "")
+                # Tools that execute via bridge and may run long
+                bridge_exec_tools = Set(["ex", "run_tests", "profile_code", "lint_package"])
+
+                if tool_name_str in bridge_exec_tools
+                    return _handle_bridge_tool_sse(
+                        http,
+                        parsed_request,
+                        tools_dict,
+                        name_to_id,
+                        session,
+                    )
+                end
+            end
+
+            # All other requests go to create_handler
             req_with_body = HTTP.Request(req.method, req.target, req.headers, body)
             handler = create_handler(tools_dict, name_to_id, port, security_config, session)
             response = handler(req_with_body)

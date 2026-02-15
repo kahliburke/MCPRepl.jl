@@ -17,6 +17,7 @@ using Dates
 
 const SOCK_DIR = joinpath(homedir(), ".cache", "mcprepl", "sock")
 const BRIDGE_LOCK = ReentrantLock()
+const _PUB_LOCK = ReentrantLock()
 
 # Global state for the running bridge
 const _BRIDGE_TASK = Ref{Union{Task,Nothing}}(nothing)
@@ -116,15 +117,20 @@ function _current_options()
     return (type = :options, mirror_repl = _MIRROR_REPL[])
 end
 
-function _publish_stream(channel::String, data::String)
+function _publish_stream(channel::String, data; request_id::String = "")
     pub = _STREAM_SOCKET[]
     pub === nothing && return
-    try
-        io = IOBuffer()
-        serialize(io, (channel = channel, data = data))
-        send(pub, Message(take!(io)))
-    catch
-        # Non-critical — subscriber may not be connected
+    lock(_PUB_LOCK) do
+        try
+            io = IOBuffer()
+            msg =
+                isempty(request_id) ? (channel = channel, data = data) :
+                (channel = channel, data = data, request_id = request_id)
+            serialize(io, msg)
+            send(pub, Message(take!(io)))
+        catch
+            # Non-critical — subscriber may not be connected
+        end
     end
 end
 
@@ -287,6 +293,15 @@ end
 
 # ── Message loop ──────────────────────────────────────────────────────────────
 
+"""
+Serialize a result NamedTuple to bytes for PUB transport.
+"""
+function _serialize_result(result)::String
+    io = IOBuffer()
+    serialize(io, result)
+    return String(take!(io))
+end
+
 function handle_message(request::NamedTuple)
     msg_type = get(request, :type, :unknown)
 
@@ -295,6 +310,27 @@ function handle_message(request::NamedTuple)
         display_code = get(request, :display_code, code)
         result = bridge_eval(code; display_code = display_code)
         return result
+    elseif msg_type == :eval_async
+        code = get(request, :code, "")
+        display_code = get(request, :display_code, code)
+        request_id = get(request, :request_id, "")
+        # Run eval in background, return :accepted immediately
+        @async begin
+            try
+                result = bridge_eval(code; display_code = display_code)
+                _publish_stream("eval_complete", _serialize_result(result); request_id)
+            catch e
+                error_result = (
+                    stdout = "",
+                    stderr = "",
+                    value_repr = "",
+                    exception = sprint(showerror, e, catch_backtrace()),
+                    backtrace = nothing,
+                )
+                _publish_stream("eval_error", _serialize_result(error_result); request_id)
+            end
+        end
+        return (type = :accepted, request_id = request_id)
     elseif msg_type == :set_option
         key = string(get(request, :key, ""))
         value = get(request, :value, nothing)

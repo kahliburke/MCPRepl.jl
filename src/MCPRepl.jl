@@ -983,26 +983,18 @@ const BRIDGE_MODE = Ref{Bool}(false)
 const BRIDGE_CONN_MGR = Ref{Union{Nothing,ConnectionManager}}(nothing)
 
 """
-    execute_via_bridge(code; quiet=true, max_output=6000)
+    _resolve_bridge_conn(session) -> (conn, error_string)
 
-Execute code on a remote REPL via the bridge client. Used when BRIDGE_MODE is
-active (TUI server process). Falls back to in-process eval if no bridge is
-connected.
+Resolve a bridge connection from the session key. Returns (conn, nothing) on success,
+or (nothing, error_message) on failure.
 """
-function execute_via_bridge(
-    code::String;
-    quiet::Bool = true,
-    silent::Bool = false,
-    max_output::Int = 6000,
-    session::String = "",
-)
+function _resolve_bridge_conn(session::String)
     mgr = BRIDGE_CONN_MGR[]
     if mgr === nothing
-        return "ERROR: Bridge mode active but no ConnectionManager configured"
+        return (nothing, "ERROR: Bridge mode active but no ConnectionManager configured")
     end
 
     conn = if isempty(session)
-        # Backward compat: auto-select if exactly one session
         conns = connected_sessions(mgr)
         if length(conns) == 1
             conns[1]
@@ -1016,36 +1008,53 @@ function execute_via_bridge(
         available =
             join(["$(short_key(c)) ($(c.name))" for c in connected_sessions(mgr)], ", ")
         if isempty(available)
-            return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+            return (
+                nothing,
+                "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")",
+            )
         end
-        return "ERROR: No session matched '$(session)'. Available: $available"
+        return (nothing, "ERROR: No session matched '$(session)'. Available: $available")
     end
+    return (conn, nothing)
+end
 
-    # Apply println stripping (stays server-side — keeps LLM results clean)
+"""
+    _prepare_bridge_code(code, quiet) -> (cleaned_code, show_return_value, was_stripped)
+
+Apply println stripping and quiet-mode semicolons to code before sending to bridge.
+"""
+function _prepare_bridge_code(code::String, quiet::Bool)
     was_stripped = Ref(false)
     expr = Base.parse_input_line(code)
     expr = remove_println_calls(expr, true, quiet, was_stripped)
-    # Re-serialize only if stripping actually happened. Use _serialize_expr
-    # instead of string(expr) because parse_input_line wraps multi-line code
-    # in :toplevel, and string(:toplevel) emits $(Expr(...)) with literal $
-    # that corrupts the code on the remote REPL.
     cleaned_code = if expr === nothing
-        ""  # Entire expression was stripped
+        ""
     elseif was_stripped[]
         _serialize_expr(expr)
     else
-        code  # keep original — no stripping means no need to re-serialize
+        code
     end
 
-    # Auto-append semicolon in quiet mode
     show_return_value = !quiet && !REPL.ends_with_semicolon(code)
     if quiet && !REPL.ends_with_semicolon(cleaned_code)
         cleaned_code = cleaned_code * ";"
     end
 
-    response = eval_remote(conn, cleaned_code; display_code = code)
+    return (cleaned_code, show_return_value, was_stripped)
+end
 
-    # Format response matching execute_repllike output format
+"""
+    _format_bridge_response(response, show_return_value, quiet, was_stripped, max_output) -> String
+
+Format a bridge eval response into the final result string.
+"""
+function _format_bridge_response(
+    response,
+    show_return_value::Bool,
+    quiet::Bool,
+    was_stripped::Ref{Bool},
+    max_output::Int,
+)
     captured = ""
     if hasproperty(response, :stdout) && hasproperty(response, :stderr)
         captured = string(response.stdout) * string(response.stderr)
@@ -1065,18 +1074,98 @@ function execute_via_bridge(
         captured * result_str
     end
 
-    # Stripping reminder
     if was_stripped[]
         result *= "\n\n⚠️  Note: println/print/logging calls were removed. Use q=false with a final expression to see values."
     end
 
-    # Truncation
     if length(result) > max_output
+        original_length = length(result)
         result = truncate_output(result, max_output, nothing)
-        result *= "\n\n⚠️  Output truncated ($max_output of $(length(result)) chars shown)."
+        result *= "\n\n⚠️  Output truncated ($max_output of $original_length chars shown)."
     end
 
     return result
+end
+
+"""
+    execute_via_bridge_streaming(code; quiet=true, silent=false, max_output=6000, session="", on_progress=nothing)
+
+Execute code on a remote REPL via the bridge client using async eval with streaming output.
+The `on_progress` callback receives `(message::String)` for each output chunk, enabling
+upstream callers (e.g. SSE progress notifications) to forward incremental output.
+
+Falls back to synchronous `eval_remote` if the bridge doesn't support `:eval_async`.
+"""
+function execute_via_bridge_streaming(
+    code::String;
+    quiet::Bool = true,
+    silent::Bool = false,
+    max_output::Int = 6000,
+    session::String = "",
+    on_progress::Union{Function,Nothing} = nothing,
+)
+    conn, err = _resolve_bridge_conn(session)
+    err !== nothing && return err
+
+    cleaned_code, show_return_value, was_stripped = _prepare_bridge_code(code, quiet)
+
+    # Use async eval with streaming — on_output forwards chunks to on_progress
+    on_output = if on_progress !== nothing
+        (channel, data) -> begin
+            try
+                on_progress("[$channel] $data")
+            catch
+            end
+        end
+    else
+        nothing
+    end
+
+    response =
+        eval_remote_async(conn, cleaned_code; display_code = code, on_output = on_output)
+
+    # Fallback: if bridge doesn't support :eval_async (old bridge version),
+    # the error will mention "unknown request type". Retry with sync eval_remote.
+    if hasproperty(response, :exception) &&
+       response.exception !== nothing &&
+       contains(string(response.exception), "unknown request type")
+        response = eval_remote(conn, cleaned_code; display_code = code)
+    end
+
+    return _format_bridge_response(
+        response,
+        show_return_value,
+        quiet,
+        was_stripped,
+        max_output,
+    )
+end
+
+"""
+    execute_via_bridge(code; quiet=true, max_output=6000)
+
+Execute code on a remote REPL via the bridge client. Used when BRIDGE_MODE is
+active (TUI server process). Falls back to in-process eval if no bridge is
+connected.
+
+Delegates to `execute_via_bridge_streaming` with async eval for robustness
+(avoids blocking the REQ socket during long evals).
+"""
+function execute_via_bridge(
+    code::String;
+    quiet::Bool = true,
+    silent::Bool = false,
+    max_output::Int = 6000,
+    session::String = "",
+)
+    return execute_via_bridge_streaming(
+        code;
+        quiet = quiet,
+        silent = silent,
+        max_output = max_output,
+        session = session,
+        on_progress = nothing,
+    )
 end
 
 # ============================================================================

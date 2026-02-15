@@ -9,6 +9,8 @@
 
 # ── Types ─────────────────────────────────────────────────────────────────────
 
+@enum EvalState EVAL_IDLE EVAL_SENDING EVAL_STREAMING
+
 mutable struct REPLConnection
     session_id::String
     name::String
@@ -17,6 +19,12 @@ mutable struct REPLConnection
     stream_endpoint::String      # ipc:// endpoint for PUB/SUB streaming
     req_socket::Union{ZMQ.Socket,Nothing}
     sub_socket::Union{ZMQ.Socket,Nothing}   # SUB for streaming stdout/stderr
+    zmq_context::Union{ZMQ.Context,Nothing} # shared context for socket recreation
+    req_lock::ReentrantLock      # protects REQ socket access
+    eval_state::Ref{EvalState}   # current eval lifecycle state
+    _eval_inbox::Channel{Any}    # legacy: receives untagged eval messages from drain loop
+    _eval_inboxes::Dict{String,Channel{Any}}  # per-request_id channels for concurrent evals
+    _eval_inboxes_lock::ReentrantLock          # protects _eval_inboxes dict
     status::Symbol               # :connected, :disconnected, :connecting
     project_path::String
     julia_version::String
@@ -47,6 +55,12 @@ function REPLConnection(;
         stream_endpoint,
         nothing,
         nothing,
+        nothing,
+        ReentrantLock(),
+        Ref(EVAL_IDLE),
+        Channel{Any}(32),
+        Dict{String,Channel{Any}}(),
+        ReentrantLock(),
         :disconnected,
         project_path,
         julia_version,
@@ -114,7 +128,6 @@ function _remove_session_files(sock_dir::String, session_id::String)
 end
 
 const _cleanup_done = Ref(false)
-const _orphan_contexts = ZMQ.Context[]
 
 """
     cleanup_stale_sessions!(sock_dir)
@@ -244,6 +257,7 @@ function connect!(mgr::ConnectionManager, conn::REPLConnection)
         socket.linger = 0        # don't block on close
         connect(socket, conn.endpoint)
         conn.req_socket = socket
+        conn.zmq_context = mgr.zmq_context  # store for _reconnect_req!
 
         # Connect SUB socket for streaming output (non-blocking)
         if !isempty(conn.stream_endpoint)
@@ -298,8 +312,17 @@ end
 Reset a poisoned REQ socket after a ZMQ timeout. REQ sockets enter
 an invalid state when a send completes but recv times out — they can
 never send again. The only fix is to close and reconnect.
+
+Reuses the provided ZMQ context instead of creating a new one (which
+leaked contexts and caused resource exhaustion).
 """
 function _reconnect_req!(conn::REPLConnection)
+    ctx = conn.zmq_context
+    if ctx === nothing
+        conn.req_socket = nothing
+        conn.status = :disconnected
+        return
+    end
     old = conn.req_socket
     try
         old.linger = 0
@@ -307,8 +330,6 @@ function _reconnect_req!(conn::REPLConnection)
     catch
     end
     try
-        ctx = Context()
-        push!(_orphan_contexts, ctx)
         socket = Socket(ctx, REQ)
         socket.rcvtimeo = 5000
         socket.sndtimeo = 2000
@@ -340,40 +361,223 @@ function eval_remote(
     end
 
     request = (type = :eval, code = code, display_code = display_code)
-    try
-        # Serialize and send
-        io = IOBuffer()
-        serialize(io, request)
-        send(conn.req_socket, Message(take!(io)))
+    lock(conn.req_lock) do
+        try
+            # Serialize and send
+            io = IOBuffer()
+            serialize(io, request)
+            send(conn.req_socket, Message(take!(io)))
 
-        # Receive response
-        raw = recv(conn.req_socket)
-        response = deserialize(IOBuffer(raw))
-        conn.last_seen = now()
-        conn.tool_call_count += 1
-        return response
-    catch e
-        if e isa ZMQ.TimeoutError
-            # REQ socket is now in a broken state (sent request, never got
-            # reply). We must close and reconnect or all future calls fail.
-            _reconnect_req!(conn)
+            # Receive response
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            conn.tool_call_count += 1
+            return response
+        catch e
+            if e isa ZMQ.TimeoutError
+                # REQ socket is now in a broken state (sent request, never got
+                # reply). We must close and reconnect or all future calls fail.
+                _reconnect_req!(conn)
+                return (
+                    stdout = "",
+                    stderr = "",
+                    value_repr = "",
+                    exception = "Bridge eval timed out after $(timeout_ms)ms",
+                    backtrace = nothing,
+                )
+            end
+            # Connection likely broken — mark disconnected
+            conn.status = :disconnected
             return (
                 stdout = "",
                 stderr = "",
                 value_repr = "",
-                exception = "Bridge eval timed out after $(timeout_ms)ms",
+                exception = "Bridge communication error: $(sprint(showerror, e))",
                 backtrace = nothing,
             )
         end
-        # Connection likely broken — mark disconnected
-        conn.status = :disconnected
+    end
+end
+
+"""
+    eval_remote_async(conn, code; timeout_ms=120000, display_code=code, on_output=nothing)
+
+Asynchronous eval: sends `:eval_async` via REQ, gets `:accepted` ack immediately,
+then polls SUB socket for stdout/stderr/eval_complete/eval_error messages.
+
+This avoids blocking the REQ socket during long-running evals, allowing health
+pings and other operations to proceed.
+
+`on_output` callback, if provided, is called as `on_output(channel::String, data::String)`
+for each stdout/stderr chunk received during streaming.
+
+Returns the same NamedTuple format as `eval_remote`.
+"""
+function eval_remote_async(
+    conn::REPLConnection,
+    code::String;
+    timeout_ms::Int = 120000,
+    display_code::String = code,
+    on_output::Union{Function,Nothing} = nothing,
+)
+    if conn.status != :connected || conn.req_socket === nothing
         return (
             stdout = "",
             stderr = "",
             value_repr = "",
-            exception = "Bridge communication error: $(sprint(showerror, e))",
+            exception = "Bridge not connected (session=$(conn.session_id), status=$(conn.status))",
             backtrace = nothing,
         )
+    end
+
+    # Generate a unique request ID to correlate response with this caller
+    request_id = bytes2hex(rand(UInt8, 8))
+
+    # Phase 1: Send eval_async request via REQ socket (short lock)
+    conn.eval_state[] = EVAL_SENDING
+    ack = lock(conn.req_lock) do
+        try
+            request = (
+                type = :eval_async,
+                code = code,
+                display_code = display_code,
+                request_id = request_id,
+            )
+            io = IOBuffer()
+            serialize(io, request)
+            send(conn.req_socket, Message(take!(io)))
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            return response
+        catch e
+            if e isa ZMQ.TimeoutError
+                _reconnect_req!(conn)
+                return (type = :error, message = "Bridge eval_async handshake timed out")
+            end
+            conn.status = :disconnected
+            return (
+                type = :error,
+                message = "Bridge communication error: $(sprint(showerror, e))",
+            )
+        end
+    end
+
+    # Check handshake result
+    ack_type = get(ack, :type, :error)
+    if ack_type == :error
+        conn.eval_state[] = EVAL_IDLE
+        msg = get(ack, :message, "Unknown handshake error")
+        return (
+            stdout = "",
+            stderr = "",
+            value_repr = "",
+            exception = string(msg),
+            backtrace = nothing,
+        )
+    end
+    if ack_type != :accepted
+        conn.eval_state[] = EVAL_IDLE
+        return (
+            stdout = "",
+            stderr = "",
+            value_repr = "",
+            exception = "Unexpected ack type: $ack_type",
+            backtrace = nothing,
+        )
+    end
+
+    # Phase 2: Wait for eval_complete/eval_error on a per-request inbox channel.
+    # The TUI drain loop reads the SUB socket and routes messages by request_id
+    # to the correct inbox so concurrent evals don't steal each other's results.
+    conn.eval_state[] = EVAL_STREAMING
+
+    # Register a per-request inbox channel
+    my_inbox = Channel{Any}(32)
+    lock(conn._eval_inboxes_lock) do
+        conn._eval_inboxes[request_id] = my_inbox
+    end
+
+    deadline = time() + timeout_ms / 1000.0
+
+    try
+        while time() < deadline
+            # Poll the per-request inbox
+            msg = if isready(my_inbox)
+                try
+                    take!(my_inbox)
+                catch
+                    nothing
+                end
+            else
+                sleep(0.1)
+                nothing
+            end
+
+            msg === nothing && continue
+
+            ch = string(get(msg, :channel, ""))
+            data = get(msg, :data, "")
+
+            if ch == "stdout" || ch == "stderr"
+                on_output !== nothing && on_output(ch, string(data))
+            elseif ch == "eval_complete"
+                result = try
+                    deserialize(IOBuffer(Vector{UInt8}(data)))
+                catch
+                    (
+                        stdout = "",
+                        stderr = "",
+                        value_repr = string(data),
+                        exception = nothing,
+                        backtrace = nothing,
+                    )
+                end
+                conn.tool_call_count += 1
+                return result
+            elseif ch == "eval_error"
+                result = try
+                    deserialize(IOBuffer(Vector{UInt8}(data)))
+                catch
+                    (
+                        stdout = "",
+                        stderr = "",
+                        value_repr = "",
+                        exception = string(data),
+                        backtrace = nothing,
+                    )
+                end
+                conn.tool_call_count += 1
+                return result
+            end
+        end
+
+        # Timeout
+        return (
+            stdout = "",
+            stderr = "",
+            value_repr = "",
+            exception = "Bridge eval timed out after $(timeout_ms)ms (async streaming)",
+            backtrace = nothing,
+        )
+    catch e
+        return (
+            stdout = "",
+            stderr = "",
+            value_repr = "",
+            exception = "Error during async eval streaming: $(sprint(showerror, e))",
+            backtrace = nothing,
+        )
+    finally
+        # Always clean up: deregister inbox and update state
+        lock(conn._eval_inboxes_lock) do
+            delete!(conn._eval_inboxes, request_id)
+        end
+        # Only go IDLE if no other evals are pending
+        if isempty(conn._eval_inboxes)
+            conn.eval_state[] = EVAL_IDLE
+        end
     end
 end
 
@@ -381,22 +585,24 @@ function get_remote_options(conn::REPLConnection)
     if conn.status != :connected || conn.req_socket === nothing
         return nothing
     end
-    req = (type = :get_options,)
-    try
-        io = IOBuffer()
-        serialize(io, req)
-        send(conn.req_socket, Message(take!(io)))
-        raw = recv(conn.req_socket)
-        response = deserialize(IOBuffer(raw))
-        conn.last_seen = now()
-        return response
-    catch e
-        if e isa ZMQ.TimeoutError
-            _reconnect_req!(conn)
-        else
-            conn.status = :disconnected
+    lock(conn.req_lock) do
+        req = (type = :get_options,)
+        try
+            io = IOBuffer()
+            serialize(io, req)
+            send(conn.req_socket, Message(take!(io)))
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            return response
+        catch e
+            if e isa ZMQ.TimeoutError
+                _reconnect_req!(conn)
+            else
+                conn.status = :disconnected
+            end
+            return nothing
         end
-        return nothing
     end
 end
 
@@ -404,48 +610,59 @@ function set_mirror_repl!(conn::REPLConnection, enabled::Bool)
     if conn.status != :connected || conn.req_socket === nothing
         return false
     end
-    req = (type = :set_option, key = "mirror_repl", value = enabled)
-    try
-        io = IOBuffer()
-        serialize(io, req)
-        send(conn.req_socket, Message(take!(io)))
-        raw = recv(conn.req_socket)
-        response = deserialize(IOBuffer(raw))
-        conn.last_seen = now()
-        return get(response, :type, :error) == :ok
-    catch e
-        if e isa ZMQ.TimeoutError
-            _reconnect_req!(conn)
-        else
-            conn.status = :disconnected
+    lock(conn.req_lock) do
+        req = (type = :set_option, key = "mirror_repl", value = enabled)
+        try
+            io = IOBuffer()
+            serialize(io, req)
+            send(conn.req_socket, Message(take!(io)))
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            return get(response, :type, :error) == :ok
+        catch e
+            if e isa ZMQ.TimeoutError
+                _reconnect_req!(conn)
+            else
+                conn.status = :disconnected
+            end
+            return false
         end
-        return false
     end
 end
 
-function ping(conn::REPLConnection)
+function ping(conn::REPLConnection; skip_if_busy::Bool = false)
+    # When called from health check, skip if an eval is in progress —
+    # the REQ socket is either locked or the bridge is busy.
+    # Check this BEFORE the socket check so it works even when the socket
+    # is temporarily nil during reconnect.
+    if skip_if_busy && conn.eval_state[] != EVAL_IDLE
+        return (type = :pong, skipped = true)  # synthetic pong to avoid disconnect
+    end
     if conn.status != :connected || conn.req_socket === nothing
         return nothing
     end
 
-    try
-        io = IOBuffer()
-        serialize(io, (type = :ping,))
-        send(conn.req_socket, Message(take!(io)))
+    lock(conn.req_lock) do
+        try
+            io = IOBuffer()
+            serialize(io, (type = :ping,))
+            send(conn.req_socket, Message(take!(io)))
 
-        raw = recv(conn.req_socket)
-        response = deserialize(IOBuffer(raw))
-        conn.last_seen = now()
-        conn.last_ping = now()
-        return response
-    catch e
-        if e isa ZMQ.TimeoutError
-            # REQ socket is poisoned after timeout — must reconnect
-            _reconnect_req!(conn)
-        else
-            conn.status = :disconnected
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            conn.last_ping = now()
+            return response
+        catch e
+            if e isa ZMQ.TimeoutError
+                # REQ socket is poisoned after timeout — must reconnect
+                _reconnect_req!(conn)
+            else
+                conn.status = :disconnected
+            end
+            return nothing
         end
-        return nothing
     end
 end
 
@@ -474,7 +691,61 @@ function drain_stream_messages!(mgr::ConnectionManager)
                 end
                 ch = string(get(msg, :channel, "stdout"))
                 data = string(get(msg, :data, ""))
-                push!(messages, (channel = ch, data = data, session_name = conn.name))
+                msg_request_id = string(get(msg, :request_id, ""))
+
+                # Route eval lifecycle messages to the correct per-request inbox
+                # so concurrent eval_remote_async callers each get their own results.
+                routed = false
+                if ch in ("eval_complete", "eval_error") && !isempty(msg_request_id)
+                    inbox = lock(conn._eval_inboxes_lock) do
+                        get(conn._eval_inboxes, msg_request_id, nothing)
+                    end
+                    if inbox !== nothing
+                        try
+                            put!(inbox, (channel = ch, data = data))
+                            routed = true
+                        catch
+                            # Channel full or closed
+                        end
+                    end
+                end
+
+                # Fallback for untagged eval messages (old bridge without request_id)
+                if !routed &&
+                   ch in ("eval_complete", "eval_error") &&
+                   conn.eval_state[] == EVAL_STREAMING
+                    try
+                        put!(conn._eval_inbox, (channel = ch, data = data))
+                        routed = true
+                    catch
+                    end
+                end
+
+                if !routed
+                    push!(messages, (channel = ch, data = data, session_name = conn.name))
+                end
+
+                # Forward stdout/stderr to all active inboxes during streaming
+                # so on_output callbacks (SSE progress) can see them.
+                # stdout/stderr aren't tagged with request_id (they come from
+                # the REPL's stdout/stderr which is shared), so broadcast to all.
+                if ch in ("stdout", "stderr") && conn.eval_state[] == EVAL_STREAMING
+                    lock(conn._eval_inboxes_lock) do
+                        for (_, inbox) in conn._eval_inboxes
+                            try
+                                put!(inbox, (channel = ch, data = data))
+                            catch
+                            end
+                        end
+                    end
+                    # Also legacy inbox
+                    if isempty(conn._eval_inboxes)
+                        try
+                            put!(conn._eval_inbox, (channel = ch, data = data))
+                        catch
+                        end
+                    end
+                end
             end
         end
     end
@@ -522,7 +793,7 @@ function start!(mgr::ConnectionManager)
                 to_remove = REPLConnection[]
                 for conn in conns
                     if conn.status == :connected
-                        result = ping(conn)
+                        result = ping(conn; skip_if_busy = true)
                         if result === nothing
                             @debug "Bridge unresponsive, disconnecting" name = conn.name
                             disconnect!(conn)
@@ -572,19 +843,12 @@ function stop!(mgr::ConnectionManager)
         end
     end
 
-    # Close the main ZMQ context and any orphans from _reconnect_req!.
+    # Close the main ZMQ context.
     # All sockets have linger=0 so this should return promptly.
     try
         close(mgr.zmq_context)
     catch
     end
-    for ctx in _orphan_contexts
-        try
-            close(ctx)
-        catch
-        end
-    end
-    empty!(_orphan_contexts)
 
     # Let background tasks finish (they'll exit on next loop since running=false)
     Threads.@spawn begin

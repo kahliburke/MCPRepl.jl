@@ -84,11 +84,21 @@ end
 using MCPRepl
 
 if use_revise && isdefined(Main, :Revise)
-    try
-        # Wire event-driven Revise listener so changes apply without REPL input.
-        MCPRepl.start_revise_event_watcher(project_path=PROJECT_DIR; silent=false)
-    catch e
-        @warn "Could not start MCPRepl Revise event watcher" exception = e
+    # Revise is loaded and tracking MCPRepl. In a REPL, revisions apply
+    # automatically via AST transforms. In a script (no REPL backend),
+    # we need a background task to call Revise.revise() periodically.
+    # Poll-based Revise: check for changes every 3 seconds.
+    # Event-based (Revise.revision_event) doesn't reliably fire in non-REPL
+    # scripts since there's no entr() or REPL backend polling inotify.
+    Threads.@spawn begin
+        while true
+            try
+                Main.Revise.revise()
+            catch e
+                e isa InterruptException && break
+            end
+            sleep(3)
+        end
     end
 end
 

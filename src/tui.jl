@@ -348,6 +348,10 @@ end
     selected_result::Int = 0       # 0 = none, 1+ = index into tool_results (newest-first)
     result_scroll::Int = 0         # vertical scroll in detail panel
     activity_layout::ResizableLayout = ResizableLayout(Vertical, [Percent(35), Fill()])
+    activity_filter::String = ""   # "" = all, or session_key to filter by
+    result_word_wrap::Bool = true   # word wrap in detail panel
+    detail_paragraph::Union{Paragraph,Nothing} = nothing  # cached for scroll state
+    _detail_for_result::Int = -1   # which selected_result the paragraph was built for
 
     # Server state
     server_port::Int = 2828
@@ -568,9 +572,16 @@ Async reindex: check that a Qdrant collection exists for this project, then
 run `sync_index` silently. Results are logged to the TUI server log.
 """
 function _trigger_background_reindex(project_path::String)
+    # Skip if project_path is empty or would result in "default" collection
+    if isempty(project_path) || project_path == "/"
+        return
+    end
     @async Logging.with_logger(TUILogger()) do
         try
             col_name = String(get_project_collection_name(project_path))
+            if col_name == "default"
+                return  # refuse to operate on a "default" collection
+            end
             collections = QdrantClient.list_collections()
             if !(col_name in collections)
                 return  # project not indexed — nothing to sync
@@ -671,6 +682,7 @@ function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
         handle_resize!(m.sessions_left_layout, evt)
     elseif m.active_tab == 3
         handle_resize!(m.activity_layout, evt)
+        m.detail_paragraph !== nothing && handle_mouse!(m.detail_paragraph, evt)
     elseif m.active_tab == 4
         handle_resize!(m.config_layout, evt)
         handle_resize!(m.config_left_layout, evt)
@@ -704,6 +716,17 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             m.log_word_wrap = !m.log_word_wrap
             _rebuild_log_pane!(m)
             return
+        end
+        # Activity tab actions (tab 3)
+        if m.active_tab == 3
+            if evt.char == 'f'
+                _cycle_activity_filter!(m)
+                return
+            elseif evt.char == 'w'
+                m.result_word_wrap = !m.result_word_wrap
+                m._detail_for_result = -1  # invalidate cached paragraph
+                return
+            end
         end
         # Config tab actions (tab 4)
         if m.active_tab == 4
@@ -757,23 +780,29 @@ function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
         end
     elseif tab == 3
         if fp == 1 && !isempty(m.tool_results)
-            # Tool call list
-            if evt.key == :up
-                m.selected_result = min(length(m.tool_results), m.selected_result + 1)
-            elseif evt.key == :down
-                m.selected_result = max(1, m.selected_result - 1)
+            # Tool call list — navigate within filtered results
+            filter_key = m.activity_filter
+            filtered = Int[]
+            for i = 1:length(m.tool_results)
+                if isempty(filter_key) || m.tool_results[i].session_key == filter_key
+                    push!(filtered, i)
+                end
+            end
+            if !isempty(filtered)
+                cur_pos = findfirst(==(m.selected_result), filtered)
+                if cur_pos === nothing
+                    m.selected_result = filtered[end]
+                elseif evt.key == :up && cur_pos < length(filtered)
+                    m.selected_result = filtered[cur_pos+1]
+                elseif evt.key == :down && cur_pos > 1
+                    m.selected_result = filtered[cur_pos-1]
+                end
             end
             m.result_scroll = 0
         elseif fp == 2
-            # Detail panel scroll
-            if evt.key == :up
-                m.result_scroll = max(0, m.result_scroll - 1)
-            elseif evt.key == :down
-                m.result_scroll += 1
-            elseif evt.key == :pageup
-                m.result_scroll = max(0, m.result_scroll - 5)
-            elseif evt.key == :pagedown
-                m.result_scroll += 5
+            # Detail panel scroll — delegate to Paragraph widget
+            if m.detail_paragraph !== nothing
+                handle_key!(m.detail_paragraph, evt)
             end
         end
     end
@@ -793,7 +822,7 @@ end
 
 function begin_onboarding!(m::MCPReplModel)
     m.config_flow = FLOW_ONBOARD_PATH
-    m.path_input = TextInput(text = string(pwd()), label = "Path: ")
+    m.path_input = TextInput(text = string(pwd()), label = "Path: ", tick = m.tick)
     m.flow_selected = 1
     m.flow_modal_selected = :confirm
 end
@@ -1476,6 +1505,11 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
         for msg in drain_stream_messages!(m.conn_mgr)
             if msg.channel == "files_changed"
                 m._reindex_pending[msg.data] = time()
+            elseif msg.channel in ("eval_complete", "eval_error")
+                # Async eval lifecycle messages — log but don't push to activity feed
+                # (the tool handler already pushes tool_start/tool_done events)
+                status = msg.channel == "eval_complete" ? "completed" : "error"
+                _push_log!(:info, "Bridge eval $status ($(msg.session_name))")
             else
                 kind = msg.channel == "stderr" ? :stderr : :stdout
                 push!(
@@ -1767,41 +1801,105 @@ end
 
 # ── Activity Tab ──────────────────────────────────────────────────────────────
 
+"""Cycle activity filter: All → session1 → session2 → … → All."""
+function _cycle_activity_filter!(m::MCPReplModel)
+    mgr = m.conn_mgr
+    mgr === nothing && return
+
+    # Collect unique session keys that appear in tool results
+    seen_keys = String[]
+    for r in m.tool_results
+        if !isempty(r.session_key) && r.session_key ∉ seen_keys
+            push!(seen_keys, r.session_key)
+        end
+    end
+    isempty(seen_keys) && return
+
+    # Build cycle: "" (all) → key1 → key2 → … → "" (all)
+    if isempty(m.activity_filter)
+        m.activity_filter = seen_keys[1]
+    else
+        idx = findfirst(==(m.activity_filter), seen_keys)
+        if idx === nothing || idx == length(seen_keys)
+            m.activity_filter = ""  # back to all
+        else
+            m.activity_filter = seen_keys[idx+1]
+        end
+    end
+    # Reset selection when filter changes
+    m.selected_result = 0
+    m._detail_for_result = -1
+end
+
+"""Resolve a session_key to a short display name (e.g. "rEVAlation")."""
+function _session_display_name(session_key::String)::String
+    isempty(session_key) && return ""
+    mgr = BRIDGE_CONN_MGR[]
+    mgr === nothing && return session_key
+    conn = get_connection_by_key(mgr, session_key)
+    conn === nothing && return session_key
+    return conn.name
+end
+
 function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     panes = split_layout(m.activity_layout, area)
     length(panes) < 2 && return
 
-    # ── Top pane: tool call list (newest first) ──
-    n = length(m.tool_results)
+    # ── Build filtered index list (indices into tool_results) ──
+    filter_key = m.activity_filter
+    filtered = Int[]  # indices into m.tool_results matching the filter
+    for i = 1:length(m.tool_results)
+        if isempty(filter_key) || m.tool_results[i].session_key == filter_key
+            push!(filtered, i)
+        end
+    end
+    nf = length(filtered)
 
-    # Auto-select newest entry when results arrive and nothing selected
-    if n > 0 && m.selected_result == 0
-        m.selected_result = n
+    # Auto-select newest filtered entry when results arrive and nothing selected
+    if nf > 0 && (m.selected_result == 0 || m.selected_result ∉ filtered)
+        m.selected_result = filtered[end]
     end
 
+    # ── Top pane: tool call list (newest first) ──
     items = ListItem[]
-    for i = n:-1:1
-        r = m.tool_results[i]
+    display_sel = 0
+    for (di, ri) in enumerate(Iterators.reverse(filtered))
+        r = m.tool_results[ri]
         ts = Dates.format(r.timestamp, "HH:MM:SS")
         marker = r.success ? "✓" : "✗"
         style = r.success ? tstyle(:success) : tstyle(:error)
-        label = "$ts $marker $(r.tool_name) ($(r.duration_str))"
+        # Show session/REPL name inline when not filtering
+        sess_name = _session_display_name(r.session_key)
+        sess_tag = isempty(filter_key) && !isempty(sess_name) ? " [$sess_name]" : ""
+        label = "$ts $marker $(r.tool_name)$sess_tag ($(r.duration_str))"
         push!(items, ListItem(label, style))
+        if ri == m.selected_result
+            display_sel = di
+        end
     end
 
     if isempty(items)
-        push!(items, ListItem("  No tool calls yet", tstyle(:text_dim)))
+        msg = isempty(filter_key) ? "No tool calls yet" : "No calls for this session"
+        push!(items, ListItem("  $msg", tstyle(:text_dim)))
     end
 
-    # Map selected_result (1-based into tool_results) to display index (reversed)
-    display_sel = n > 0 ? (n - m.selected_result + 1) : 0
+    # Build title with filter indicator
+    filter_label = if isempty(filter_key)
+        "All"
+    else
+        name = _session_display_name(filter_key)
+        isempty(name) ? filter_key : name
+    end
+    list_title =
+        isempty(filter_key) ? " Tool Calls ($nf) [f]ilter " :
+        " Tool Calls ($nf) [f] $filter_label "
 
     render(
         SelectableList(
             items;
             selected = display_sel,
             block = Block(
-                title = " Tool Calls ($n) ",
+                title = list_title,
                 border_style = _pane_border(m, 3, 1),
                 title_style = _pane_title(m, 3, 1),
             ),
@@ -1813,7 +1911,8 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     )
 
     # ── Bottom pane: detail panel ──
-    if n == 0 || m.selected_result < 1 || m.selected_result > n
+    n = length(m.tool_results)
+    if nf == 0 || m.selected_result < 1 || m.selected_result > n
         empty_block = Block(
             title = " Details ",
             border_style = _pane_border(m, 3, 2),
@@ -1834,76 +1933,87 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     end
 
     r = m.tool_results[m.selected_result]
-    detail_block = Block(
-        title = " $(r.tool_name) ",
+
+    # (Re)build the Paragraph when selection or wrap mode changes
+    if m._detail_for_result != m.selected_result || m.detail_paragraph === nothing
+        spans = Span[]
+        _detail_span!(
+            spans,
+            r.success ? "✓ Success" : "✗ Failed",
+            r.success ? :success : :error,
+            "Status:   ",
+        )
+        _detail_span!(spans, r.duration_str, :text, "Duration: ")
+        _detail_span!(spans, Dates.format(r.timestamp, "HH:MM:SS"), :text, "Time:     ")
+        sess_name = _session_display_name(r.session_key)
+        if !isempty(sess_name)
+            _detail_span!(spans, "$sess_name ($(r.session_key))", :secondary, "Session:  ")
+        end
+        push!(spans, Span("\n", tstyle(:text)))
+        push!(spans, Span("── Arguments ──\n", tstyle(:text_dim)))
+        try
+            args_dict = JSON.parse(r.args_json)
+            for (k, v) in args_dict
+                val_str = v isa AbstractString ? repr(v) : JSON.json(v)
+                push!(spans, Span("  $k: $val_str\n", tstyle(:text)))
+            end
+        catch
+            push!(spans, Span("  $(r.args_json)\n", tstyle(:text)))
+        end
+        push!(spans, Span("\n", tstyle(:text)))
+        push!(spans, Span("── Result ──\n", tstyle(:text_dim)))
+        for ln in split(r.result_text, '\n')
+            push!(spans, Span("  " * string(ln) * "\n", tstyle(:text)))
+        end
+        wrap_mode = m.result_word_wrap ? word_wrap : no_wrap
+        m.detail_paragraph = Paragraph(spans; wrap = wrap_mode)
+        m._detail_for_result = m.selected_result
+    end
+
+    # Update wrap mode if toggled without selection change
+    target_wrap = m.result_word_wrap ? word_wrap : no_wrap
+    if m.detail_paragraph.wrap != target_wrap
+        m.detail_paragraph.wrap = target_wrap
+        m.detail_paragraph.scroll_offset = 0
+    end
+
+    # Compute scroll info for title
+    pane_inner_h = panes[2].height - 2
+    pane_inner_w = panes[2].width - 2
+    total_lines = paragraph_line_count(m.detail_paragraph, pane_inner_w)
+    offset = m.detail_paragraph.scroll_offset
+    has_scroll = total_lines > pane_inner_h
+
+    wrap_hint = m.result_word_wrap ? "w:on" : "w:off"
+    detail_title = if has_scroll
+        top_line = offset + 1
+        bot_line = min(offset + pane_inner_h, total_lines)
+        " $(r.tool_name) [$top_line-$bot_line/$total_lines] $wrap_hint "
+    else
+        " $(r.tool_name) $wrap_hint "
+    end
+
+    m.detail_paragraph.block = Block(
+        title = detail_title,
         border_style = _pane_border(m, 3, 2),
         title_style = _pane_title(m, 3, 2),
     )
-    di = render(detail_block, panes[2], buf)
-    di.width < 4 && return
 
-    # Build detail lines
-    lines = String[]
-    push!(lines, "Status:   $(r.success ? "✓ Success" : "✗ Failed")")
-    push!(lines, "Duration: $(r.duration_str)")
-    push!(lines, "Time:     $(Dates.format(r.timestamp, "HH:MM:SS"))")
-    # Show session routing info if present
-    if !isempty(r.session_key) && BRIDGE_CONN_MGR[] !== nothing
-        conn = get_connection_by_key(BRIDGE_CONN_MGR[], r.session_key)
-        session_label =
-            conn !== nothing ? "$(conn.name) ($(short_key(conn)))" : r.session_key
-        push!(lines, "Session:  $session_label")
-    end
-    push!(lines, "")
-    push!(lines, "── Arguments ──")
-    # Pretty-print JSON args (one key per line)
-    try
-        args_dict = JSON.parse(r.args_json)
-        for (k, v) in args_dict
-            val_str = if v isa AbstractString
-                repr(v)
-            else
-                JSON.json(v)
-            end
-            push!(lines, "  $k: $val_str")
-        end
-    catch
-        push!(lines, "  $(r.args_json)")
-    end
-    push!(lines, "")
-    push!(lines, "── Result ──")
-    for ln in split(r.result_text, '\n')
-        push!(lines, "  " * string(ln))
-    end
-
-    # Apply scroll and render
-    max_w = di.width - 2
-    visible = bottom(di) - di.y + 1
-    offset = min(m.result_scroll, max(0, length(lines) - visible))
-    m.result_scroll = offset  # clamp
-
-    y = di.y
-    for i = (offset+1):length(lines)
-        y > bottom(di) && break
-        line = lines[i]
-        if length(line) > max_w && max_w > 1
-            line = first(line, max_w - 1) * "…"
-        end
-        style = if startswith(lines[i], "──")
-            tstyle(:text_dim)
-        elseif startswith(lines[i], "Status:") && r.success
-            tstyle(:success)
-        elseif startswith(lines[i], "Status:")
-            tstyle(:error)
-        else
-            tstyle(:text)
-        end
-        set_string!(buf, di.x + 1, y, line, style)
-        y += 1
-    end
+    render(m.detail_paragraph, panes[2], buf)
 
     # Render the draggable divider between panes
     render_resize_handles!(buf, m.activity_layout)
+end
+
+"""Build a labeled detail line as Spans: label in dim, value in given style."""
+function _detail_span!(
+    spans::Vector{Span},
+    value::String,
+    style_name::Symbol,
+    label::String,
+)
+    push!(spans, Span(label, tstyle(:text_dim)))
+    push!(spans, Span(value * "\n", tstyle(style_name)))
 end
 
 # ── Server Tab ────────────────────────────────────────────────────────────────
@@ -2083,13 +2193,17 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
     _dim_area!(buf, area)
 
     if flow == FLOW_ONBOARD_PATH
+        if m.path_input !== nothing
+            m.path_input.tick = m.tick
+        end
         _render_text_input_modal(
             buf,
             area,
             " Add Project ",
             "Enter project path:",
             m.path_input,
-            "[Enter] confirm  [Esc] cancel",
+            "[Enter] confirm  [Esc] cancel";
+            tick = m.tick,
         )
 
     elseif flow == FLOW_ONBOARD_SCOPE
@@ -2099,7 +2213,8 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
             " Scope ",
             SCOPE_LABELS,
             m.flow_selected,
-            "[↑↓] select  [Enter] confirm  [Esc] cancel",
+            "[↑↓] select  [Enter] confirm  [Esc] cancel";
+            tick = m.tick,
         )
 
     elseif flow == FLOW_ONBOARD_CONFIRM
@@ -2119,7 +2234,7 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
         )
 
     elseif flow == FLOW_ONBOARD_RESULT
-        _render_result_modal(buf, area, m.flow_success, m.flow_message)
+        _render_result_modal(buf, area, m.flow_success, m.flow_message; tick = m.tick)
 
     elseif flow == FLOW_CLIENT_SELECT
         _render_selection_modal(
@@ -2128,7 +2243,8 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
             " Select Client ",
             CLIENT_LABELS,
             m.flow_selected,
-            "[↑↓] select  [Enter] confirm  [Esc] cancel",
+            "[↑↓] select  [Enter] confirm  [Esc] cancel";
+            tick = m.tick,
         )
 
     elseif flow == FLOW_CLIENT_CONFIRM
@@ -2141,13 +2257,25 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
         w = min(44, area.width - 4)
         h = 8
         rect = center(area, w, h)
-        block = Block(
-            title = " $client_label ",
-            border_style = tstyle(:accent, bold = true),
-            title_style = tstyle(:accent, bold = true),
-            box = BOX_HEAVY,
-        )
-        inner = render(block, rect, buf)
+        border_s = tstyle(:accent, bold = true)
+        inner = if animations_enabled()
+            border_shimmer!(buf, rect, border_s.fg, m.tick; box = BOX_HEAVY, intensity = 0.12)
+            if rect.width > 4
+                set_string!(buf, rect.x + 2, rect.y, " $client_label ", border_s)
+            end
+            Rect(rect.x + 1, rect.y + 1, max(0, rect.width - 2), max(0, rect.height - 2))
+        else
+            render(
+                Block(
+                    title = " $client_label ",
+                    border_style = border_s,
+                    title_style = border_s,
+                    box = BOX_HEAVY,
+                ),
+                rect,
+                buf,
+            )
+        end
         if inner.width >= 4
             for row = inner.y:bottom(inner)
                 for col = inner.x:right(inner)
@@ -2176,7 +2304,7 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
         end
 
     elseif flow == FLOW_CLIENT_RESULT
-        _render_result_modal(buf, area, m.flow_success, m.flow_message)
+        _render_result_modal(buf, area, m.flow_success, m.flow_message; tick = m.tick)
     end
 end
 
@@ -2196,19 +2324,32 @@ function _render_text_input_modal(
     title::String,
     prompt::String,
     input,
-    hint::String,
+    hint::String;
+    tick::Union{Int,Nothing} = nothing,
 )
     w = min(60, area.width - 4)
     h = 7
     rect = center(area, w, h)
 
-    block = Block(
-        title = title,
-        border_style = tstyle(:accent, bold = true),
-        title_style = tstyle(:accent, bold = true),
-        box = BOX_HEAVY,
-    )
-    inner = render(block, rect, buf)
+    border_s = tstyle(:accent, bold = true)
+    inner = if tick !== nothing && animations_enabled()
+        border_shimmer!(buf, rect, border_s.fg, tick; box = BOX_HEAVY, intensity = 0.12)
+        if !isempty(title) && rect.width > 4
+            set_string!(buf, rect.x + 2, rect.y, " $title ", tstyle(:accent, bold = true))
+        end
+        Rect(rect.x + 1, rect.y + 1, max(0, rect.width - 2), max(0, rect.height - 2))
+    else
+        render(
+            Block(
+                title = title,
+                border_style = border_s,
+                title_style = border_s,
+                box = BOX_HEAVY,
+            ),
+            rect,
+            buf,
+        )
+    end
     inner.width < 4 && return
 
     # Clear interior
@@ -2235,19 +2376,32 @@ function _render_selection_modal(
     title::String,
     options::Vector{String},
     selected::Int,
-    hint::String,
+    hint::String;
+    tick::Union{Int,Nothing} = nothing,
 )
     w = min(50, area.width - 4)
     h = length(options) + 5
     rect = center(area, w, h)
 
-    block = Block(
-        title = title,
-        border_style = tstyle(:accent, bold = true),
-        title_style = tstyle(:accent, bold = true),
-        box = BOX_HEAVY,
-    )
-    inner = render(block, rect, buf)
+    border_s = tstyle(:accent, bold = true)
+    inner = if tick !== nothing && animations_enabled()
+        border_shimmer!(buf, rect, border_s.fg, tick; box = BOX_HEAVY, intensity = 0.12)
+        if !isempty(title) && rect.width > 4
+            set_string!(buf, rect.x + 2, rect.y, " $title ", tstyle(:accent, bold = true))
+        end
+        Rect(rect.x + 1, rect.y + 1, max(0, rect.width - 2), max(0, rect.height - 2))
+    else
+        render(
+            Block(
+                title = title,
+                border_style = border_s,
+                title_style = border_s,
+                box = BOX_HEAVY,
+            ),
+            rect,
+            buf,
+        )
+    end
     inner.width < 4 && return
 
     # Clear interior
@@ -2272,7 +2426,13 @@ function _render_selection_modal(
     end
 end
 
-function _render_result_modal(buf::Buffer, area::Rect, success::Bool, message::String)
+function _render_result_modal(
+    buf::Buffer,
+    area::Rect,
+    success::Bool,
+    message::String;
+    tick::Union{Int,Nothing} = nothing,
+)
     lines = Base.split(message, '\n')
     w = min(max(maximum(length.(lines); init = 20) + 6, 30), area.width - 4)
     h = length(lines) + 5
@@ -2280,13 +2440,24 @@ function _render_result_modal(buf::Buffer, area::Rect, success::Bool, message::S
 
     border_style = success ? tstyle(:success, bold = true) : tstyle(:error, bold = true)
     title = success ? " Success " : " Error "
-    block = Block(
-        title = title,
-        border_style = border_style,
-        title_style = border_style,
-        box = BOX_HEAVY,
-    )
-    inner = render(block, rect, buf)
+    inner = if tick !== nothing && animations_enabled()
+        border_shimmer!(buf, rect, border_style.fg, tick; box = BOX_HEAVY, intensity = 0.12)
+        if rect.width > 4
+            set_string!(buf, rect.x + 2, rect.y, " $title ", border_style)
+        end
+        Rect(rect.x + 1, rect.y + 1, max(0, rect.width - 2), max(0, rect.height - 2))
+    else
+        render(
+            Block(
+                title = title,
+                border_style = border_style,
+                title_style = border_style,
+                box = BOX_HEAVY,
+            ),
+            rect,
+            buf,
+        )
+    end
     inner.width < 4 && return
 
     # Clear interior
