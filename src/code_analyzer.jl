@@ -5,7 +5,6 @@ Identifies duplicate code, similar patterns, and refactoring opportunities.
 """
 module CodeAnalyzer
 
-using CodeTracking
 
 export analyze_codebase, find_duplicates, find_similar_functions
 

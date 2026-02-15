@@ -276,12 +276,9 @@ function has_startup_script()
     return isfile(get_startup_script_path())
 end
 
-function install_startup_script(; emoticon::String = "🐉")
+function install_startup_script()
     startup_path = get_startup_script_path()
-
-    # Use Generate module's shared function
-    # The startup script will call MCPRepl.start!() which reads the security config at runtime
-    return Generate.create_startup_script(dirname(startup_path), emoticon)
+    return Generate.create_startup_script(dirname(startup_path))
 end
 
 function install_repl_script()
@@ -401,7 +398,7 @@ function prompt_and_setup_vscode_startup(; gentle::Bool = false)
 
         # Install startup script if needed
         if !has_script
-            if install_startup_script(emoticon = emoticon)
+            if install_startup_script()
                 println("   ✅ Created .julia-startup.jl")
             else
                 println("   ❌ Failed to create .julia-startup.jl")
@@ -838,7 +835,7 @@ function setup(; gentle::Bool = false)
     emoticon = gentle ? "🦋" : "🐉"
     if !has_startup_script()
         println("📝 Installing Julia startup script...")
-        if install_startup_script(emoticon = emoticon)
+        if install_startup_script()
             println("   ✅ Created .julia-startup.jl")
         else
             println("   ❌ Failed to create .julia-startup.jl")

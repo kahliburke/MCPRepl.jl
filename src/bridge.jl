@@ -26,14 +26,21 @@ const _STREAM_SOCKET = Ref{Union{ZMQ.Socket,Nothing}}(nothing)  # PUB for stream
 const _SESSION_ID = Ref{String}("")
 const _RUNNING = Ref{Bool}(false)
 const _START_TIME = Ref{Float64}(0.0)
+const _MIRROR_REPL = Ref{Bool}(false)
+const _REVISE_WATCHER_TASK = Ref{Union{Task,Nothing}}(nothing)
 
 # ── Core eval logic ──────────────────────────────────────────────────────────
 # Extracted from MCPRepl's execute_repllike, stripped of MCP-specific concerns
 # (truncation, println stripping, prompt display). Those stay on the server side.
 
-function bridge_eval(code::String; _mod::Module = Main)
+function bridge_eval(code::String; _mod::Module = Main, display_code::String = code)
     lock(BRIDGE_LOCK)
     try
+        if _MIRROR_REPL[]
+            printstyled("\nagent> ", color = :red, bold = true)
+            print(display_code, "\n")
+        end
+
         # Check REPL availability
         repl =
             (isdefined(Base, :active_repl) && Base.active_repl !== nothing) ?
@@ -60,9 +67,12 @@ function bridge_eval(code::String; _mod::Module = Main)
             else
                 result
             end
+            _maybe_echo_result(val)
             return val
         else
-            return _eval_with_capture(expr)
+            val = _eval_with_capture(expr)
+            _maybe_echo_result(val)
+            return val
         end
     catch e
         return (
@@ -77,6 +87,35 @@ function bridge_eval(code::String; _mod::Module = Main)
     end
 end
 
+function _maybe_echo_result(result)
+    _MIRROR_REPL[] || return
+
+    has_exc = hasproperty(result, :exception) && result.exception !== nothing
+    if has_exc
+        printstyled("ERROR: ", color = :red, bold = true)
+        println(string(result.exception))
+        return
+    end
+
+    # stdout/stderr are mirrored live while reading redirected streams.
+    if hasproperty(result, :value_repr)
+        val = string(result.value_repr)
+        isempty(val) || println(val)
+    end
+end
+
+function _set_option!(key::String, value)
+    if key == "mirror_repl"
+        _MIRROR_REPL[] = value === true
+        return (type = :ok, key = key, value = _MIRROR_REPL[])
+    end
+    return (type = :error, message = "unknown option: $key")
+end
+
+function _current_options()
+    return (type = :options, mirror_repl = _MIRROR_REPL[])
+end
+
 function _publish_stream(channel::String, data::String)
     pub = _STREAM_SOCKET[]
     pub === nothing && return
@@ -86,6 +125,25 @@ function _publish_stream(channel::String, data::String)
         send(pub, Message(take!(io)))
     catch
         # Non-critical — subscriber may not be connected
+    end
+end
+
+function _start_revise_watcher()
+    isdefined(Main, :Revise) || return
+    isdefined(Main.Revise, :revision_event) || return
+    _REVISE_WATCHER_TASK[] = @async begin
+        try
+            while _RUNNING[]
+                wait(Main.Revise.revision_event)
+                _RUNNING[] || break
+                Base.reset(Main.Revise.revision_event)
+                project_path = dirname(Base.active_project())
+                _publish_stream("files_changed", project_path)
+            end
+        catch e
+            e isa InterruptException && return
+            @debug "Revise watcher exited" exception = e
+        end
     end
 end
 
@@ -234,8 +292,15 @@ function handle_message(request::NamedTuple)
 
     if msg_type == :eval
         code = get(request, :code, "")
-        result = bridge_eval(code)
+        display_code = get(request, :display_code, code)
+        result = bridge_eval(code; display_code = display_code)
         return result
+    elseif msg_type == :set_option
+        key = string(get(request, :key, ""))
+        value = get(request, :value, nothing)
+        return _set_option!(key, value)
+    elseif msg_type == :get_options
+        return _current_options()
     elseif msg_type == :ping
         return (
             type = :pong,
@@ -322,6 +387,11 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     session_id = string(Base.UUID(rand(UInt128)))
     _SESSION_ID[] = session_id
     _START_TIME[] = time()
+    _MIRROR_REPL[] = try
+        parentmodule(@__MODULE__).get_bridge_mirror_repl_preference()
+    catch
+        false
+    end
 
     # Create ZMQ context and sockets
     ctx = Context()
@@ -367,6 +437,8 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
         end
     end
 
+    _start_revise_watcher()
+
     emoticon = try
         parentmodule(@__MODULE__).load_personality()
     catch
@@ -375,6 +447,9 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     printstyled("  $emoticon MCPRepl bridge "; color = :green, bold = true)
     printstyled("connected"; color = :green)
     printstyled(" ($name)\n"; color = :light_black)
+    if _MIRROR_REPL[]
+        printstyled("  host REPL mirroring enabled\n"; color = :light_black)
+    end
     return session_id
 end
 
@@ -405,6 +480,19 @@ function stop()
 end
 
 function _cleanup()
+    # Stop Revise watcher
+    watcher = _REVISE_WATCHER_TASK[]
+    if watcher !== nothing && !istaskdone(watcher)
+        try
+            # Wake the blocked wait so the task can exit
+            if isdefined(Main, :Revise)
+                Base.notify(Main.Revise.revision_event)
+            end
+        catch
+        end
+    end
+    _REVISE_WATCHER_TASK[] = nothing
+
     # Close REP socket
     socket = _BRIDGE_SOCKET[]
     if socket !== nothing
@@ -440,6 +528,7 @@ function _cleanup()
 
     _BRIDGE_TASK[] = nothing
     _RUNNING[] = false
+    _MIRROR_REPL[] = false
 end
 
 """
@@ -455,6 +544,7 @@ function status()
         println("  Session: $(_SESSION_ID[])")
         println("  Uptime:  $(mins)m")
         println("  PID:     $(getpid())")
+        println("  Mirror:  $(_MIRROR_REPL[])")
     else
         println("Bridge: not running")
     end

@@ -261,6 +261,12 @@ function connect!(mgr::ConnectionManager, conn::REPLConnection)
 
         conn.status = :connected
         conn.last_seen = now()
+        # Apply runtime bridge options from persisted preferences.
+        try
+            set_mirror_repl!(conn, get_bridge_mirror_repl_preference())
+        catch e
+            @debug "Failed to apply mirror_repl preference to bridge" exception = e
+        end
         return true
     catch e
         @debug "Failed to connect to bridge" session_id = conn.session_id exception = e
@@ -317,7 +323,12 @@ end
 
 # ── Eval / Communication ─────────────────────────────────────────────────────
 
-function eval_remote(conn::REPLConnection, code::String; timeout_ms::Int = 30000)
+function eval_remote(
+    conn::REPLConnection,
+    code::String;
+    timeout_ms::Int = 30000,
+    display_code::String = code,
+)
     if conn.status != :connected || conn.req_socket === nothing
         return (
             stdout = "",
@@ -328,7 +339,7 @@ function eval_remote(conn::REPLConnection, code::String; timeout_ms::Int = 30000
         )
     end
 
-    request = (type = :eval, code = code)
+    request = (type = :eval, code = code, display_code = display_code)
     try
         # Serialize and send
         io = IOBuffer()
@@ -363,6 +374,52 @@ function eval_remote(conn::REPLConnection, code::String; timeout_ms::Int = 30000
             exception = "Bridge communication error: $(sprint(showerror, e))",
             backtrace = nothing,
         )
+    end
+end
+
+function get_remote_options(conn::REPLConnection)
+    if conn.status != :connected || conn.req_socket === nothing
+        return nothing
+    end
+    req = (type = :get_options,)
+    try
+        io = IOBuffer()
+        serialize(io, req)
+        send(conn.req_socket, Message(take!(io)))
+        raw = recv(conn.req_socket)
+        response = deserialize(IOBuffer(raw))
+        conn.last_seen = now()
+        return response
+    catch e
+        if e isa ZMQ.TimeoutError
+            _reconnect_req!(conn)
+        else
+            conn.status = :disconnected
+        end
+        return nothing
+    end
+end
+
+function set_mirror_repl!(conn::REPLConnection, enabled::Bool)
+    if conn.status != :connected || conn.req_socket === nothing
+        return false
+    end
+    req = (type = :set_option, key = "mirror_repl", value = enabled)
+    try
+        io = IOBuffer()
+        serialize(io, req)
+        send(conn.req_socket, Message(take!(io)))
+        raw = recv(conn.req_socket)
+        response = deserialize(IOBuffer(raw))
+        conn.last_seen = now()
+        return get(response, :type, :error) == :ok
+    catch e
+        if e isa ZMQ.TimeoutError
+            _reconnect_req!(conn)
+        else
+            conn.status = :disconnected
+        end
+        return false
     end
 end
 

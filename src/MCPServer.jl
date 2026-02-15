@@ -1941,5 +1941,5 @@ function stop_mcp_server(server::MCPServer)
         empty!(STANDALONE_SESSIONS)
     end
 
-    HTTP.close(server.server)
+    HTTP.forceclose(server.server)
 end

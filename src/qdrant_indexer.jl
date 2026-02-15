@@ -236,8 +236,12 @@ Get list of files that need re-indexing.
 """
 function get_stale_files(project_path::String, src_dir::String; extensions::Vector{String}=DEFAULT_INDEX_EXTENSIONS)
     stale = String[]
+    isdir(src_dir) || return stale
 
-    for (root, dirs, files) in walkdir(src_dir)
+    onerr = e -> begin
+        with_index_logger(() -> @warn "Skipping unreadable directory during stale scan" exception = e)
+    end
+    for (root, dirs, files) in walkdir(src_dir; onerror=onerr)
         filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
 
         for file in files
@@ -1019,10 +1023,14 @@ function index_directory(
     silent::Bool=false,
 )
     total_chunks = 0
+    isdir(dir_path) || return total_chunks
 
     # Find all matching files
     files = String[]
-    for (root, dirs, filenames) in walkdir(dir_path)
+    onerr = e -> begin
+        with_index_logger(() -> @warn "Skipping unreadable directory during indexing" exception = e)
+    end
+    for (root, dirs, filenames) in walkdir(dir_path; onerror=onerr)
         # Skip hidden directories and node_modules
         filter!(d -> !startswith(d, ".") && d != "node_modules", dirs)
 
@@ -1285,32 +1293,26 @@ function setup_revise_hook(
         src_dir = project_path
     end
 
-    # Create callback function
-    callback = function (files_changed)
-        for file_path in files_changed
-            # Only index .jl files in our project
-            if endswith(file_path, ".jl") && startswith(file_path, src_dir)
-                with_index_logger(() -> @info "Auto-reindexing changed file" file = basename(file_path))
-                try
-                    reindex_file(
-                        file_path,
-                        col_name;
-                        project_path=project_path,
-                        verbose=false,
-                        silent=true,  # Always silent in background
-                    )
-                catch e
-                    with_index_logger(() -> @warn "Failed to reindex file" file = file_path exception = e)
-                end
-            end
+    # Revise callbacks are zero-arg in current Revise API.
+    # We run sync_index() to incrementally pick up changed/deleted files.
+    callback = function ()
+        try
+            result = sync_index(
+                project_path;
+                collection=col_name,
+                verbose=false,
+                silent=true,  # Always silent in background
+            )
+            with_index_logger(() -> @info "Auto-sync after Revise event" reindexed = result.reindexed deleted = result.deleted chunks = result.chunks)
+        catch e
+            with_index_logger(() -> @warn "Failed to sync index after Revise event" exception = e)
         end
     end
 
     # Register with Revise
-    # Note: Revise.add_callback expects (callback, files) but we want all files
-    # We'll use the revision callback approach
+    # Watch project source directory; callback is invoked by Revise with no args.
     try
-        Main.Revise.add_callback(callback)
+        Main.Revise.add_callback(callback, [src_dir])
         msg = "Revise hook installed for automatic index updates"
         !silent && @info msg
         with_index_logger(() -> @info msg collection = col_name)
@@ -1326,6 +1328,103 @@ end
 # Global refs for the scheduler
 const INDEX_SYNC_TASK = Ref{Union{Task,Nothing}}(nothing)
 const INDEX_SYNC_STOP = Ref{Bool}(false)
+const REVISE_EVENT_TASK = Ref{Union{Task,Nothing}}(nothing)
+const REVISE_EVENT_STOP = Ref{Bool}(false)
+const REVISE_EVENT_CHANGES = Ref{Int}(0)
+
+"""
+    start_revise_event_watcher(; project_path::String=pwd(), collection::Union{String,Nothing}=nothing, silent::Bool=false)
+
+Start an event-driven Revise watcher that waits on `Revise.revision_event`,
+applies revisions, and syncs the Qdrant index after each change.
+"""
+function start_revise_event_watcher(;
+    project_path::String=pwd(),
+    collection::Union{String,Nothing}=nothing,
+    silent::Bool=false,
+)
+    if !isdefined(Main, :Revise)
+        msg = "Revise.jl not loaded - event watcher disabled"
+        !silent && @warn msg
+        with_index_logger(() -> @warn msg)
+        return nothing
+    end
+
+    if REVISE_EVENT_TASK[] !== nothing && !istaskdone(REVISE_EVENT_TASK[])
+        msg = "Revise event watcher already running"
+        !silent && @warn msg
+        with_index_logger(() -> @warn msg)
+        return REVISE_EVENT_TASK[]
+    end
+
+    col_name = String(
+        collection === nothing ? get_project_collection_name(project_path) : collection,
+    )
+    REVISE_EVENT_STOP[] = false
+    REVISE_EVENT_CHANGES[] = 0
+
+    task = @async begin
+        while !REVISE_EVENT_STOP[]
+            try
+                # Wait for filesystem change notification (Revise-level signal)
+                wait(Main.Revise.revision_event)
+                REVISE_EVENT_STOP[] && break
+                Base.reset(Main.Revise.revision_event)
+
+                # Apply pending revisions before syncing index
+                Main.Revise.revise()
+
+                REVISE_EVENT_CHANGES[] += 1
+                result = sync_index(
+                    project_path;
+                    collection=col_name,
+                    verbose=false,
+                    silent=true,
+                )
+                with_index_logger(() -> @info "Revise applied changes" total_changes = REVISE_EVENT_CHANGES[] reindexed = result.reindexed deleted = result.deleted chunks = result.chunks)
+            catch e
+                if e isa InterruptException || REVISE_EVENT_STOP[]
+                    break
+                end
+                with_index_logger(() -> @error "Revise watcher error" exception = (e, catch_backtrace()))
+                sleep(1)  # Brief back-off on error
+            end
+        end
+    end
+
+    REVISE_EVENT_TASK[] = task
+    msg = "Revise event watcher started"
+    !silent && @info msg collection = col_name
+    with_index_logger(() -> @info msg collection = col_name)
+    return task
+end
+
+"""
+    stop_revise_event_watcher(; silent::Bool=false)
+
+Stop the event-driven Revise watcher if running.
+"""
+function stop_revise_event_watcher(; silent::Bool=false)
+    task = REVISE_EVENT_TASK[]
+    if task === nothing || istaskdone(task)
+        return false
+    end
+    REVISE_EVENT_STOP[] = true
+    try
+        # Wake wait(revision_event) so the task can exit quickly.
+        Base.notify(Main.Revise.revision_event)
+    catch
+    end
+    try
+        wait(task)
+    catch
+    end
+    REVISE_EVENT_TASK[] = nothing
+    msg = "Revise event watcher stopped"
+    !silent && @info msg
+    with_index_logger(() -> @info msg)
+    return true
+end
 
 """
     start_index_sync_scheduler(; project_path::String=pwd(), collection::Union{String,Nothing}=nothing, interval_seconds::Int=300, initial_delay::Int=10, silent::Bool=false)

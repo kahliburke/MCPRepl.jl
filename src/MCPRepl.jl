@@ -11,12 +11,12 @@ using SHA
 using Dates
 using Coverage
 using ReTest
-using CodeTracking
 using Pkg
 using Sockets
 using TOML
 using LoggingExtras
 using Serialization
+using Preferences
 using ZMQ
 using Tachikoma
 
@@ -30,6 +30,7 @@ include("proxy.jl")
 include("qdrant_client.jl")
 include("tools.jl")
 include("Generate.jl")
+include("bridge_prefs.jl")
 include("bridge.jl")
 include("bridge_client.jl")
 include("tui.jl")
@@ -45,6 +46,7 @@ export tui  # TUI server entry point
 export setup_wizard_tui  # Animated security setup wizard
 export Proxy  # Proxy server module
 export MCPReplBridge  # Eval bridge module
+export get_bridge_mirror_repl_preference, set_bridge_mirror_repl_preference!
 # export Generate  # Project template generator module
 # export Dashboard
 # export Database
@@ -1041,7 +1043,7 @@ function execute_via_bridge(
         cleaned_code = cleaned_code * ";"
     end
 
-    response = eval_remote(conn, cleaned_code)
+    response = eval_remote(conn, cleaned_code; display_code = code)
 
     # Format response matching execute_repllike output format
     captured = ""
@@ -1871,27 +1873,8 @@ function start!(;
         atreplinit(set_prefix!)
     end
 
-    # Start automatic background indexing (silent, non-blocking)
-    try
-        @async begin
-            # Setup logging first
-            setup_index_logging(workspace_dir)
-
-            # Start background indexing with dual monitoring:
-            # 1. Revise hook for immediate reindexing on file save
-            # 2. Periodic scheduler for catching missed changes
-            setup_revise_hook(workspace_dir; silent = true)
-            start_index_sync_scheduler(
-                project_path = workspace_dir,
-                interval_seconds = 300,  # 5 minutes
-                initial_delay = 10,  # Wait 10 seconds after startup
-                silent = true,
-            )
-        end
-    catch e
-        # Never let indexing failure break server startup
-        @debug "Failed to start background indexing (non-fatal)" exception = e
-    end
+    # TODO: rethink background indexing — the TUI shouldn't watch over bridged sessions.
+    # Indexing should be driven by the bridge sessions themselves.
 
     nothing
 end

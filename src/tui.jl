@@ -39,6 +39,51 @@ end
 const _TUI_LOG_BUFFER = ServerLogEntry[]
 const _TUI_LOG_LOCK = ReentrantLock()
 const _TUI_OLD_LOGGER = Ref{Any}(nothing)
+const _TUI_LOG_FILE = Ref{Union{IOStream,Nothing}}(nothing)
+
+# stderr capture — prevent background code from corrupting the terminal
+const _TUI_ORIG_STDERR = Ref{Any}(nothing)
+const _TUI_STDERR_TASK = Ref{Union{Task,Nothing}}(nothing)
+const _TUI_STDERR_RUNNING = Ref{Bool}(false)
+
+const _TUI_LOG_PATH = joinpath(homedir(), ".cache", "mcprepl", "server.log")
+
+function _open_log_file!()
+    try
+        mkpath(dirname(_TUI_LOG_PATH))
+        _TUI_LOG_FILE[] = open(_TUI_LOG_PATH, "a")
+    catch
+        _TUI_LOG_FILE[] = nothing
+    end
+end
+
+function _close_log_file!()
+    io = _TUI_LOG_FILE[]
+    _TUI_LOG_FILE[] = nothing
+    io === nothing && return
+    try
+        close(io)
+    catch
+    end
+end
+
+function _write_log_entry(ts::DateTime, level::Symbol, msg::String)
+    io = _TUI_LOG_FILE[]
+    io === nothing && return
+    try
+        write(
+            io,
+            Dates.format(ts, "yyyy-mm-dd HH:MM:SS"),
+            " [",
+            uppercase(string(level)),
+            "] ",
+            msg,
+            "\n",
+        )
+        flush(io)
+    catch
+    end
+end
 
 struct TUILogger <: Logging.AbstractLogger end
 
@@ -69,12 +114,14 @@ function Logging.handle_message(
         parts = String[string(k, "=", repr(v)) for (k, v) in kwargs]
         msg *= "  " * join(parts, " ")
     end
+    ts = now()
     lock(_TUI_LOG_LOCK) do
-        push!(_TUI_LOG_BUFFER, ServerLogEntry(now(), lvl, msg))
+        push!(_TUI_LOG_BUFFER, ServerLogEntry(ts, lvl, msg))
         while length(_TUI_LOG_BUFFER) > 500
             popfirst!(_TUI_LOG_BUFFER)
         end
     end
+    _write_log_entry(ts, lvl, msg)
     return nothing
 end
 
@@ -89,9 +136,71 @@ function _drain_log_buffer!(dest::Vector{ServerLogEntry})
 end
 
 function _push_log!(level::Symbol, message::String)
+    ts = now()
     lock(_TUI_LOG_LOCK) do
-        push!(_TUI_LOG_BUFFER, ServerLogEntry(now(), level, message))
+        push!(_TUI_LOG_BUFFER, ServerLogEntry(ts, level, message))
     end
+    _write_log_entry(ts, level, message)
+end
+
+# ── stderr capture ───────────────────────────────────────────────────────────
+# Redirect stderr to a pipe so background code (HTTP.jl, etc.) can't write
+# raw bytes to the terminal and corrupt the TUI display.
+
+const _TUI_STDERR_WR = Ref{Any}(nothing)
+
+function _start_stderr_capture!()
+    _TUI_STDERR_RUNNING[] = true
+    _TUI_ORIG_STDERR[] = stderr
+    rd, wr = redirect_stderr()
+    _TUI_STDERR_WR[] = wr
+    _TUI_STDERR_TASK[] = @async begin
+        try
+            while _TUI_STDERR_RUNNING[]
+                line = readline(rd; keep = false)
+                isempty(line) && continue
+                _push_log!(:warn, "stderr: $line")
+            end
+        catch e
+            e isa EOFError && return
+            e isa InterruptException && return
+        finally
+            try
+                close(rd)
+            catch
+            end
+        end
+    end
+end
+
+function _stop_stderr_capture!()
+    _TUI_STDERR_RUNNING[] = false
+    # Restore original stderr first
+    orig = _TUI_ORIG_STDERR[]
+    if orig !== nothing
+        try
+            redirect_stderr(orig)
+        catch
+        end
+        _TUI_ORIG_STDERR[] = nothing
+    end
+    # Close the pipe write end so the reader task gets EOF
+    wr = _TUI_STDERR_WR[]
+    if wr !== nothing
+        try
+            close(wr)
+        catch
+        end
+        _TUI_STDERR_WR[] = nothing
+    end
+    task = _TUI_STDERR_TASK[]
+    if task !== nothing && !istaskdone(task)
+        try
+            wait(task)
+        catch
+        end
+    end
+    _TUI_STDERR_TASK[] = nothing
 end
 
 # ── Activity Feed ─────────────────────────────────────────────────────────────
@@ -190,15 +299,6 @@ struct ToolCallRecord
     success::Bool
 end
 
-struct AgentInfo
-    session_id::String
-    client_name::String
-    protocol_version::String
-    connected_at::DateTime
-    tool_calls::Int
-    bound_repl::String       # name of the REPL this agent routes to
-end
-
 # Modal flow states
 @enum ConfigFlow begin
     FLOW_IDLE
@@ -220,16 +320,23 @@ end
     shutting_down::Bool = false
     tick::Int = 0
 
-    # Tabs: 1=Server, 2=Sessions, 3=Agents, 4=Activity, 5=Config
+    # Tabs: 1=Server, 2=Sessions, 3=Activity, 4=Config
     active_tab::Int = 1
 
     # REPL connections (managed by ConnectionManager)
     conn_mgr::Union{ConnectionManager,Nothing} = nothing
     selected_connection::Int = 1
 
-    # Agent sessions
-    agents::Vector{AgentInfo} = AgentInfo[]
-    selected_agent::Int = 1
+    # Session tab layouts (resizable)
+    sessions_layout::ResizableLayout = ResizableLayout(Horizontal, [Percent(45), Fill()])
+    sessions_left_layout::ResizableLayout = ResizableLayout(Vertical, [Fill(), Percent(40)])
+
+    # Server tab layout (resizable)
+    server_layout::ResizableLayout = ResizableLayout(Vertical, [Fixed(9), Fill()])
+
+    # Config tab layouts (resizable)
+    config_layout::ResizableLayout = ResizableLayout(Horizontal, [Percent(50), Fill()])
+    config_left_layout::ResizableLayout = ResizableLayout(Vertical, [Fixed(8), Fill()])
 
     # Activity feed — unified timeline of tool calls + streaming output
     activity_feed::Vector{ActivityEvent} = ActivityEvent[]
@@ -265,6 +372,7 @@ end
 
     # Client config state
     client_target::Symbol = :claude
+    bridge_mirror_repl::Bool = false
 
     # Flow result
     flow_message::String = ""
@@ -272,6 +380,217 @@ end
 
     # Client detection (populated async on tab switch)
     client_statuses::Vector{Pair{String,Bool}} = Pair{String,Bool}[]
+
+    # Background reindex: project_path → timestamp of last files_changed notification
+    _reindex_pending::Dict{String,Float64} = Dict{String,Float64}()
+
+    # Server log scroll pane
+    log_pane::Union{ScrollPane,Nothing} = nothing
+    log_word_wrap::Bool = false
+    _log_pane_synced::Int = 0   # number of server_log entries already pushed to pane
+
+    # Pane focus — which pane has keyboard focus on each tab
+    # Tab 1: 1=status, 2=log | Tab 2: 1=bridges, 2=agents, 3=detail
+    # Tab 3: 1=list, 2=detail | Tab 4: 1=server, 2=actions, 3=clients
+    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1)
+end
+
+# Number of focusable panes per tab
+const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3)
+
+"""Return the border style for a pane — highlighted if focused."""
+function _pane_border(m::MCPReplModel, tab::Int, pane::Int)
+    focused = get(m.focused_pane, tab, 1) == pane
+    focused ? tstyle(:accent) : tstyle(:border)
+end
+
+"""Return the title style for a pane — highlighted if focused."""
+function _pane_title(m::MCPReplModel, tab::Int, pane::Int)
+    focused = get(m.focused_pane, tab, 1) == pane
+    focused ? tstyle(:accent, bold = true) : tstyle(:text_dim)
+end
+
+# ── Server Log Pane Helpers ───────────────────────────────────────────────────
+
+function _log_entry_spans(entry::ServerLogEntry)
+    time_str = Dates.format(entry.timestamp, "HH:MM:SS")
+    level_str = rpad(string(entry.level), 5)
+    level_style = if entry.level == :error
+        tstyle(:error)
+    elseif entry.level == :warn
+        tstyle(:warning)
+    else
+        tstyle(:text_dim)
+    end
+    return Span[
+        Span(time_str * " ", tstyle(:text_dim)),
+        Span(level_str * " ", level_style),
+        Span(entry.message, tstyle(:text)),
+    ]
+end
+
+"""Build wrapped span lines for a single log entry. Prefix is "HH:MM:SS level " (15 chars)."""
+function _log_entry_spans_wrapped(entry::ServerLogEntry, width::Int)
+    time_str = Dates.format(entry.timestamp, "HH:MM:SS")
+    level_str = rpad(string(entry.level), 5)
+    level_style = if entry.level == :error
+        tstyle(:error)
+    elseif entry.level == :warn
+        tstyle(:warning)
+    else
+        tstyle(:text_dim)
+    end
+    prefix_len = 15  # "HH:MM:SS level "
+    msg = entry.message
+    msg_width = max(10, width - prefix_len)
+    lines = Vector{Span}[]
+    if length(msg) <= msg_width
+        push!(
+            lines,
+            Span[
+                Span(time_str * " ", tstyle(:text_dim)),
+                Span(level_str * " ", level_style),
+                Span(msg, tstyle(:text)),
+            ],
+        )
+    else
+        # First line with prefix
+        push!(
+            lines,
+            Span[
+                Span(time_str * " ", tstyle(:text_dim)),
+                Span(level_str * " ", level_style),
+                Span(first(msg, msg_width), tstyle(:text)),
+            ],
+        )
+        # Continuation lines indented to align with message
+        rest = SubString(msg, nextind(msg, 0, msg_width + 1))
+        indent = " "^prefix_len
+        while !isempty(rest)
+            chunk_len = min(length(rest), msg_width)
+            push!(
+                lines,
+                Span[
+                    Span(indent, tstyle(:text_dim)),
+                    Span(first(rest, chunk_len), tstyle(:text)),
+                ],
+            )
+            if chunk_len >= length(rest)
+                break
+            end
+            rest = SubString(rest, nextind(rest, 0, chunk_len + 1))
+        end
+    end
+    return lines
+end
+
+function _ensure_log_pane!(m::MCPReplModel)
+    if m.log_pane === nothing
+        m.log_pane = ScrollPane(
+            Vector{Span}[];
+            following = true,
+            reverse = false,
+            block = nothing,
+            show_scrollbar = true,
+        )
+        m._log_pane_synced = 0
+    end
+end
+
+"""Sync new server_log entries into the ScrollPane."""
+function _sync_log_pane!(m::MCPReplModel, width::Int = 0)
+    _ensure_log_pane!(m)
+    pane = m.log_pane::ScrollPane
+    n = length(m.server_log)
+    if m._log_pane_synced > n
+        # Log was truncated (ring buffer popfirst!), rebuild
+        m._log_pane_synced = 0
+        pane.content = Vector{Span}[]
+    end
+    for i = (m._log_pane_synced+1):n
+        entry = m.server_log[i]
+        if m.log_word_wrap && width > 0
+            for line in _log_entry_spans_wrapped(entry, width)
+                push_line!(pane, line)
+            end
+        else
+            push_line!(pane, _log_entry_spans(entry))
+        end
+    end
+    m._log_pane_synced = n
+end
+
+"""Rebuild the entire pane content (e.g. after toggling word wrap)."""
+function _rebuild_log_pane!(m::MCPReplModel, width::Int = 0)
+    _ensure_log_pane!(m)
+    pane = m.log_pane::ScrollPane
+    lines = Vector{Span}[]
+    for entry in m.server_log
+        if m.log_word_wrap && width > 0
+            append!(lines, _log_entry_spans_wrapped(entry, width))
+        else
+            push!(lines, _log_entry_spans(entry))
+        end
+    end
+    set_content!(pane, lines)
+    m._log_pane_synced = length(m.server_log)
+end
+
+# ── Background Reindex (bridge → TUI files_changed notifications) ────────────
+
+const REINDEX_DEBOUNCE_SECONDS = 2.0
+
+"""
+    _process_pending_reindexes!(m)
+
+Check `_reindex_pending` for projects whose last notification is older than the
+debounce window, and kick off a background sync for each.
+"""
+function _process_pending_reindexes!(m::MCPReplModel)
+    isempty(m._reindex_pending) && return
+    now_t = time()
+    ready = String[]
+    for (path, ts) in m._reindex_pending
+        if now_t - ts >= REINDEX_DEBOUNCE_SECONDS
+            push!(ready, path)
+        end
+    end
+    for path in ready
+        delete!(m._reindex_pending, path)
+        _trigger_background_reindex(path)
+    end
+end
+
+"""
+    _trigger_background_reindex(project_path)
+
+Async reindex: check that a Qdrant collection exists for this project, then
+run `sync_index` silently. Results are logged to the TUI server log.
+"""
+function _trigger_background_reindex(project_path::String)
+    @async Logging.with_logger(TUILogger()) do
+        try
+            col_name = String(get_project_collection_name(project_path))
+            collections = QdrantClient.list_collections()
+            if !(col_name in collections)
+                return  # project not indexed — nothing to sync
+            end
+            result = sync_index(
+                project_path;
+                collection = col_name,
+                verbose = false,
+                silent = true,
+            )
+            if result.reindexed > 0 || result.deleted > 0
+                _push_log!(
+                    :info,
+                    "Auto-reindex ($col_name): $(result.reindexed) reindexed, $(result.deleted) deleted, $(result.chunks) chunks",
+                )
+            end
+        catch e
+            _push_log!(:warn, "Auto-reindex failed: $(sprint(showerror, e))")
+        end
+    end
 end
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
@@ -279,14 +598,21 @@ end
 function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
     set_theme!(KOKAKU)
 
+    # Open persistent log file
+    _open_log_file!()
+
     # Redirect logging into the TUI ring buffer so @info/@warn from the MCP
     # server, HTTP.jl, etc. show up in the Server tab instead of on stderr.
     _TUI_OLD_LOGGER[] = global_logger()
     global_logger(TUILogger())
 
+    # Capture stderr so background code can't corrupt the terminal
+    _start_stderr_capture!()
+
     # Start connection manager (discovers REPL bridges)
     m.conn_mgr = ConnectionManager()
     start!(m.conn_mgr)
+    m.bridge_mirror_repl = get_bridge_mirror_repl_preference()
 
     # Enable bridge mode — tool evals route to connected REPLs
     BRIDGE_MODE[] = true
@@ -318,11 +644,17 @@ function Tachikoma.cleanup!(m::MCPReplModel)
         stop!(m.conn_mgr)
     end
 
+    # Restore stderr before logger so logging can write to stderr again
+    _stop_stderr_capture!()
+
     # Restore original logger so post-TUI Julia session isn't silenced
     if _TUI_OLD_LOGGER[] !== nothing
         global_logger(_TUI_OLD_LOGGER[])
         _TUI_OLD_LOGGER[] = nothing
     end
+
+    # Close log file
+    _close_log_file!()
 end
 
 Tachikoma.should_quit(m::MCPReplModel) = m.quit
@@ -330,9 +662,18 @@ Tachikoma.should_quit(m::MCPReplModel) = m.quit
 # ── Update ────────────────────────────────────────────────────────────────────
 
 function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
-    # Route mouse events to resizable layouts
-    if m.active_tab == 4
+    # Route mouse events to scroll panes and resizable layouts
+    if m.active_tab == 1
+        handle_resize!(m.server_layout, evt)
+        m.log_pane !== nothing && handle_mouse!(m.log_pane, evt)
+    elseif m.active_tab == 2
+        handle_resize!(m.sessions_layout, evt)
+        handle_resize!(m.sessions_left_layout, evt)
+    elseif m.active_tab == 3
         handle_resize!(m.activity_layout, evt)
+    elseif m.active_tab == 4
+        handle_resize!(m.config_layout, evt)
+        handle_resize!(m.config_left_layout, evt)
     end
 end
 
@@ -349,49 +690,93 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
 
     if evt.key == :char
         evt.char == 'q' && (m.shutting_down = true; return)
-        evt.char == '1' && _switch_tab!(m, 1)
-        evt.char == '2' && _switch_tab!(m, 2)
-        evt.char == '3' && _switch_tab!(m, 3)
-        evt.char == '4' && _switch_tab!(m, 4)
-        evt.char == '5' && _switch_tab!(m, 5)
-        # Config tab actions (tab 5)
-        if m.active_tab == 5
-            evt.char == 'a' && begin_onboarding!(m)
-            evt.char == 'c' && begin_client_config!(m)
+        # Tab switching: number keys + letter shortcuts
+        evt.char == '1' && (_switch_tab!(m, 1); return)
+        evt.char == '2' && (_switch_tab!(m, 2); return)
+        evt.char == '3' && (_switch_tab!(m, 3); return)
+        evt.char == '4' && (_switch_tab!(m, 4); return)
+        evt.char == 's' && (_switch_tab!(m, 1); return)
+        evt.char == 'e' && (_switch_tab!(m, 2); return)
+        evt.char == 'a' && (_switch_tab!(m, 3); return)
+        evt.char == 'c' && (_switch_tab!(m, 4); return)
+        # Server tab actions (tab 1)
+        if m.active_tab == 1 && evt.char == 'w'
+            m.log_word_wrap = !m.log_word_wrap
+            _rebuild_log_pane!(m)
+            return
+        end
+        # Config tab actions (tab 4)
+        if m.active_tab == 4
+            evt.char == 'o' && begin_onboarding!(m)
+            evt.char == 'i' && begin_client_config!(m)
+            evt.char == 'm' && toggle_bridge_mirror_repl!(m)
         end
     elseif evt.key == :tab
-        _switch_tab!(m, mod1(m.active_tab + 1, 5))
-    elseif evt.key == :up
-        if m.active_tab == 2
-            m.selected_connection = max(1, m.selected_connection - 1)
-        elseif m.active_tab == 3
-            m.selected_agent = max(1, m.selected_agent - 1)
-        elseif m.active_tab == 4 && !isempty(m.tool_results)
-            # List is newest-first; up = toward newer = increase selected_result
-            m.selected_result = min(length(m.tool_results), m.selected_result + 1)
-            m.result_scroll = 0
+        # Cycle focus between panes within the current tab
+        tab = m.active_tab
+        n_panes = get(_PANE_COUNTS, tab, 0)
+        if n_panes > 1
+            cur = get(m.focused_pane, tab, 1)
+            m.focused_pane[tab] = mod1(cur + 1, n_panes)
         end
-    elseif evt.key == :down
-        if m.active_tab == 2 && m.conn_mgr !== nothing
-            n = length(m.conn_mgr.connections)
-            m.selected_connection = min(max(1, n), m.selected_connection + 1)
-        elseif m.active_tab == 3
-            m.selected_agent = min(max(1, length(m.agents)), m.selected_agent + 1)
-        elseif m.active_tab == 4 && !isempty(m.tool_results)
-            # List is newest-first; down = toward older = decrease selected_result
-            m.selected_result = max(1, m.selected_result - 1)
-            m.result_scroll = 0
+        return
+    elseif evt.key == :backtab  # shift-tab: cycle backwards
+        tab = m.active_tab
+        n_panes = get(_PANE_COUNTS, tab, 0)
+        if n_panes > 1
+            cur = get(m.focused_pane, tab, 1)
+            m.focused_pane[tab] = mod1(cur - 1, n_panes)
         end
-    elseif evt.key == :pageup
-        if m.active_tab == 4
-            m.result_scroll = max(0, m.result_scroll - 5)
-        end
-    elseif evt.key == :pagedown
-        if m.active_tab == 4
-            m.result_scroll += 5
-        end
+        return
+    elseif evt.key in (:up, :down, :pageup, :pagedown)
+        _handle_scroll!(m, evt)
+        return
     end
     evt.key == :escape && (m.shutting_down = true)
+end
+
+function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
+    tab = m.active_tab
+    fp = get(m.focused_pane, tab, 1)
+
+    if tab == 1
+        # Pane 2 = log (only scrollable pane on server tab)
+        if fp == 2 && m.log_pane !== nothing
+            handle_key!(m.log_pane, evt)
+        end
+    elseif tab == 2
+        if fp == 1
+            # Bridges list
+            if evt.key == :up
+                m.selected_connection = max(1, m.selected_connection - 1)
+            elseif evt.key == :down && m.conn_mgr !== nothing
+                n = length(m.conn_mgr.connections)
+                m.selected_connection = min(max(1, n), m.selected_connection + 1)
+            end
+            # Pane 2 (agents) and 3 (detail) — no scrolling yet
+        end
+    elseif tab == 3
+        if fp == 1 && !isempty(m.tool_results)
+            # Tool call list
+            if evt.key == :up
+                m.selected_result = min(length(m.tool_results), m.selected_result + 1)
+            elseif evt.key == :down
+                m.selected_result = max(1, m.selected_result - 1)
+            end
+            m.result_scroll = 0
+        elseif fp == 2
+            # Detail panel scroll
+            if evt.key == :up
+                m.result_scroll = max(0, m.result_scroll - 1)
+            elseif evt.key == :down
+                m.result_scroll += 1
+            elseif evt.key == :pageup
+                m.result_scroll = max(0, m.result_scroll - 5)
+            elseif evt.key == :pagedown
+                m.result_scroll += 5
+            end
+        end
+    end
 end
 
 # ── Tab switching ────────────────────────────────────────────────────────────
@@ -399,7 +784,7 @@ end
 function _switch_tab!(m::MCPReplModel, tab::Int)
     m.active_tab = tab
     # Trigger async client detection when entering the Config tab
-    if tab == 5
+    if tab == 4
         _refresh_client_status_async!(m)
     end
 end
@@ -516,15 +901,8 @@ function execute_onboarding!(m::MCPReplModel)
             isdir(path) || mkpath(path)
             projname = basename(path)
             startup_file = joinpath(path, ".julia-startup.jl")
-            content = """
-            # MCPRepl Bridge — auto-connect this REPL to the TUI server
-            try
-                using MCPRepl
-                MCPReplBridge.serve(name=$(repr(projname)))
-            catch e
-                @warn "MCPRepl bridge failed to start" exception=e
-            end
-            """
+            content =
+                Generate.render_template("julia-startup.jl"; name_expr = repr(projname))
             write(startup_file, content)
             m.flow_message = "Created $(_short_path(startup_file))\n\nAdd to your project's startup:\n  include(\".julia-startup.jl\")"
             m.flow_success = true
@@ -540,17 +918,10 @@ function execute_onboarding!(m::MCPReplModel)
                 m.flow_message = "Bridge snippet already in\n$(_short_path(startup_file))"
                 m.flow_success = true
             else
-                block = """
-
-                $marker
-                try
-                    using MCPRepl
-                    projname = basename(something(Base.active_project(), "julia"))
-                    MCPReplBridge.serve(name=projname)
-                catch e
-                    @warn "MCPRepl bridge failed to start" exception=e
-                end
-                """
+                name_expr = "basename(something(Base.active_project(), \"julia\"))"
+                block =
+                    "\n" *
+                    Generate.render_template("julia-startup.jl"; name_expr = name_expr)
                 open(startup_file, "a") do io
                     write(io, block)
                 end
@@ -600,6 +971,27 @@ function execute_client_config!(m::MCPReplModel)
     m.config_flow = FLOW_CLIENT_RESULT
 end
 
+function toggle_bridge_mirror_repl!(m::MCPReplModel)
+    new_value = !m.bridge_mirror_repl
+    m.bridge_mirror_repl = set_bridge_mirror_repl_preference!(new_value)
+
+    applied = 0
+    total = 0
+    if m.conn_mgr !== nothing
+        conns = connected_sessions(m.conn_mgr)
+        total = length(conns)
+        for conn in conns
+            set_mirror_repl!(conn, m.bridge_mirror_repl) && (applied += 1)
+        end
+    end
+
+    state = m.bridge_mirror_repl ? "enabled" : "disabled"
+    _push_log!(
+        :info,
+        "Host REPL mirroring $state (applied to $applied/$total connected bridge sessions)",
+    )
+end
+
 function remove_client_config!(m::MCPReplModel)
     try
         target = m.client_target
@@ -628,7 +1020,7 @@ end
 function _remove_claude(m::MCPReplModel)
     try
         read(
-            pipeline(`claude mcp remove julia-repl --scope user`; stderr = devnull),
+            pipeline(`claude mcp remove --scope user julia-repl`; stderr = devnull),
             String,
         )
     catch
@@ -728,17 +1120,17 @@ function _install_claude(m::MCPReplModel, port::Int, api_key)
     url = "http://localhost:$port/mcp"
     try
         read(
-            pipeline(`claude mcp remove julia-repl --scope user`; stderr = devnull),
+            pipeline(`claude mcp remove --scope user julia-repl`; stderr = devnull),
             String,
         )
     catch
     end
-    args = `claude mcp add julia-repl --transport http --url $url --scope user`
+    args = `claude mcp add --transport http --scope user julia-repl $url`
     if api_key !== nothing
         args = `$args -H "Authorization: Bearer $api_key"`
     end
-    read(pipeline(args; stderr = devnull), String)
-    m.flow_message = "Added julia-repl to Claude Code\n(~/.claude/settings.json)"
+    read(pipeline(args; stderr = stderr), String)
+    m.flow_message = "Added julia-repl to Claude Code\n(scope: user)"
     m.flow_success = true
 end
 
@@ -1082,15 +1474,20 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     # Drain streaming REPL output from bridge SUB sockets
     if m.conn_mgr !== nothing
         for msg in drain_stream_messages!(m.conn_mgr)
-            kind = msg.channel == "stderr" ? :stderr : :stdout
-            push!(
-                m.activity_feed,
-                ActivityEvent(now(), kind, "", msg.session_name, msg.data, true),
-            )
+            if msg.channel == "files_changed"
+                m._reindex_pending[msg.data] = time()
+            else
+                kind = msg.channel == "stderr" ? :stderr : :stdout
+                push!(
+                    m.activity_feed,
+                    ActivityEvent(now(), kind, "", msg.session_name, msg.data, true),
+                )
+            end
         end
         while length(m.activity_feed) > 2000
             popfirst!(m.activity_feed)
         end
+        _process_pending_reindexes!(m)
     end
 
     # Reap stale MCP agent sessions every ~30s (450 ticks at 15fps).
@@ -1116,8 +1513,6 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             )
             m.server_running = true
             _push_log!(:info, "MCP server listening on port $(m.server_port)")
-            # Re-hide cursor in case HTTP.jl or a dependency showed it
-            print(stdout, "\e[?25l")
         catch e
             m.server_running = false
             _push_log!(:error, "Server failed: $(sprint(showerror, e))")
@@ -1145,10 +1540,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
 
     # ── Tab bar ──
     render(
-        TabBar(
-            ["Server", "Sessions", "Agents", "Activity", "Config"];
-            active = m.active_tab,
-        ),
+        TabBar(["Server", "Sessions", "Activity", "Config"]; active = m.active_tab),
         tab_area,
         buf,
     )
@@ -1159,8 +1551,6 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     elseif m.active_tab == 2
         view_sessions(m, content_area, buf)
     elseif m.active_tab == 3
-        view_agents(m, content_area, buf)
-    elseif m.active_tab == 4
         view_activity(m, content_area, buf)
     else
         view_config(m, content_area, buf)
@@ -1200,7 +1590,10 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             ],
             right = [
                 Span("$(uptime) ", tstyle(:text_dim)),
-                Span(" [tab]nav [q]quit ", tstyle(:text_dim)),
+                Span(
+                    " [s]erver s[e]ssions [a]ctivity [c]onfig  tab:focus [q]uit ",
+                    tstyle(:text_dim),
+                ),
             ],
         ),
         status_area,
@@ -1208,13 +1601,25 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     )
 end
 
-# ── Sessions Tab ──────────────────────────────────────────────────────────────
+# ── Sessions Tab (REPL bridges + MCP agents) ────────────────────────────────
 
 function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
-    cols = tsplit(Layout(Horizontal, [Percent(45), Fill()]), area)
+    cols = split_layout(m.sessions_layout, area)
     length(cols) < 2 && return
+    render_resize_handles!(buf, m.sessions_layout)
 
-    # Left: connection list (snapshot under lock to avoid races with health checker)
+    # ── Left column: REPL bridges (top) + MCP agents (bottom) ──
+    # Pull live MCP agent sessions
+    agent_sessions = lock(STANDALONE_SESSIONS_LOCK) do
+        collect(values(STANDALONE_SESSIONS))
+    end
+    filter!(s -> s.state == Session.INITIALIZED, agent_sessions)
+
+    left_rows = split_layout(m.sessions_left_layout, cols[1])
+    length(left_rows) < 2 && return
+    render_resize_handles!(buf, m.sessions_left_layout)
+
+    # ── REPL bridges list ──
     connections = if m.conn_mgr !== nothing
         lock(m.conn_mgr.lock) do
             copy(m.conn_mgr.connections)
@@ -1230,7 +1635,6 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             conn.status == :connected ? tstyle(:success) :
             conn.status == :connecting ? tstyle(:warning) : tstyle(:error)
         label = "$icon $(conn.name)"
-        # Pad to align status text
         padded = rpad(label, 20)
         status_text = string(conn.status)
         push!(items, ListItem("$padded $status_text", style))
@@ -1248,21 +1652,62 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             items;
             selected = m.selected_connection,
             block = Block(
-                title = " Julia Sessions ",
-                border_style = tstyle(:border),
-                title_style = tstyle(:text_dim),
+                title = " REPL Bridges ($(length(connections))) ",
+                border_style = _pane_border(m, 2, 1),
+                title_style = _pane_title(m, 2, 1),
             ),
             highlight_style = tstyle(:accent, bold = true),
+            tick = m.tick,
         ),
-        cols[1],
+        left_rows[1],
         buf,
     )
 
-    # Right: detail panel for selected connection
+    # ── MCP agents table ──
+    if isempty(agent_sessions)
+        agent_block = Block(
+            title = " Agents ",
+            border_style = _pane_border(m, 2, 2),
+            title_style = _pane_title(m, 2, 2),
+        )
+        inner = render(agent_block, left_rows[2], buf)
+        if inner.width >= 4
+            set_string!(buf, inner.x + 1, inner.y, "No agents connected", tstyle(:text_dim))
+        end
+    else
+        header = ["CLIENT", "SESSION", "ACTIVE"]
+        rows = Vector{String}[]
+        for s in agent_sessions
+            client_name = get(s.client_info, "name", "unknown")
+            push!(
+                rows,
+                [
+                    string(client_name),
+                    s.id[1:min(8, length(s.id))] * "…",
+                    _time_ago(s.last_activity),
+                ],
+            )
+        end
+        render(
+            Table(
+                header,
+                rows;
+                block = Block(
+                    title = " Agents ($(length(agent_sessions))) ",
+                    border_style = _pane_border(m, 2, 2),
+                    title_style = _pane_title(m, 2, 2),
+                ),
+            ),
+            left_rows[2],
+            buf,
+        )
+    end
+
+    # ── Right: detail panel for selected bridge connection ──
     detail_block = Block(
         title = " Details ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
+        border_style = _pane_border(m, 2, 3),
+        title_style = _pane_title(m, 2, 3),
     )
     detail_area = render(detail_block, cols[2], buf)
 
@@ -1277,7 +1722,8 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             ("Path", _short_path(conn.project_path)),
             ("Julia", conn.julia_version),
             ("PID", string(conn.pid)),
-            ("Uptime", _time_ago(conn.last_seen)),
+            ("Uptime", _time_ago(conn.connected_at)),
+            ("Last seen", _time_ago(conn.last_seen)),
             ("Tool calls", string(conn.tool_call_count)),
             ("Session", conn.session_id[1:min(8, length(conn.session_id))] * "..."),
         ]
@@ -1302,6 +1748,7 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
                     filled_style = conn.status == :connected ? tstyle(:success) :
                                    tstyle(:warning),
                     empty_style = tstyle(:text_dim),
+                    tick = m.tick,
                 ),
                 Rect(x, y, detail_area.width - 2, 1),
                 buf,
@@ -1316,69 +1763,6 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             tstyle(:text_dim),
         )
     end
-end
-
-# ── Agents Tab ────────────────────────────────────────────────────────────────
-
-function view_agents(m::MCPReplModel, area::Rect, buf::Buffer)
-    # Pull live MCP sessions from the server's session registry
-    sessions = lock(STANDALONE_SESSIONS_LOCK) do
-        collect(values(STANDALONE_SESSIONS))
-    end
-    # Only show initialized (active) sessions
-    filter!(s -> s.state == Session.INITIALIZED, sessions)
-
-    if isempty(sessions)
-        block = Block(
-            title = " Agent Sessions ",
-            border_style = tstyle(:border),
-            title_style = tstyle(:text_dim),
-        )
-        inner = render(block, area, buf)
-        y = inner.y + 1
-        set_string!(buf, inner.x + 2, y, "No agents connected", tstyle(:text_dim))
-        y += 2
-        set_string!(
-            buf,
-            inner.x + 2,
-            y,
-            "Agents connect via HTTP to port $(m.server_port)",
-            tstyle(:text_dim),
-        )
-        return
-    end
-
-    # Agent table from live session data
-    header = ["CLIENT", "PROTOCOL", "SESSION", "CONNECTED", "LAST ACTIVE"]
-    rows = Vector{String}[]
-    for s in sessions
-        client_name = get(s.client_info, "name", "unknown")
-        push!(
-            rows,
-            [
-                string(client_name),
-                s.protocol_version,
-                s.id[1:min(8, length(s.id))] * "…",
-                _time_ago(s.created_at),
-                _time_ago(s.last_activity),
-            ],
-        )
-    end
-
-    render(
-        Table(
-            header,
-            rows;
-            block = Block(
-                title = " Agent Sessions ($(length(sessions))) ",
-                border_style = tstyle(:border),
-                title_style = tstyle(:text_dim),
-            ),
-            selected = m.selected_agent,
-        ),
-        area,
-        buf,
-    )
 end
 
 # ── Activity Tab ──────────────────────────────────────────────────────────────
@@ -1418,10 +1802,11 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
             selected = display_sel,
             block = Block(
                 title = " Tool Calls ($n) ",
-                border_style = tstyle(:border),
-                title_style = tstyle(:text_dim),
+                border_style = _pane_border(m, 3, 1),
+                title_style = _pane_title(m, 3, 1),
             ),
             highlight_style = tstyle(:accent, bold = true),
+            tick = m.tick,
         ),
         panes[1],
         buf,
@@ -1431,8 +1816,8 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     if n == 0 || m.selected_result < 1 || m.selected_result > n
         empty_block = Block(
             title = " Details ",
-            border_style = tstyle(:border),
-            title_style = tstyle(:text_dim),
+            border_style = _pane_border(m, 3, 2),
+            title_style = _pane_title(m, 3, 2),
         )
         ei = render(empty_block, panes[2], buf)
         if ei.width >= 4
@@ -1451,8 +1836,8 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     r = m.tool_results[m.selected_result]
     detail_block = Block(
         title = " $(r.tool_name) ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:accent, bold = true),
+        border_style = _pane_border(m, 3, 2),
+        title_style = _pane_title(m, 3, 2),
     )
     di = render(detail_block, panes[2], buf)
     di.width < 4 && return
@@ -1524,14 +1909,15 @@ end
 # ── Server Tab ────────────────────────────────────────────────────────────────
 
 function view_server(m::MCPReplModel, area::Rect, buf::Buffer)
-    rows = tsplit(Layout(Vertical, [Fixed(9), Fill()]), area)
+    rows = split_layout(m.server_layout, area)
     length(rows) < 2 && return
+    render_resize_handles!(buf, m.server_layout)
 
     # ── Top: Server status panel ──
     status_block = Block(
         title = " Server Status ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
+        border_style = _pane_border(m, 1, 1),
+        title_style = _pane_title(m, 1, 1),
     )
     si = render(status_block, rows[1], buf)
     if si.width >= 4
@@ -1574,54 +1960,17 @@ function view_server(m::MCPReplModel, area::Rect, buf::Buffer)
         set_string!(buf, x + 14, y, string(m.total_tool_calls), tstyle(:text))
     end
 
-    # ── Bottom: Server log ──
-    log_block = Block(
-        title = " Server Log ($(length(m.server_log))) ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
+    # ── Bottom: Server log (ScrollPane) ──
+    wrap_hint = m.log_word_wrap ? "wrap:on" : "wrap:off"
+    _ensure_log_pane!(m)
+    pane = m.log_pane::ScrollPane
+    pane.block = Block(
+        title = " Server Log ($(length(m.server_log))) [$wrap_hint] ",
+        border_style = _pane_border(m, 1, 2),
+        title_style = _pane_title(m, 1, 2),
     )
-    log_inner = render(log_block, rows[2], buf)
-    log_inner.width < 4 && return
-
-    if isempty(m.server_log)
-        set_string!(
-            buf,
-            log_inner.x + 1,
-            log_inner.y,
-            "No log entries yet",
-            tstyle(:text_dim),
-        )
-        return
-    end
-
-    y = log_inner.y
-    x = log_inner.x + 1
-    visible = log_inner.height
-    start_idx = max(1, length(m.server_log) - visible + 1)
-    for i = length(m.server_log):-1:start_idx
-        y > bottom(log_inner) && break
-        entry = m.server_log[i]
-        time_str = Dates.format(entry.timestamp, "HH:MM:SS")
-        level_str = rpad(string(entry.level), 5)
-        level_style = if entry.level == :error
-            tstyle(:error)
-        elseif entry.level == :warn
-            tstyle(:warning)
-        else
-            tstyle(:text_dim)
-        end
-
-        set_string!(buf, x, y, time_str, tstyle(:text_dim))
-        set_string!(buf, x + 9, y, level_str, level_style)
-        # Truncate message to fit available width
-        max_msg = log_inner.width - 16
-        msg = entry.message
-        if length(msg) > max_msg
-            msg = first(msg, max_msg - 1) * "…"
-        end
-        set_string!(buf, x + 15, y, msg, tstyle(:text))
-        y += 1
-    end
+    _sync_log_pane!(m, rows[2].width - 2)  # -2 for border
+    render(pane, rows[2], buf)
 end
 
 # ── Config Tab ────────────────────────────────────────────────────────────────
@@ -1634,18 +1983,20 @@ function view_config(m::MCPReplModel, area::Rect, buf::Buffer)
 end
 
 function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
-    cols = tsplit(Layout(Horizontal, [Percent(50), Fill()]), area)
+    cols = split_layout(m.config_layout, area)
     length(cols) < 2 && return
+    render_resize_handles!(buf, m.config_layout)
 
     # ── Left column: Server + Actions ──
-    left_rows = tsplit(Layout(Vertical, [Fixed(8), Fill()]), cols[1])
+    left_rows = split_layout(m.config_left_layout, cols[1])
     length(left_rows) < 2 && return
+    render_resize_handles!(buf, m.config_left_layout)
 
     # Server info
     srv_block = Block(
         title = " Server ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
+        border_style = _pane_border(m, 4, 1),
+        title_style = _pane_title(m, 4, 1),
     )
     srv = render(srv_block, left_rows[1], buf)
     if srv.width >= 4
@@ -1673,25 +2024,32 @@ function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
     # Actions
     act_block = Block(
         title = " Actions ",
-        border_style = tstyle(:accent),
-        title_style = tstyle(:accent),
+        border_style = _pane_border(m, 4, 2),
+        title_style = _pane_title(m, 4, 2),
     )
     act = render(act_block, left_rows[2], buf)
     if act.width >= 4
         y = act.y
         x = act.x + 1
-        set_string!(buf, x, y, "[a]", tstyle(:accent, bold = true))
-        set_string!(buf, x + 4, y, "Add project (bridge setup)", tstyle(:text))
+        set_string!(buf, x, y, "[o]", tstyle(:accent, bold = true))
+        set_string!(buf, x + 4, y, "Onboard project (bridge setup)", tstyle(:text))
         y += 1
-        set_string!(buf, x, y, "[c]", tstyle(:accent, bold = true))
-        set_string!(buf, x + 4, y, "Configure MCP client", tstyle(:text))
+        set_string!(buf, x, y, "[i]", tstyle(:accent, bold = true))
+        set_string!(buf, x + 4, y, "Install MCP client config", tstyle(:text))
+        y += 1
+        set_string!(buf, x, y, "[m]", tstyle(:accent, bold = true))
+        set_string!(buf, x + 4, y, "Mirror host REPL output", tstyle(:text))
+        y += 1
+        mirror_status = m.bridge_mirror_repl ? "enabled" : "disabled"
+        mirror_style = m.bridge_mirror_repl ? tstyle(:success) : tstyle(:text_dim)
+        set_string!(buf, x + 4, y, "status: $mirror_status", mirror_style)
     end
 
     # ── Right column: MCP Client Status ──
     client_block = Block(
         title = " MCP Clients ",
-        border_style = tstyle(:border),
-        title_style = tstyle(:text_dim),
+        border_style = _pane_border(m, 4, 3),
+        title_style = _pane_title(m, 4, 3),
     )
     client_inner = render(client_block, cols[2], buf)
     client_inner.width < 4 && return
@@ -1712,7 +2070,7 @@ function view_config_base(m::MCPReplModel, area::Rect, buf::Buffer)
 
     y += 1
     if y + 2 <= bottom(client_inner)
-        set_string!(buf, x, y, "Press [c] to configure a client", tstyle(:text_dim))
+        set_string!(buf, x, y, "Press [i] to configure a client", tstyle(:text_dim))
     end
 end
 
@@ -1754,6 +2112,7 @@ function view_config_flow(m::MCPReplModel, area::Rect, buf::Buffer)
                 confirm_label = "Install",
                 cancel_label = "Cancel",
                 selected = m.flow_modal_selected,
+                tick = m.tick,
             ),
             area,
             buf,
@@ -1965,6 +2324,68 @@ function _detect_in_files(paths::String...)
     return false
 end
 
+function _dict_has_julia_repl_server(x)::Bool
+    if x isa AbstractDict
+        if haskey(x, "mcpServers")
+            servers = x["mcpServers"]
+            if servers isa AbstractDict
+                for k in keys(servers)
+                    occursin("julia-repl", lowercase(string(k))) && return true
+                end
+            end
+        end
+        for v in values(x)
+            _dict_has_julia_repl_server(v) && return true
+        end
+    elseif x isa AbstractVector
+        for v in x
+            _dict_has_julia_repl_server(v) && return true
+        end
+    end
+    return false
+end
+
+function _detect_claude_configured()::Bool
+    # Preferred source of truth: Claude CLI's active MCP registry.
+    if Sys.which("claude") !== nothing
+        try
+            out = read(pipeline(`claude mcp list`; stderr = devnull), String)
+            for ln in split(out, '\n')
+                s = strip(lowercase(ln))
+                startswith(s, "julia-repl:") && return true
+            end
+            return false
+        catch
+            # Fall through to file checks if CLI invocation fails.
+        end
+    end
+
+    # Fallback: file-based detection when CLI is unavailable.
+    # Claude uses multiple config files depending on scope/version.
+    paths = (
+        joinpath(homedir(), ".claude", "settings.json"),
+        joinpath(homedir(), ".claude", "settings.local.json"),
+        joinpath(pwd(), ".mcp.json"),
+        joinpath(pwd(), ".claude", "settings.local.json"),
+    )
+
+    for p in paths
+        isfile(p) || continue
+        # Structured check first (mcpServers keys), then text fallback.
+        try
+            cfg = JSON.parsefile(p)
+            _dict_has_julia_repl_server(cfg) && return true
+        catch
+        end
+        try
+            occursin("julia-repl", read(p, String)) && return true
+        catch
+        end
+    end
+
+    return false
+end
+
 # Client detection runs async; results land in model.client_statuses.
 const _CLIENT_STATUS_PENDING = Ref{Bool}(false)
 
@@ -1978,15 +2399,8 @@ function _refresh_client_status_async!(m::MCPReplModel)
             # Check each client's config files for "julia-repl" presence.
             # All checks are file-based to avoid spawning CLI processes.
 
-            # Claude: ~/.claude/settings.json, .mcp.json, .claude/settings.local.json
-            push!(
-                statuses,
-                "Claude Code" => _detect_in_files(
-                    joinpath(homedir(), ".claude", "settings.json"),
-                    joinpath(pwd(), ".mcp.json"),
-                    joinpath(pwd(), ".claude", "settings.local.json"),
-                ),
-            )
+            # Claude Code: support global + local config variants.
+            push!(statuses, "Claude Code" => _detect_claude_configured())
 
             # Gemini: ~/.gemini/settings.json and project .gemini/settings.json
             push!(

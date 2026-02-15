@@ -475,6 +475,7 @@ qdrant_index_project_tool = @mcp_tool(
             project_path;
             collection = collection,
             recreate = recreate,
+            silent = true,
             extra_dirs = extra_dirs,
             extensions = extensions,
         )
@@ -516,7 +517,12 @@ qdrant_sync_index_tool = @mcp_tool(
             collection = nothing
         end
 
-        result = sync_index(project_path; collection = collection, verbose = verbose)
+        result = sync_index(
+            project_path;
+            collection = collection,
+            silent = true,
+            verbose = verbose,
+        )
 
         col_name =
             collection === nothing ? get_project_collection_name(project_path) : collection
@@ -562,7 +568,8 @@ qdrant_reindex_file_tool = @mcp_tool(
             file_path,
             collection;
             project_path = project_path,
-            verbose = verbose,
+            silent = true,
+            verbose = false,
         )
         return "✓ Re-indexed $chunks chunks for $(basename(file_path)) in '$collection'."
     end

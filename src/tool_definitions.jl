@@ -149,6 +149,24 @@ ping_tool = @mcp_tool(
             status *= "Revise: not loaded"
         end
 
+        # Connected Julia sessions
+        mgr = BRIDGE_CONN_MGR[]
+        if mgr !== nothing
+            conns = connected_sessions(mgr)
+            all_conns = lock(mgr.lock) do
+                copy(mgr.connections)
+            end
+            status *= "\n\nSessions: $(length(conns)) connected / $(length(all_conns)) total"
+            for conn in all_conns
+                key = short_key(conn)
+                icon =
+                    conn.status == :connected ? "●" :
+                    conn.status == :connecting ? "◐" : "○"
+                status *= "\n  $icon $key $(conn.name) ($(conn.status), Julia $(conn.julia_version), PID $(conn.pid))"
+                status *= "\n    project: $(conn.project_path)"
+            end
+        end
+
         return status
     end
 )
@@ -342,7 +360,7 @@ Never use `julia` in bash. Call usage_instructions first for workflow guidance."
                 )
             end
         catch e
-            println("Error during execute_repllike", e)
+            @error "Error during execute_repllike" exception = e
             "Apparently there was an **internal** error to the MCP server: $e"
         end
     end

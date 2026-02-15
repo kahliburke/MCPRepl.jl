@@ -6,6 +6,7 @@
 #   ./bin/mcprepl              # default port 2828, kokaku theme
 #   ./bin/mcprepl --port 3000  # custom port
 #   ./bin/mcprepl --theme esper
+#   ./bin/mcprepl --revise      # load Revise before MCPRepl
 #
 
 using Pkg
@@ -13,36 +14,23 @@ using Pkg
 const PROJECT_DIR = joinpath(@__DIR__, "..")
 Pkg.activate(PROJECT_DIR)
 
-# Auto-instantiate if Manifest is missing or stale
-let manifest = joinpath(PROJECT_DIR, "Manifest.toml")
-    project  = joinpath(PROJECT_DIR, "Project.toml")
-    if !isfile(manifest)
-        @info "First run — installing dependencies (Pkg.instantiate)..."
-        Pkg.instantiate()
-    elseif mtime(project) > mtime(manifest)
-        @info "Project.toml changed — resolving dependencies..."
-        Pkg.resolve()
-    end
-end
-
-# Precompile if needed (Pkg.precompile is a no-op when up to date)
-Pkg.precompile()
-
-using MCPRepl
-
-# Parse args
+# Parse args early so --revise can be honored before loading MCPRepl.
 function parse_args()
     port = 2828
     theme = :kokaku
+    use_revise = false
 
     i = 1
     while i <= length(ARGS)
         if ARGS[i] in ("--port", "-p") && i + 1 <= length(ARGS)
-            port = parse(Int, ARGS[i + 1])
+            port = parse(Int, ARGS[i+1])
             i += 2
         elseif ARGS[i] in ("--theme", "-t") && i + 1 <= length(ARGS)
-            theme = Symbol(ARGS[i + 1])
+            theme = Symbol(ARGS[i+1])
             i += 2
+        elseif ARGS[i] in ("--revise", "-r")
+            use_revise = true
+            i += 1
         elseif ARGS[i] in ("--help", "-h")
             println("""
             MCPRepl TUI — persistent MCP server with terminal dashboard
@@ -52,6 +40,7 @@ function parse_args()
             Options:
               -p, --port PORT    MCP HTTP server port (default: 2828)
               -t, --theme NAME   Theme: kokaku, esper, motoko, neuromancer (default: kokaku)
+              -r, --revise       Load Revise before MCPRepl
               -h, --help         Show this help
 
             Start a bridge in your Julia REPL:
@@ -64,10 +53,44 @@ function parse_args()
             exit(1)
         end
     end
-    return (; port, theme)
+    return (; port, theme, use_revise)
 end
 
-(; port, theme) = parse_args()
+(; port, theme, use_revise) = parse_args()
+
+# Auto-instantiate if Manifest is missing or stale
+let manifest = joinpath(PROJECT_DIR, "Manifest.toml")
+    project = joinpath(PROJECT_DIR, "Project.toml")
+    if !isfile(manifest)
+        @info "First run — installing dependencies (Pkg.instantiate)..."
+        Pkg.instantiate()
+    elseif mtime(project) > mtime(manifest)
+        @info "Project.toml changed — resolving dependencies..."
+        Pkg.resolve()
+    end
+end
+
+# Precompile if needed (Pkg.precompile is a no-op when up to date)
+Pkg.precompile()
+
+if use_revise
+    try
+        @eval using Revise
+    catch e
+        @warn "Could not load Revise, continuing without it" exception = e
+    end
+end
+
+using MCPRepl
+
+if use_revise && isdefined(Main, :Revise)
+    try
+        # Wire event-driven Revise listener so changes apply without REPL input.
+        MCPRepl.start_revise_event_watcher(project_path=PROJECT_DIR; silent=false)
+    catch e
+        @warn "Could not start MCPRepl Revise event watcher" exception = e
+    end
+end
 
 # First-time setup: launch security wizard if no config exists
 has_config = MCPRepl.load_security_config() !== nothing ||
