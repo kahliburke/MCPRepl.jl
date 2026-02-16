@@ -1872,7 +1872,6 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                 m.server_port;
                 verbose = false,
                 security_config = security_config,
-                dashboard = false,
             )
             m.server_running = true
             BRIDGE_PORT[] = m.server_port

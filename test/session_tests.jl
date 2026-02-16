@@ -134,10 +134,6 @@ using MCPRepl.Session: UNINITIALIZED, INITIALIZING, INITIALIZED, CLOSED
         @test haskey(caps, "prompts")
         @test haskey(caps, "resources")
         @test haskey(caps, "logging")
-        @test haskey(caps, "experimental")
-
-        @test caps["experimental"]["vscode_integration"] == true
-        @test caps["experimental"]["proxy_routing"] == true
     end
 
     @testset "Session Lifecycle" begin

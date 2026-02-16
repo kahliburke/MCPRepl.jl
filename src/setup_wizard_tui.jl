@@ -17,10 +17,50 @@ import Tachikoma:
     task_running,
     task_done
 
-# ── ASCII Art (reused from security_wizard.jl / art.jl) ─────────────────────
-#
-# Dragon art: DRAGON_ASCII (mouth closed) and DRAGON_MOUTH_OPEN are defined
-# in security_wizard.jl with the danger zone warning. We use them directly.
+# ── ASCII Art ────────────────────────────────────────────────────────────────
+
+const DRAGON_ASCII = raw"""
+                                                     __----~~~~~~~~~~~------___
+                                    .  .   ~~//====......          __--~ ~~
+                    -.            \_|//     |||\\  ~~~~~~::::... /~
+                 ___-==_       _-~o~  \/    |||  \\            _/~~-
+         __---~~~.==~||\=_    -_--~/_-~|-   |\\   \\        _/~
+     _-~~     .=~    |  \\-_    '-~7  /-   /  ||    \      /
+   .~       .~       |   \\ -_    /  /-   /   ||      \   /
+  /  ____  /         |     \\ ~-_/  /|- _/   .||       \ /
+  |~~    ~~|--~~~~--_ \     ~==-/   | \~--===~~        .\
+           '         ~-|      /|    |-~\~~       __--~~
+                       |-~~-_/ |    |   ~\_   _-~            /\
+                            /  \     \__   \/~                \__
+                        _--~ _/ | .-~~____--~-/                  ~~==.
+                       ((->/~   '.|||' -_|    ~~-/ ,              . _||
+                                  -_     ~\      ~~---l__i__i__i--~~_/
+                                  _-~-__   ~)  \--______________--~~
+                                //.-~~~-~_--~- |-------~~~~~~~~
+                                       //.-~~~--\
+"""
+
+const DRAGON_MOUTH_OPEN = raw"""
+                                                     __----~~~~~~~~~~~------___
+                                    .  .   ~~//====......          __--~ ~~
+                    -.            \_|//     |||\\  ~~~~~~::::... /~
+                 ___-==_       _-~O~  \/    |||  \\            _/~~-
+         __---~~~.==~||\=_    - --~/_-~|-   |\\   \\        _/~
+     _-~~     .=~    |  \\-_   <-/- > /-   /  ||    \      /
+   .~       .~       |   \\ -_    /  /-   /   ||      \   /
+  /  ____  /         |     \\ ~-_/  /|- _/   .||       \ /
+  |~~    ~~|--~~~~--_ \     ~==-/   | \~--===~~        .\
+           '         ~-|      /|    |-~\~~       __--~~
+                       |-~~-_/ |    |   ~\_   _-~            /\
+                            /  \     \__   \/~                \__
+                        _--~ _/ | .-~~____--~-/                  ~~==.
+                       ((->/~   '.|||' -_|    ~~-/ ,              . _||
+                                  -_     ~\      ~~---l__i__i__i--~~_/
+                                  _-~-__   ~)  \--______________--~~
+                                //.-~~~-~_--~- |-------~~~~~~~~
+                                       //.-~~~--\
+"""
+
 # Detect mouth position for fire particle emission.
 
 function _detect_dragon_mouth()
@@ -57,17 +97,52 @@ const GENTLE_BUTTERFLY_ASCII = raw"""
             *  .  .  *  .  .  *
 """
 
-# Neuromancer green color palette
+# Color palettes
+const FIRE_COLORS = [196, 202, 208, 214, 220, 226, 220, 214, 208, 202]
+const BUTTERFLY_COLORS = [219, 183, 147, 111, 75, 39, 75, 111, 147, 183]
+const WIZARD_COLORS = [33, 39, 45, 51, 87, 123, 159, 105, 69]
 const NEURO_GREENS = [22, 28, 34, 40, 46, 82, 118, 154, 190, 226]
 
 # Small companion art (first ~10 lines)
 const DRAGON_PREVIEW_LINES = split(DRAGON_ASCII, '\n')[1:min(10, end)]
 const BUTTERFLY_PREVIEW_LINES = split(GENTLE_BUTTERFLY_ASCII, '\n')[1:min(10, end)]
 
+# Wizard companion art
+const _WIZ_ART = raw"""
+                      ____
+                    .'* *.'
+                 __/_*_*(_
+                / _______ \
+               _\_)/___\(_/_
+              / _((\O O/))_ \
+              \ \())(-)(()/ /
+               ' \(((()))/ '
+              / ' \)).))/ ' \
+             / _ \ - | - /_  \
+            (   ( .;''';. .'  )
+            _\"__ /    )\ __"/_
+              \/  \   ' /  \/
+               .'  '...' ' )
+                / /  |  \ \
+               / .   .   . \
+              /   .     .   \
+             /   /   |   \   \
+           .'   /    b    '.  '.
+       _.-'    /     Bb     '-. '-._
+   _.-'       |      BBb       '-.  '-.
+  (________mrf\____.dBBBb.________)____)
+  """
 
-# Companion art for config steps
-const COMPANION_WIZ = split(wiz, '\n')
-const COMPANION_WIZ_B = split(wiz_b, '\n')
+const _WIZ_B_ART = raw"""
+
+   _ " _
+  (_\|/_)
+   (/|\)
+
+"""
+
+const COMPANION_WIZ = split(_WIZ_ART, '\n')
+const COMPANION_WIZ_B = split(_WIZ_B_ART, '\n')
 
 # ── Enums ────────────────────────────────────────────────────────────────────
 

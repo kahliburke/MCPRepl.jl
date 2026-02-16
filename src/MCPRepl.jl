@@ -52,8 +52,6 @@ end
 
 include("utils.jl")
 include("database.jl")
-include("dashboard.jl")
-include("proxy.jl")
 include("qdrant_client.jl")
 include("tools.jl")
 include("Generate.jl")
@@ -64,20 +62,15 @@ include("stress_test.jl")
 include("tui.jl")
 
 # Export public API functions
-export start!, stop!, setup, test_server, reset
+export start!, stop!, test_server
 export setup_security, security_status, generate_key, revoke_key
-export allow_ip, deny_ip, set_security_mode, quick_setup, gentle_setup
+export allow_ip, deny_ip, set_security_mode
 export call_tool, list_tools, tool_help
-export start_proxy, stop_proxy  # Proxy server functions
 export register_tool!, registry  # Project hook API
 export tui  # TUI server entry point
 export setup_wizard_tui  # Animated security setup wizard
-export Proxy  # Proxy server module
 export MCPReplBridge  # Eval bridge module
 export get_bridge_mirror_repl_preference, set_bridge_mirror_repl_preference!
-# export Generate  # Project template generator module
-# export Dashboard
-# export Database
 
 # ============================================================================
 # Port Management
@@ -220,12 +213,11 @@ macro mcp_tool(id, description, params, handler)
 end
 
 include("security.jl")
-include("security_wizard.jl")
 include("setup_wizard_tui.jl")
 include("repl_status.jl")
 include("tool_definitions.jl")
 include("MCPServer.jl")
-include("setup.jl")
+include("config_utils.jl")
 include("vscode.jl")
 include("lsp.jl")
 include("lsp_tool_definitions.jl")
@@ -1556,27 +1548,7 @@ MCPRepl.start!(port=0)
 
 # Start with a custom name
 MCPRepl.start!(julia_session_name="data-processor")
-
-# Start in standalone mode (no proxy, includes dashboard)
-MCPRepl.start!(register_with_proxy=false)
 ```
-
-# Standalone Mode (Proxy-Compatible Mode)
-
-When the proxy is not available or `bypass_proxy=true` in security config, MCPRepl runs in
-standalone mode with full proxy-compatible functionality:
-
-- **HTTP JSON-RPC**: Accepts MCP protocol requests at `/` or `/mcp` endpoints
-- **Dashboard UI**: Serves React dashboard at `http://localhost:<port>/`
-- **WebSocket Live Updates**: Real-time event streaming at `/ws`
-- **All MCP Tools**: Full tool registry accessible via HTTP
-
-This mode is ideal for:
-- Single-session development without proxy overhead
-- Testing and debugging MCP integrations
-- Simplified deployment scenarios
-- Direct HTTP client access to MCP protocol
-
 """
 function start!(;
     port::Union{Int,Nothing} = nothing,
@@ -1585,12 +1557,8 @@ function start!(;
     julia_session_name::String = "",
     workspace_dir::String = pwd(),
     session_uuid::Union{String,Nothing} = nothing,
-    register_with_proxy::Bool = true,
 )
     SERVER[] !== nothing && stop!() # Stop existing server if running
-
-    # Check for persistent proxy server
-    proxy_port = 3000  # Default proxy port
 
     # Temporarily suppress Info logs during startup to avoid interfering with spinner
     old_logger = global_logger()
@@ -1638,24 +1606,6 @@ function start!(;
     else
         @debug "Security config loaded successfully" port = security_config.port mode =
             security_config.mode
-    end
-
-    # Check if proxy should be bypassed (from security config or ENV override)
-    bypass_proxy =
-        security_config.bypass_proxy || get(ENV, "MCPREPL_BYPASS_PROXY", "false") == "true"
-    proxy_running = bypass_proxy ? false : Proxy.is_server_running(proxy_port)
-
-    # Start proxy if needed
-    if !proxy_running && !bypass_proxy
-        # Start proxy server in background (using our shared status)
-        status_msg[] = "Starting MCPRepl (starting proxy)..."
-        Proxy.start_server(
-            proxy_port;
-            background = true,
-            status_callback = (msg) -> (status_msg[] = msg),
-        )
-    elseif bypass_proxy
-        @debug "Bypassing proxy - running in standalone mode"
     end
 
     # Determine port: function arg overrides config, otherwise use what load_security_config() found
@@ -1753,216 +1703,6 @@ function start!(;
         security_config = security_config,
         session_uuid = session_uuid,
     )
-
-    # Register this REPL with the proxy if proxy is running and registration is enabled.
-    # If we're explicitly bypassing the proxy, never attempt registration.
-    if register_with_proxy && proxy_running
-        # Wait for the backend HTTP server to be ready to accept connections
-        # This prevents race conditions where the proxy flushes buffered requests
-        # before the backend can handle them
-        max_attempts = 50  # 5 seconds total (50 * 0.1s)
-        server_ready = false
-
-        for attempt = 1:max_attempts
-            try
-                # Try a simple TCP connection to verify the server is listening
-                sock = Sockets.connect(actual_port)
-                close(sock)
-                server_ready = true
-                @debug "Backend server ready after attempt $attempt"
-                break
-            catch e
-                if attempt == max_attempts
-                    @debug "Backend server connection failed" attempt = attempt error = e
-                end
-                sleep(0.1)
-            end
-        end
-
-        if !server_ready
-            @warn "Backend server not ready after 5 seconds, skipping proxy registration"
-        else
-            @debug "Proceeding with proxy registration" port = actual_port
-        end
-
-        if server_ready
-            try
-                # Determine REPL ID
-                # Priority: MCPREPL_ID env var > julia_session_name > workspace basename
-                repl_id = if haskey(ENV, "MCPREPL_ID") && !isempty(ENV["MCPREPL_ID"])
-                    ENV["MCPREPL_ID"]
-                elseif !isempty(julia_session_name)
-                    julia_session_name  # Use julia_session_name directly without prefix
-                else
-                    basename(workspace_dir)
-                end
-
-                # Register with proxy
-                registration = Dict(
-                    "jsonrpc" => "2.0",
-                    "id" => 1,
-                    "method" => "proxy/register",
-                    "params" => Dict(
-                        "uuid" => SERVER[].uuid,
-                        "name" => repl_id,
-                        "port" => actual_port,
-                        "pid" => getpid(),
-                        "metadata" => Dict(
-                            "workspace" => workspace_dir,
-                            "julia_session_name" => julia_session_name,
-                        ),
-                    ),
-                )
-
-                @debug "Proxy registration payload" registration
-                response = HTTP.post(
-                    "http://127.0.0.1:$proxy_port/",
-                    ["Content-Type" => "application/json"],
-                    JSON.json(registration);
-                    readtimeout = 5,
-                    status_exception = false,
-                )
-
-                if response.status == 200
-                    if verbose
-                        printstyled(
-                            "📝 Registered with proxy as '$repl_id'\n",
-                            color = :green,
-                            bold = true,
-                        )
-                    end
-                elseif response.status == 409
-                    # Duplicate registration - parse error message and show to user
-                    response_data = JSON.parse(String(response.body))
-                    error_msg = get(
-                        get(response_data, "error", Dict()),
-                        "message",
-                        "Session ID already in use",
-                    )
-
-                    # Stop spinner before showing error
-                    spinner_active[] = false
-                    wait(spinner_task)
-                    global_logger(old_logger)
-
-                    print("\r\033[K")  # Clear spinner line
-                    printstyled("❌ Registration failed: ", color = :red, bold = true)
-                    println(error_msg)
-                    printstyled("💡 Tip: ", color = :yellow, bold = true)
-                    println(
-                        "Use a different julia_session_name or stop the existing session",
-                    )
-                    # Registration is required for proxy routing; stop the server to avoid a
-                    # confusing half-started state.
-                    try
-                        stop!()
-                    catch
-                    end
-                    return nothing
-                else
-                    # Try to parse error response for details
-                    error_details = ""
-                    try
-                        response_data = JSON.parse(String(response.body))
-                        if haskey(response_data, "error")
-                            error_details = get(response_data["error"], "message", "")
-                        end
-                    catch
-                        # If parsing fails, show raw body (truncated)
-                        body_str = String(response.body)
-                        error_details =
-                            length(body_str) > 200 ? first(body_str, 200) * "..." : body_str
-                    end
-
-                    # Registration failures should not prevent standalone use.
-                    # Treat common cases (proxy not running / wrong service on port 3000 / old proxy)
-                    # as non-fatal and continue.
-                    if verbose
-                        printstyled(
-                            "⚠️  Proxy registration skipped: ",
-                            color = :yellow,
-                            bold = true,
-                        )
-                        if !isempty(error_details)
-                            println(error_details)
-                        else
-                            println("HTTP $(response.status)")
-                        end
-                    end
-
-                    @warn "Failed to register with proxy (continuing without proxy)" status =
-                        response.status error = error_details
-                end
-
-                # Only start heartbeat if registration succeeded
-                if response.status == 200
-
-                    # Start heartbeat task to keep proxy updated
-                    @async begin
-                        @debug "Heartbeat task started" repl_id = repl_id proxy_port =
-                            proxy_port
-                        # Capture metadata in closure for heartbeat
-                        heartbeat_metadata = Dict(
-                            "workspace" => workspace_dir,
-                            "julia_session_name" => julia_session_name,
-                        )
-                        while SERVER[] !== nothing
-                            try
-                                sleep(5)  # Send heartbeat every 5 seconds
-                                @debug "Heartbeat check" server_active =
-                                    (SERVER[] !== nothing) proxy_running =
-                                    Proxy.is_server_running(proxy_port)
-                                if SERVER[] !== nothing &&
-                                   Proxy.is_server_running(proxy_port)
-                                    heartbeat = Dict(
-                                        "jsonrpc" => "2.0",
-                                        "id" => rand(1:1000000),
-                                        "method" => "proxy/heartbeat",
-                                        "params" => Dict(
-                                            "uuid" => SERVER[].uuid,
-                                            "name" => repl_id,
-                                            "port" => actual_port,
-                                            "pid" => getpid(),
-                                            "metadata" => heartbeat_metadata,
-                                        ),
-                                    )
-                                    @debug "Sending heartbeat" repl_id = repl_id
-                                    HTTP.post(
-                                        "http://127.0.0.1:$proxy_port/",
-                                        ["Content-Type" => "application/json"],
-                                        JSON.json(heartbeat);
-                                        readtimeout = 5,
-                                        connect_timeout = 2,
-                                    )
-                                    @debug "Heartbeat sent successfully" repl_id = repl_id
-                                else
-                                    @warn "Heartbeat skipped" server_active =
-                                        (SERVER[] !== nothing) proxy_running =
-                                        Proxy.is_server_running(proxy_port)
-                                end
-                            catch e
-                                # Ignore heartbeat errors, they're not critical
-                                @warn "Heartbeat failed" repl_id = repl_id exception = e
-                            end
-                        end
-                        @info "Heartbeat task ended" repl_id = repl_id
-                    end
-                end  # if response.status == 200
-            catch e
-                @warn "Failed to register with proxy (continuing without proxy)" exception =
-                    e
-            end
-        end  # if server_ready
-    elseif bypass_proxy && verbose
-        printstyled("\n🔌 Standalone Mode (Proxy-Compatible)\n", color = :cyan, bold = true)
-        printstyled("   📊 Dashboard: ", color = :green)
-        println("http://localhost:$actual_port/")
-        printstyled("   🔧 MCP JSON-RPC: ", color = :green)
-        println("http://localhost:$actual_port/mcp")
-        printstyled("   💡 Tip: ", color = :yellow)
-        println("This server includes the full dashboard UI and accepts MCP calls via HTTP")
-        println()
-    end  # if register_with_proxy
 
     # Stop the spinner and show completion
     spinner_active[] = false
@@ -2387,24 +2127,6 @@ function restart()
 end
 function shutdown()
     call_tool(:manage_repl, Dict("command" => "shutdown"))
-end
-
-"""
-    start_proxy(port::Int=3000; background::Bool=false)
-
-Start the MCP proxy server. Wrapper for Proxy.start_server().
-"""
-function start_proxy(port::Int = 3000; background::Bool = false)
-    return Proxy.start_server(port; background = background)
-end
-
-"""
-    stop_proxy(port::Int=3000)
-
-Stop the proxy server on the specified port. Wrapper for Proxy.stop_server().
-"""
-function stop_proxy(port::Int = 3000)
-    return Proxy.stop_server(port)
 end
 
 end #module
