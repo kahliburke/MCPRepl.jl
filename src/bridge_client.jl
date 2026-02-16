@@ -85,9 +85,7 @@ mutable struct ConnectionManager
     lock::ReentrantLock
 end
 
-function ConnectionManager(;
-    sock_dir::String = joinpath(homedir(), ".cache", "mcprepl", "sock"),
-)
+function ConnectionManager(; sock_dir::String = joinpath(mcprepl_cache_dir(), "sock"))
     ConnectionManager(
         REPLConnection[],
         Context(),

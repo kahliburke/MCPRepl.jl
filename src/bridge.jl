@@ -15,7 +15,18 @@ using Dates
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-const SOCK_DIR = joinpath(homedir(), ".cache", "mcprepl", "sock")
+const _BRIDGE_CACHE_DIR = let
+    d = get(ENV, "XDG_CACHE_HOME") do
+        Sys.iswindows() ?
+        joinpath(
+            get(ENV, "LOCALAPPDATA", joinpath(homedir(), "AppData", "Local")),
+            "MCPRepl",
+        ) : joinpath(homedir(), ".cache", "mcprepl")
+    end
+    mkpath(d)
+    d
+end
+const SOCK_DIR = joinpath(_BRIDGE_CACHE_DIR, "sock")
 const BRIDGE_LOCK = ReentrantLock()
 const _PUB_LOCK = ReentrantLock()
 

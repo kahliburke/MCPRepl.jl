@@ -26,9 +26,7 @@ const STANDALONE_SESSIONS_LOCK = ReentrantLock()
 Get the path to the sessions persistence file (.mcprepl/sessions.json).
 """
 function get_sessions_file_path()
-    mcprepl_dir = joinpath(pwd(), ".mcprepl")
-    mkpath(mcprepl_dir)
-    return joinpath(mcprepl_dir, "sessions.json")
+    return joinpath(mcprepl_cache_dir(), "sessions.json")
 end
 
 """
@@ -165,18 +163,38 @@ function get_or_create_session(session_id::Union{String,Nothing}, is_initialize:
                     # Restore from persistence
                     session = MCPSession()
                     session.id = session_id
+                    session.state = Session.INITIALIZED  # Auto-initialize so tool calls work immediately
+                    session.initialized_at = now()
                     STANDALONE_SESSIONS[session.id] = session
                     register_persisted_session(session.id)  # Update last_seen
                     @info "Restored session from persistence file" session_id = session.id
                     return (session, false)
                 else
-                    # Session not found anywhere
-                    return (nothing, false)
+                    # Session ID not in persistence file — create it on the fly.
+                    # Some MCP clients (e.g. Claude Code) don't re-initialize after a
+                    # 404; they just mark the server as down. Be lenient: accept the
+                    # session ID and let the request proceed.
+                    session = MCPSession()
+                    session.id = session_id
+                    session.state = Session.INITIALIZED
+                    session.initialized_at = now()
+                    STANDALONE_SESSIONS[session.id] = session
+                    register_persisted_session(session.id)
+                    @warn "Accepted unknown session ID (client did not re-initialize)" session_id =
+                        session.id
+                    return (session, false)
                 end
             end
         else
-            # No session ID provided for non-initialize request
-            return (nothing, false)
+            # No session ID provided for non-initialize request — create an anonymous session.
+            # This handles clients that skip the initialize handshake entirely.
+            session = MCPSession()
+            session.state = Session.INITIALIZED
+            session.initialized_at = now()
+            STANDALONE_SESSIONS[session.id] = session
+            register_persisted_session(session.id)
+            @warn "Created anonymous session for request without session ID"
+            return (session, true)
         end
     end
 end
@@ -1071,8 +1089,11 @@ function create_handler(
                     end
 
                     # Always push activity events in TUI mode (including ex, etc.)
+                    inflight_id = 0
                     if tui_mode
                         _push_activity!(:tool_start, tool.name, "", "")
+                        sk = string(get(args, "ses", get(args, "session", "")))
+                        inflight_id = _push_inflight_start!(tool.name, JSON.json(args), sk)
                     end
 
                     start_time = time()
@@ -1103,6 +1124,7 @@ function create_handler(
                                 time_str;
                                 success = tool_ok,
                             )
+                            _push_inflight_done!(inflight_id)
                             if show_timing
                                 marker = tool_ok ? "✓" : "✗"
                                 @info "$(tool.name) $marker ($time_str)"
@@ -1287,6 +1309,8 @@ function _handle_bridge_tool_sse(
     end
 
     # Send progress notification
+    # Note: inflight_id is captured from the enclosing scope after it's assigned below
+    _sse_inflight_id = Ref{Int}(0)
     function send_progress(message::String)
         step_counter[] += 1
         send_sse_event(
@@ -1301,6 +1325,13 @@ function _handle_bridge_tool_sse(
                 ),
             ),
         )
+        # Push progress to in-flight tracker for TUI display
+        if _sse_inflight_id[] > 0
+            _push_inflight_progress!(
+                _sse_inflight_id[],
+                length(message) > 200 ? first(message, 200) * "..." : message,
+            )
+        end
     end
 
     # Start heartbeat task
@@ -1317,6 +1348,9 @@ function _handle_bridge_tool_sse(
 
     # Push activity events in TUI mode
     _push_activity!(:tool_start, tool.name, "", "")
+    sk = string(get(args, "ses", get(args, "session", "")))
+    inflight_id = _push_inflight_start!(tool.name, JSON.json(args), sk)
+    _sse_inflight_id[] = inflight_id
     start_time = time()
     tool_ok = true
 
@@ -1343,6 +1377,10 @@ function _handle_bridge_tool_sse(
                 session = ses,
                 on_progress = send_progress,
             )
+        elseif tool_name_str == "stress_test"
+            # Inject progress callback so handler can stream per-line updates
+            args["_on_progress"] = send_progress
+            Base.invokelatest(tool.handler, args)
         else
             # Other bridge tools: call handler normally (no streaming progress)
             Base.invokelatest(tool.handler, args)
@@ -1356,6 +1394,7 @@ function _handle_bridge_tool_sse(
         time_str =
             elapsed < 1.0 ? @sprintf("%.0fms", elapsed * 1000) : @sprintf("%.1fs", elapsed)
         _push_activity!(:tool_done, tool.name, "", time_str; success = tool_ok)
+        _push_inflight_done!(inflight_id)
     end
 
     # Push tool result for TUI Activity inspection
@@ -2006,7 +2045,8 @@ function start_mcp_server(
 
                 tool_name_str = get(get(parsed_request, "params", Dict()), "name", "")
                 # Tools that execute via bridge and may run long
-                bridge_exec_tools = Set(["ex", "run_tests", "profile_code", "lint_package"])
+                bridge_exec_tools =
+                    Set(["ex", "run_tests", "profile_code", "lint_package", "stress_test"])
 
                 if tool_name_str in bridge_exec_tools
                     return _handle_bridge_tool_sse(

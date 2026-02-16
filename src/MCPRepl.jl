@@ -18,10 +18,37 @@ using LoggingExtras
 using Serialization
 using Preferences
 using ZMQ
+using Printf
 using Tachikoma
 
 export @mcp_tool, MCPTool
 export start!, stop!, test_server
+
+# ── Shared cache directory ────────────────────────────────────────────────────
+# Single source of truth for ~/.cache/mcprepl (respects XDG_CACHE_HOME).
+# All operational files (logs, sockets, sessions, db, pid files) go here.
+
+"""
+    mcprepl_cache_dir() -> String
+
+Return the path to the MCPRepl cache directory, creating it if needed.
+Respects `XDG_CACHE_HOME` on Unix; uses `LOCALAPPDATA` on Windows.
+Defaults to `~/.cache/mcprepl`.
+"""
+function mcprepl_cache_dir()
+    dir = get(ENV, "XDG_CACHE_HOME") do
+        if Sys.iswindows()
+            joinpath(
+                get(ENV, "LOCALAPPDATA", joinpath(homedir(), "AppData", "Local")),
+                "MCPRepl",
+            )
+        else
+            joinpath(homedir(), ".cache", "mcprepl")
+        end
+    end
+    mkpath(dir)
+    return dir
+end
 
 include("utils.jl")
 include("database.jl")
@@ -33,6 +60,7 @@ include("Generate.jl")
 include("bridge_prefs.jl")
 include("bridge.jl")
 include("bridge_client.jl")
+include("stress_test.jl")
 include("tui.jl")
 
 # Export public API functions
@@ -1289,6 +1317,7 @@ function collect_tools()::Vector{MCPTool}
         pkg_add_tool,
         pkg_rm_tool,
         run_tests_tool,
+        stress_test_tool,
         lsp_tools...,
         qdrant_tools...,
     ]

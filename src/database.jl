@@ -45,14 +45,7 @@ const DB = Ref{Union{SQLite.DB,Nothing}}(nothing)
 Get the default database path in the user's cache directory.
 """
 function get_default_db_path()
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-    return joinpath(cache_dir, "mcprepl.db")
+    return joinpath(mcprepl_cache_dir(), "mcprepl.db")
 end
 
 """

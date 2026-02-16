@@ -46,7 +46,7 @@ const _TUI_ORIG_STDERR = Ref{Any}(nothing)
 const _TUI_STDERR_TASK = Ref{Union{Task,Nothing}}(nothing)
 const _TUI_STDERR_RUNNING = Ref{Bool}(false)
 
-const _TUI_LOG_PATH = joinpath(homedir(), ".cache", "mcprepl", "server.log")
+const _TUI_LOG_PATH = joinpath(mcprepl_cache_dir(), "server.log")
 
 function _open_log_file!()
     try
@@ -288,6 +288,92 @@ function _drain_tool_results!(dest::Vector{ToolCallResult})
     end
 end
 
+# ── In-Flight Tool Calls (live progress) ─────────────────────────────────────
+# Tracks tool calls that are currently executing, displayed at the top of the
+# Activity tab with a live elapsed timer.
+
+mutable struct InFlightToolCall
+    id::Int                  # unique monotonic ID for pairing start/done
+    timestamp::Float64       # time() when started (for elapsed calculation)
+    timestamp_dt::DateTime   # DateTime for display
+    tool_name::String
+    args_json::String
+    session_key::String
+    last_progress::String    # most recent progress message
+    progress_lines::Vector{String}  # all progress lines for detail view
+end
+
+const _TUI_INFLIGHT_BUFFER = Tuple{Symbol,InFlightToolCall}[]  # (:start/:done/:progress, call)
+const _TUI_INFLIGHT_LOCK = ReentrantLock()
+const _INFLIGHT_ID_COUNTER = Ref{Int}(0)
+
+"""Push an in-flight start event. Returns the unique inflight ID."""
+function _push_inflight_start!(
+    tool_name::String,
+    args_json::String,
+    session_key::String,
+)::Int
+    lock(_TUI_INFLIGHT_LOCK) do
+        _INFLIGHT_ID_COUNTER[] += 1
+        id = _INFLIGHT_ID_COUNTER[]
+        ifc = InFlightToolCall(
+            id,
+            time(),
+            now(),
+            tool_name,
+            args_json,
+            session_key,
+            "",
+            String[],
+        )
+        push!(_TUI_INFLIGHT_BUFFER, (:start, ifc))
+        return id
+    end
+end
+
+"""Push an in-flight progress event (SSE streaming updates)."""
+function _push_inflight_progress!(id::Int, message::String)
+    lock(_TUI_INFLIGHT_LOCK) do
+        ifc = InFlightToolCall(id, 0.0, now(), "", "", "", message, String[])
+        push!(_TUI_INFLIGHT_BUFFER, (:progress, ifc))
+    end
+end
+
+"""Push an in-flight done event (tool finished executing)."""
+function _push_inflight_done!(id::Int)
+    lock(_TUI_INFLIGHT_LOCK) do
+        ifc = InFlightToolCall(id, 0.0, now(), "", "", "", "", String[])
+        push!(_TUI_INFLIGHT_BUFFER, (:done, ifc))
+    end
+end
+
+"""Drain the in-flight buffer into the model's inflight_calls vector."""
+function _drain_inflight_buffer!(dest::Vector{InFlightToolCall})
+    lock(_TUI_INFLIGHT_LOCK) do
+        for (kind, ifc) in _TUI_INFLIGHT_BUFFER
+            if kind == :start
+                push!(dest, ifc)
+            elseif kind == :progress
+                for existing in dest
+                    if existing.id == ifc.id
+                        existing.last_progress = ifc.last_progress
+                        push!(existing.progress_lines, ifc.last_progress)
+                        # Cap progress lines to avoid unbounded growth
+                        while length(existing.progress_lines) > 200
+                            popfirst!(existing.progress_lines)
+                        end
+                        break
+                    end
+                end
+            elseif kind == :done
+                idx = findfirst(x -> x.id == ifc.id, dest)
+                idx !== nothing && deleteat!(dest, idx)
+            end
+        end
+        empty!(_TUI_INFLIGHT_BUFFER)
+    end
+end
+
 # ── Data types ────────────────────────────────────────────────────────────────
 
 struct ToolCallRecord
@@ -312,6 +398,9 @@ end
     FLOW_CLIENT_CONFIRM        # Modal confirmation
     FLOW_CLIENT_RESULT         # Success/failure feedback
 end
+
+# Stress test state machine
+@enum StressState STRESS_IDLE STRESS_RUNNING STRESS_COMPLETE STRESS_ERROR
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 
@@ -352,6 +441,11 @@ end
     result_word_wrap::Bool = true   # word wrap in detail panel
     detail_paragraph::Union{Paragraph,Nothing} = nothing  # cached for scroll state
     _detail_for_result::Int = -1   # which selected_result the paragraph was built for
+
+    # In-flight tool calls — currently executing, shown at top of Activity list
+    inflight_calls::Vector{InFlightToolCall} = InFlightToolCall[]
+    selected_inflight::Int = 0     # 0 = none selected, 1+ = index into inflight_calls (newest-first)
+    activity_follow::Bool = true   # follow mode: auto-select newest entry each frame
 
     # Server state
     server_port::Int = 2828
@@ -396,11 +490,30 @@ end
     # Pane focus — which pane has keyboard focus on each tab
     # Tab 1: 1=status, 2=log | Tab 2: 1=bridges, 2=agents, 3=detail
     # Tab 3: 1=list, 2=detail | Tab 4: 1=server, 2=actions, 3=clients
-    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1)
+    # Tab 5: 1=form, 2=output
+    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1, 5 => 1)
+
+    # ── Advanced tab (stress test) ──
+    stress_state::StressState = STRESS_IDLE
+    stress_code::String = "sleep(3); 42"
+    stress_agents::String = "5"
+    stress_stagger::String = "0.0"
+    stress_timeout::String = "30"
+    stress_session_idx::Int = 1         # selected session index
+    stress_field_idx::Int = 1           # which form field has focus (1-6, 6=Run)
+    stress_editing::Bool = false        # true when a form field is in edit mode
+    stress_code_area::Any = nothing     # TextArea widget, created on demand
+    stress_output::Vector{String} = String[]
+    stress_output_lock::ReentrantLock = ReentrantLock()
+    stress_scroll_pane::Union{ScrollPane,Nothing} = nothing
+    stress_horde_scroll::Int = 0        # vertical scroll offset for agent horde
+    stress_process::Any = nothing       # process handle for kill
+    stress_result_file::String = ""     # path to written results
+    advanced_layout::ResizableLayout = ResizableLayout(Vertical, [Fixed(14), Fill()])
 end
 
 # Number of focusable panes per tab
-const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3)
+const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3, 5 => 3)
 
 """Return the border style for a pane — highlighted if focused."""
 function _pane_border(m::MCPReplModel, tab::Int, pane::Int)
@@ -686,6 +799,9 @@ function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
     elseif m.active_tab == 4
         handle_resize!(m.config_layout, evt)
         handle_resize!(m.config_left_layout, evt)
+    elseif m.active_tab == 5
+        handle_resize!(m.advanced_layout, evt)
+        m.stress_scroll_pane !== nothing && handle_mouse!(m.stress_scroll_pane, evt)
     end
 end
 
@@ -700,6 +816,12 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         return
     end
 
+    # When a stress test form field is in edit mode, capture all input
+    if m.active_tab == 5 && m.stress_editing
+        _handle_stress_field_edit!(m, evt)
+        return
+    end
+
     if evt.key == :char
         evt.char == 'q' && (m.shutting_down = true; return)
         # Tab switching: number keys + letter shortcuts
@@ -707,10 +829,12 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         evt.char == '2' && (_switch_tab!(m, 2); return)
         evt.char == '3' && (_switch_tab!(m, 3); return)
         evt.char == '4' && (_switch_tab!(m, 4); return)
+        evt.char == '5' && (_switch_tab!(m, 5); return)
         evt.char == 's' && (_switch_tab!(m, 1); return)
         evt.char == 'e' && (_switch_tab!(m, 2); return)
         evt.char == 'a' && (_switch_tab!(m, 3); return)
         evt.char == 'c' && (_switch_tab!(m, 4); return)
+        evt.char == 'v' && (_switch_tab!(m, 5); return)
         # Server tab actions (tab 1)
         if m.active_tab == 1 && evt.char == 'w'
             m.log_word_wrap = !m.log_word_wrap
@@ -721,6 +845,9 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         if m.active_tab == 3
             if evt.char == 'f'
                 _cycle_activity_filter!(m)
+                return
+            elseif evt.char == 'F'
+                m.activity_follow = !m.activity_follow
                 return
             elseif evt.char == 'w'
                 m.result_word_wrap = !m.result_word_wrap
@@ -733,6 +860,11 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             evt.char == 'o' && begin_onboarding!(m)
             evt.char == 'i' && begin_client_config!(m)
             evt.char == 'm' && toggle_bridge_mirror_repl!(m)
+        end
+        # Advanced tab actions (tab 5)
+        if m.active_tab == 5
+            _handle_stress_key!(m, evt)
+            return
         end
     elseif evt.key == :tab
         # Cycle focus between panes within the current tab
@@ -751,11 +883,30 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             m.focused_pane[tab] = mod1(cur - 1, n_panes)
         end
         return
+    elseif evt.key == :enter
+        if m.active_tab == 5
+            _handle_stress_enter!(m)
+            return
+        end
+    elseif evt.key in (:left, :right)
+        if m.active_tab == 5
+            _handle_stress_arrow!(m, evt)
+            return
+        end
     elseif evt.key in (:up, :down, :pageup, :pagedown)
         _handle_scroll!(m, evt)
         return
     end
-    evt.key == :escape && (m.shutting_down = true)
+    # Escape on Advanced tab cancels stress test or does nothing (don't quit)
+    if evt.key == :escape
+        if m.active_tab == 5
+            if m.stress_state == STRESS_RUNNING
+                _cancel_stress_test!(m)
+            end
+            return
+        end
+        m.shutting_down = true
+    end
 end
 
 function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
@@ -779,31 +930,95 @@ function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
             # Pane 2 (agents) and 3 (detail) — no scrolling yet
         end
     elseif tab == 3
-        if fp == 1 && !isempty(m.tool_results)
-            # Tool call list — navigate within filtered results
+        if fp == 1
+            # Manual navigation disables follow mode
+            m.activity_follow = false
+            # Tool call list — navigate across in-flight + completed entries
+            # Display order: in-flight reversed (newest first), then completed reversed (newest first)
             filter_key = m.activity_filter
-            filtered = Int[]
-            for i = 1:length(m.tool_results)
-                if isempty(filter_key) || m.tool_results[i].session_key == filter_key
-                    push!(filtered, i)
+
+            # Build filtered in-flight indices (display order: reversed)
+            fi_indices = Int[]
+            for i = 1:length(m.inflight_calls)
+                if isempty(filter_key) || m.inflight_calls[i].session_key == filter_key
+                    push!(fi_indices, i)
                 end
             end
-            if !isempty(filtered)
-                cur_pos = findfirst(==(m.selected_result), filtered)
-                if cur_pos === nothing
-                    m.selected_result = filtered[end]
-                elseif evt.key == :up && cur_pos < length(filtered)
-                    m.selected_result = filtered[cur_pos+1]
-                elseif evt.key == :down && cur_pos > 1
-                    m.selected_result = filtered[cur_pos-1]
+            reverse!(fi_indices)
+
+            # Build filtered completed indices (display order: reversed)
+            fc_indices = Int[]
+            for i = 1:length(m.tool_results)
+                if isempty(filter_key) || m.tool_results[i].session_key == filter_key
+                    push!(fc_indices, i)
+                end
+            end
+            reverse!(fc_indices)
+
+            total = length(fi_indices) + length(fc_indices)
+            if total > 0
+                # Find current position in combined list
+                cur = 0
+                if m.selected_inflight > 0
+                    pos = findfirst(==(m.selected_inflight), fi_indices)
+                    if pos !== nothing
+                        cur = pos
+                    end
+                elseif m.selected_result > 0
+                    pos = findfirst(==(m.selected_result), fc_indices)
+                    if pos !== nothing
+                        cur = length(fi_indices) + pos
+                    end
+                end
+
+                # Move selection
+                new_pos = cur
+                if evt.key == :up
+                    new_pos = max(1, cur - 1)
+                elseif evt.key == :down
+                    new_pos = min(total, cur + 1)
+                end
+                if new_pos == 0
+                    new_pos = 1
+                end
+
+                # Map position back to inflight or completed
+                if new_pos <= length(fi_indices)
+                    m.selected_inflight = fi_indices[new_pos]
+                    m.selected_result = 0
+                else
+                    m.selected_inflight = 0
+                    ci = new_pos - length(fi_indices)
+                    m.selected_result = fc_indices[ci]
                 end
             end
             m.result_scroll = 0
+            m._detail_for_result = -1  # force rebuild of detail
         elseif fp == 2
             # Detail panel scroll — delegate to Paragraph widget
             if m.detail_paragraph !== nothing
                 handle_key!(m.detail_paragraph, evt)
             end
+        end
+    elseif tab == 5
+        if fp == 1
+            # Navigate form fields (1-5 = fields, 6 = Run button)
+            if evt.key == :up
+                m.stress_field_idx = max(1, m.stress_field_idx - 1)
+            elseif evt.key == :down
+                m.stress_field_idx = min(6, m.stress_field_idx + 1)
+            end
+        elseif fp == 2
+            # Scroll agent horde
+            step = evt.key in (:pageup, :pagedown) ? 5 : 1
+            if evt.key in (:up, :pageup)
+                m.stress_horde_scroll = max(0, m.stress_horde_scroll - step)
+            elseif evt.key in (:down, :pagedown)
+                m.stress_horde_scroll += step
+            end
+        elseif fp == 3
+            # Scroll log output pane
+            m.stress_scroll_pane !== nothing && handle_key!(m.stress_scroll_pane, evt)
         end
     end
 end
@@ -1500,6 +1715,20 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     # Drain tool call results for Activity tab inspection
     _drain_tool_results!(m.tool_results)
 
+    # Drain in-flight tool call events — track selected ID to detect index shifts
+    _prev_sel_id =
+        if m.selected_inflight > 0 && m.selected_inflight <= length(m.inflight_calls)
+            m.inflight_calls[m.selected_inflight].id
+        else
+            -1
+        end
+    _drain_inflight_buffer!(m.inflight_calls)
+    # Fix selected_inflight if deleteat! shifted indices under us
+    if _prev_sel_id > 0
+        new_idx = findfirst(x -> x.id == _prev_sel_id, m.inflight_calls)
+        m.selected_inflight = new_idx === nothing ? 0 : new_idx
+    end
+
     # Drain streaming REPL output from bridge SUB sockets
     if m.conn_mgr !== nothing
         for msg in drain_stream_messages!(m.conn_mgr)
@@ -1546,6 +1775,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                 dashboard = false,
             )
             m.server_running = true
+            BRIDGE_PORT[] = m.server_port
             _push_log!(:info, "MCP server listening on port $(m.server_port)")
         catch e
             m.server_running = false
@@ -1574,7 +1804,24 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
 
     # ── Tab bar ──
     render(
-        TabBar(["Server", "Sessions", "Activity", "Config"]; active = m.active_tab),
+        TabBar(
+            [
+                [Span("S", tstyle(:warning)), Span("erver", tstyle(:text))],
+                [
+                    Span("S", tstyle(:text)),
+                    Span("e", tstyle(:warning)),
+                    Span("ssions", tstyle(:text)),
+                ],
+                [Span("A", tstyle(:warning)), Span("ctivity", tstyle(:text))],
+                [Span("C", tstyle(:warning)), Span("onfig", tstyle(:text))],
+                [
+                    Span("Ad", tstyle(:text)),
+                    Span("v", tstyle(:warning)),
+                    Span("anced", tstyle(:text)),
+                ],
+            ];
+            active = m.active_tab,
+        ),
         tab_area,
         buf,
     )
@@ -1586,8 +1833,11 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
         view_sessions(m, content_area, buf)
     elseif m.active_tab == 3
         view_activity(m, content_area, buf)
-    else
+    elseif m.active_tab == 4
         view_config(m, content_area, buf)
+    elseif m.active_tab == 5
+        _drain_stress_output!(m)
+        view_advanced(m, content_area, buf)
     end
 
     # ── Status bar ──
@@ -1624,10 +1874,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             ],
             right = [
                 Span("$(uptime) ", tstyle(:text_dim)),
-                Span(
-                    " [s]erver s[e]ssions [a]ctivity [c]onfig  tab:focus [q]uit ",
-                    tstyle(:text_dim),
-                ),
+                Span(" tab:focus [q]uit ", tstyle(:text_dim)),
             ],
         ),
         status_area,
@@ -1803,14 +2050,27 @@ end
 
 """Cycle activity filter: All → session1 → session2 → … → All."""
 function _cycle_activity_filter!(m::MCPReplModel)
-    mgr = m.conn_mgr
-    mgr === nothing && return
-
-    # Collect unique session keys that appear in tool results
+    # Collect unique session keys from both in-flight and completed results
     seen_keys = String[]
+    for ifc in m.inflight_calls
+        if !isempty(ifc.session_key) && ifc.session_key ∉ seen_keys
+            push!(seen_keys, ifc.session_key)
+        end
+    end
     for r in m.tool_results
         if !isempty(r.session_key) && r.session_key ∉ seen_keys
             push!(seen_keys, r.session_key)
+        end
+    end
+
+    # Also pull session keys from active connections (even if no calls yet)
+    mgr = m.conn_mgr
+    if mgr !== nothing
+        for conn in mgr.connections
+            sk = short_key(conn)
+            if !isempty(sk) && sk ∉ seen_keys
+                push!(seen_keys, sk)
+            end
         end
     end
     isempty(seen_keys) && return
@@ -1828,6 +2088,7 @@ function _cycle_activity_filter!(m::MCPReplModel)
     end
     # Reset selection when filter changes
     m.selected_result = 0
+    m.selected_inflight = 0
     m._detail_for_result = -1
 end
 
@@ -1845,8 +2106,17 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     panes = split_layout(m.activity_layout, area)
     length(panes) < 2 && return
 
-    # ── Build filtered index list (indices into tool_results) ──
+    # ── Build filtered in-flight list ──
     filter_key = m.activity_filter
+    filtered_inflight = Int[]  # indices into m.inflight_calls matching filter
+    for i = 1:length(m.inflight_calls)
+        if isempty(filter_key) || m.inflight_calls[i].session_key == filter_key
+            push!(filtered_inflight, i)
+        end
+    end
+    n_inflight = length(filtered_inflight)
+
+    # ── Build filtered completed index list (indices into tool_results) ──
     filtered = Int[]  # indices into m.tool_results matching the filter
     for i = 1:length(m.tool_results)
         if isempty(filter_key) || m.tool_results[i].session_key == filter_key
@@ -1855,26 +2125,89 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     end
     nf = length(filtered)
 
-    # Auto-select newest filtered entry when results arrive and nothing selected
-    if nf > 0 && (m.selected_result == 0 || m.selected_result ∉ filtered)
-        m.selected_result = filtered[end]
+    # Total items in the combined list
+    total_items = n_inflight + nf
+
+    # Track previous selection to detect changes and invalidate detail cache
+    prev_sel_inflight = m.selected_inflight
+    prev_sel_result = m.selected_result
+
+    # If selected_inflight points to an index that no longer exists (call completed),
+    # fall through to completed selection
+    if m.selected_inflight > 0 && m.selected_inflight ∉ filtered_inflight
+        m.selected_inflight = 0
+        # Try to select the newest completed result instead
+        if nf > 0
+            m.selected_result = filtered[end]
+        end
     end
 
-    # ── Top pane: tool call list (newest first) ──
+    # Follow mode: always snap to the newest entry (in-flight preferred)
+    if m.activity_follow
+        if n_inflight > 0
+            m.selected_inflight = filtered_inflight[end]
+            m.selected_result = 0
+        elseif nf > 0
+            m.selected_inflight = 0
+            m.selected_result = filtered[end]
+        end
+    end
+
+    # Auto-select when nothing is selected (initial state or after filter change)
+    if m.selected_inflight == 0 && m.selected_result == 0
+        if n_inflight > 0
+            m.selected_inflight = filtered_inflight[end]
+        elseif nf > 0
+            m.selected_result = filtered[end]
+        end
+    end
+    # If selected_result is stale (no longer in filtered), fix it
+    if m.selected_inflight == 0 && m.selected_result > 0 && m.selected_result ∉ filtered
+        m.selected_result = nf > 0 ? filtered[end] : 0
+    end
+
+    # Invalidate detail cache when selection changed during fixup above
+    if m.selected_inflight != prev_sel_inflight || m.selected_result != prev_sel_result
+        m._detail_for_result = -1
+        m.detail_paragraph = nothing
+    end
+
+    # ── Top pane: tool call list (in-flight at top, then completed newest-first) ──
     items = ListItem[]
     display_sel = 0
-    for (di, ri) in enumerate(Iterators.reverse(filtered))
+    item_idx = 0
+
+    # In-flight calls (newest first = reversed)
+    for ii in reverse(filtered_inflight)
+        item_idx += 1
+        ifc = m.inflight_calls[ii]
+        elapsed = time() - ifc.timestamp
+        elapsed_str =
+            elapsed < 1.0 ? @sprintf("%.0fms", elapsed * 1000) : @sprintf("%.1fs", elapsed)
+        ts = Dates.format(ifc.timestamp_dt, "HH:MM:SS")
+        sess_name = _session_display_name(ifc.session_key)
+        sess_tag = isempty(filter_key) && !isempty(sess_name) ? " [$sess_name]" : ""
+        si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+        label = "$ts $(SPINNER_BRAILLE[si]) $(ifc.tool_name)$sess_tag ($elapsed_str)"
+        push!(items, ListItem(label, tstyle(:warning)))
+        if m.selected_inflight == ii
+            display_sel = item_idx
+        end
+    end
+
+    # Completed calls (newest first)
+    for ri in Iterators.reverse(filtered)
+        item_idx += 1
         r = m.tool_results[ri]
         ts = Dates.format(r.timestamp, "HH:MM:SS")
         marker = r.success ? "✓" : "✗"
         style = r.success ? tstyle(:success) : tstyle(:error)
-        # Show session/REPL name inline when not filtering
         sess_name = _session_display_name(r.session_key)
         sess_tag = isempty(filter_key) && !isempty(sess_name) ? " [$sess_name]" : ""
         label = "$ts $marker $(r.tool_name)$sess_tag ($(r.duration_str))"
         push!(items, ListItem(label, style))
-        if ri == m.selected_result
-            display_sel = di
+        if m.selected_inflight == 0 && ri == m.selected_result
+            display_sel = item_idx
         end
     end
 
@@ -1890,9 +2223,11 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
         name = _session_display_name(filter_key)
         isempty(name) ? filter_key : name
     end
+    count_str = n_inflight > 0 ? "$(n_inflight) running, $nf done" : "$nf"
+    follow_str = m.activity_follow ? "[F]ollow:on" : "[F]ollow:off"
     list_title =
-        isempty(filter_key) ? " Tool Calls ($nf) [f]ilter " :
-        " Tool Calls ($nf) [f] $filter_label "
+        isempty(filter_key) ? " Tool Calls ($count_str) [f]ilter $follow_str " :
+        " Tool Calls ($count_str) [f] $filter_label $follow_str "
 
     render(
         SelectableList(
@@ -1911,8 +2246,15 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     )
 
     # ── Bottom pane: detail panel ──
-    n = length(m.tool_results)
-    if nf == 0 || m.selected_result < 1 || m.selected_result > n
+    # Determine what's selected: in-flight or completed
+    show_inflight =
+        m.selected_inflight > 0 && m.selected_inflight <= length(m.inflight_calls)
+    show_completed =
+        !show_inflight &&
+        m.selected_result > 0 &&
+        m.selected_result <= length(m.tool_results)
+
+    if !show_inflight && !show_completed
         empty_block = Block(
             title = " Details ",
             border_style = _pane_border(m, 3, 2),
@@ -1932,74 +2274,138 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
         return
     end
 
-    r = m.tool_results[m.selected_result]
-
-    # (Re)build the Paragraph when selection or wrap mode changes
-    if m._detail_for_result != m.selected_result || m.detail_paragraph === nothing
+    if show_inflight
+        # Build detail for in-flight call (rebuilt every frame for live elapsed)
+        ifc = m.inflight_calls[m.selected_inflight]
+        elapsed = time() - ifc.timestamp
+        elapsed_str =
+            elapsed < 1.0 ? @sprintf("%.0fms", elapsed * 1000) : @sprintf("%.1fs", elapsed)
         spans = Span[]
+        si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+        _detail_span!(spans, "$(SPINNER_BRAILLE[si]) Running", :warning, "Status:   ")
+        _detail_span!(spans, elapsed_str, :text, "Elapsed:  ")
         _detail_span!(
             spans,
-            r.success ? "✓ Success" : "✗ Failed",
-            r.success ? :success : :error,
-            "Status:   ",
+            Dates.format(ifc.timestamp_dt, "HH:MM:SS"),
+            :text,
+            "Started:  ",
         )
-        _detail_span!(spans, r.duration_str, :text, "Duration: ")
-        _detail_span!(spans, Dates.format(r.timestamp, "HH:MM:SS"), :text, "Time:     ")
-        sess_name = _session_display_name(r.session_key)
+        sess_name = _session_display_name(ifc.session_key)
         if !isempty(sess_name)
-            _detail_span!(spans, "$sess_name ($(r.session_key))", :secondary, "Session:  ")
+            _detail_span!(
+                spans,
+                "$sess_name ($(ifc.session_key))",
+                :secondary,
+                "Session:  ",
+            )
         end
         push!(spans, Span("\n", tstyle(:text)))
         push!(spans, Span("── Arguments ──\n", tstyle(:text_dim)))
         try
-            args_dict = JSON.parse(r.args_json)
+            args_dict = JSON.parse(ifc.args_json)
             for (k, v) in args_dict
                 val_str = v isa AbstractString ? repr(v) : JSON.json(v)
                 push!(spans, Span("  $k: $val_str\n", tstyle(:text)))
             end
         catch
-            push!(spans, Span("  $(r.args_json)\n", tstyle(:text)))
+            push!(spans, Span("  $(ifc.args_json)\n", tstyle(:text)))
         end
-        push!(spans, Span("\n", tstyle(:text)))
-        push!(spans, Span("── Result ──\n", tstyle(:text_dim)))
-        for ln in split(r.result_text, '\n')
-            push!(spans, Span("  " * string(ln) * "\n", tstyle(:text)))
+        if !isempty(ifc.progress_lines)
+            push!(spans, Span("\n", tstyle(:text)))
+            push!(spans, Span("── Progress ──\n", tstyle(:text_dim)))
+            # Show last N progress lines to keep detail readable
+            start_idx = max(1, length(ifc.progress_lines) - 50)
+            for i = start_idx:length(ifc.progress_lines)
+                push!(spans, Span("  " * ifc.progress_lines[i] * "\n", tstyle(:text)))
+            end
         end
         wrap_mode = m.result_word_wrap ? word_wrap : no_wrap
-        m.detail_paragraph = Paragraph(spans; wrap = wrap_mode)
-        m._detail_for_result = m.selected_result
-    end
-
-    # Update wrap mode if toggled without selection change
-    target_wrap = m.result_word_wrap ? word_wrap : no_wrap
-    if m.detail_paragraph.wrap != target_wrap
-        m.detail_paragraph.wrap = target_wrap
-        m.detail_paragraph.scroll_offset = 0
-    end
-
-    # Compute scroll info for title
-    pane_inner_h = panes[2].height - 2
-    pane_inner_w = panes[2].width - 2
-    total_lines = paragraph_line_count(m.detail_paragraph, pane_inner_w)
-    offset = m.detail_paragraph.scroll_offset
-    has_scroll = total_lines > pane_inner_h
-
-    wrap_hint = m.result_word_wrap ? "w:on" : "w:off"
-    detail_title = if has_scroll
-        top_line = offset + 1
-        bot_line = min(offset + pane_inner_h, total_lines)
-        " $(r.tool_name) [$top_line-$bot_line/$total_lines] $wrap_hint "
+        p = Paragraph(spans; wrap = wrap_mode)
+        detail_title = " $(ifc.tool_name) (running) "
+        p.block = Block(
+            title = detail_title,
+            border_style = _pane_border(m, 3, 2),
+            title_style = _pane_title(m, 3, 2),
+        )
+        render(p, panes[2], buf)
+        # Don't cache the paragraph — it changes every frame
+        m.detail_paragraph = nothing
+        m._detail_for_result = -1
     else
-        " $(r.tool_name) $wrap_hint "
+        r = m.tool_results[m.selected_result]
+
+        # (Re)build the Paragraph when selection or wrap mode changes
+        if m._detail_for_result != m.selected_result || m.detail_paragraph === nothing
+            spans = Span[]
+            _detail_span!(
+                spans,
+                r.success ? "✓ Success" : "✗ Failed",
+                r.success ? :success : :error,
+                "Status:   ",
+            )
+            _detail_span!(spans, r.duration_str, :text, "Duration: ")
+            _detail_span!(spans, Dates.format(r.timestamp, "HH:MM:SS"), :text, "Time:     ")
+            sess_name = _session_display_name(r.session_key)
+            if !isempty(sess_name)
+                _detail_span!(
+                    spans,
+                    "$sess_name ($(r.session_key))",
+                    :secondary,
+                    "Session:  ",
+                )
+            end
+            push!(spans, Span("\n", tstyle(:text)))
+            push!(spans, Span("── Arguments ──\n", tstyle(:text_dim)))
+            try
+                args_dict = JSON.parse(r.args_json)
+                for (k, v) in args_dict
+                    val_str = v isa AbstractString ? repr(v) : JSON.json(v)
+                    push!(spans, Span("  $k: $val_str\n", tstyle(:text)))
+                end
+            catch
+                push!(spans, Span("  $(r.args_json)\n", tstyle(:text)))
+            end
+            push!(spans, Span("\n", tstyle(:text)))
+            push!(spans, Span("── Result ──\n", tstyle(:text_dim)))
+            for ln in split(r.result_text, '\n')
+                push!(spans, Span("  " * string(ln) * "\n", tstyle(:text)))
+            end
+            wrap_mode = m.result_word_wrap ? word_wrap : no_wrap
+            m.detail_paragraph = Paragraph(spans; wrap = wrap_mode)
+            m._detail_for_result = m.selected_result
+        end
+
+        # Update wrap mode if toggled without selection change
+        target_wrap = m.result_word_wrap ? word_wrap : no_wrap
+        if m.detail_paragraph.wrap != target_wrap
+            m.detail_paragraph.wrap = target_wrap
+            m.detail_paragraph.scroll_offset = 0
+        end
+
+        # Compute scroll info for title
+        pane_inner_h = panes[2].height - 2
+        pane_inner_w = panes[2].width - 2
+        total_lines = paragraph_line_count(m.detail_paragraph, pane_inner_w)
+        offset = m.detail_paragraph.scroll_offset
+        has_scroll = total_lines > pane_inner_h
+
+        wrap_hint = m.result_word_wrap ? "w:on" : "w:off"
+        detail_title = if has_scroll
+            top_line = offset + 1
+            bot_line = min(offset + pane_inner_h, total_lines)
+            " $(r.tool_name) [$top_line-$bot_line/$total_lines] $wrap_hint "
+        else
+            " $(r.tool_name) $wrap_hint "
+        end
+
+        m.detail_paragraph.block = Block(
+            title = detail_title,
+            border_style = _pane_border(m, 3, 2),
+            title_style = _pane_title(m, 3, 2),
+        )
+
+        render(m.detail_paragraph, panes[2], buf)
     end
-
-    m.detail_paragraph.block = Block(
-        title = detail_title,
-        border_style = _pane_border(m, 3, 2),
-        title_style = _pane_title(m, 3, 2),
-    )
-
-    render(m.detail_paragraph, panes[2], buf)
 
     # Render the draggable divider between panes
     render_resize_handles!(buf, m.activity_layout)
@@ -2478,6 +2884,992 @@ function _render_result_modal(
     y += 1
     if y <= bottom(inner)
         set_string!(buf, x, y, "Press any key to close", tstyle(:text_dim))
+    end
+end
+
+# ── Advanced Tab: Stress Test Runner ─────────────────────────────────────────
+# StressAgentResult, _write_stress_script, _STRESS_SCRIPT_SOURCE,
+# _parse_stress_kv, and _parse_stress_results live in stress_test.jl
+
+"""Launch the stress test process."""
+function _launch_stress_test!(m::MCPReplModel)
+    m.stress_state == STRESS_RUNNING && return
+
+    # Get session info
+    sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+    if isempty(sessions)
+        m.stress_state = STRESS_ERROR
+        lock(m.stress_output_lock) do
+            push!(
+                m.stress_output,
+                "ERROR agent=0 elapsed=0.0 message=no_connected_sessions",
+            )
+        end
+        return
+    end
+
+    idx = clamp(m.stress_session_idx, 1, length(sessions))
+    sess = sessions[idx]
+    sess_key = short_key(sess)
+
+    code = m.stress_code
+    n_agents = tryparse(Int, m.stress_agents)
+    n_agents === nothing && (n_agents = 5)
+    stagger_val = tryparse(Float64, m.stress_stagger)
+    stagger_val === nothing && (stagger_val = 0.0)
+    timeout_val = tryparse(Int, m.stress_timeout)
+    timeout_val === nothing && (timeout_val = 30)
+
+    # Reset state
+    lock(m.stress_output_lock) do
+        empty!(m.stress_output)
+    end
+    m.stress_scroll_pane = ScrollPane(
+        Vector{Span}[];
+        following = true,
+        reverse = false,
+        block = nothing,
+        show_scrollbar = true,
+    )
+    m.stress_result_file = ""
+    m.stress_state = STRESS_RUNNING
+
+    script_path = _write_stress_script()
+    project_dir = pkgdir(@__MODULE__)
+    cmd = `$(Base.julia_cmd()) --startup-file=no --project=$project_dir $script_path $(m.server_port) $sess_key $code $n_agents $stagger_val $timeout_val`
+
+    Threads.@spawn try
+        process = open(cmd, "r")
+        m.stress_process = process
+        while !eof(process)
+            line = readline(process; keep = false)
+            isempty(line) && continue
+            lock(m.stress_output_lock) do
+                push!(m.stress_output, line)
+            end
+        end
+        # Process finished
+        exit_code = try
+            wait(process)
+            process.exitcode
+        catch
+            -1
+        end
+        m.stress_process = nothing
+
+        # Write results file
+        _write_stress_results!(m, code, sess_key, n_agents, stagger_val, timeout_val)
+
+        # Check actual results — did any agents fail?
+        all_output = lock(m.stress_output_lock) do
+            copy(m.stress_output)
+        end
+        agents = _parse_stress_results(all_output)
+        has_failures = any(a -> a.status == :fail, agents)
+
+        if exit_code != 0
+            m.stress_state = STRESS_ERROR
+        elseif has_failures
+            m.stress_state = STRESS_ERROR
+        else
+            m.stress_state = STRESS_COMPLETE
+        end
+    catch e
+        m.stress_process = nothing
+        lock(m.stress_output_lock) do
+            push!(
+                m.stress_output,
+                "ERROR agent=0 elapsed=0.0 message=$(sprint(showerror, e))",
+            )
+        end
+        m.stress_state = STRESS_ERROR
+    end
+end
+
+"""Cancel a running stress test."""
+function _cancel_stress_test!(m::MCPReplModel)
+    m.stress_state != STRESS_RUNNING && return
+    proc = m.stress_process
+    if proc !== nothing
+        try
+            kill(proc)
+        catch
+        end
+        m.stress_process = nothing
+    end
+    lock(m.stress_output_lock) do
+        push!(m.stress_output, "CANCELLED")
+    end
+    m.stress_state = STRESS_IDLE
+end
+
+"""Write stress test results to a file (delegates to shared _write_stress_results_to_file)."""
+function _write_stress_results!(m::MCPReplModel, code, sess_key, n_agents, stagger, timeout)
+    all_output = lock(m.stress_output_lock) do
+        copy(m.stress_output)
+    end
+    path = _write_stress_results_to_file(
+        all_output,
+        code,
+        sess_key,
+        n_agents,
+        stagger,
+        timeout,
+    )
+    if path !== nothing
+        m.stress_result_file = path
+    end
+end
+
+"""Drain buffered stress output lines into the ScrollPane each frame."""
+function _drain_stress_output!(m::MCPReplModel)
+    m.stress_scroll_pane === nothing && return
+    pane = m.stress_scroll_pane::ScrollPane
+    new_lines = lock(m.stress_output_lock) do
+        if isempty(m.stress_output)
+            return String[]
+        end
+        # Return lines that haven't been synced to pane yet
+        # We track by comparing lengths
+        total = length(m.stress_output)
+        synced = length(pane.content)
+        if total > synced
+            return m.stress_output[synced+1:total]
+        end
+        return String[]
+    end
+    for line in new_lines
+        push_line!(pane, _stress_line_spans(line, m.tick))
+    end
+end
+
+"""Convert a stress output line to styled Spans."""
+function _stress_line_spans(line::String, tick::Int)::Vector{Span}
+    if startswith(line, "INIT ")
+        kv = _parse_stress_kv(line)
+        aid = get(kv, "agent", "?")
+        sid = get(kv, "session", "?")
+        return Span[
+            Span("[Agent $aid] ", tstyle(:secondary)),
+            Span("initialized ", tstyle(:text_dim)),
+            Span("session=$sid", tstyle(:text_dim)),
+        ]
+    elseif startswith(line, "SEND ")
+        kv = _parse_stress_kv(line)
+        aid = get(kv, "agent", "?")
+        return Span[
+            Span("[Agent $aid] ", tstyle(:secondary)),
+            Span("SENDING tool call...", tstyle(:accent)),
+        ]
+    elseif startswith(line, "SEND_ALL ")
+        kv = _parse_stress_kv(line)
+        n = get(kv, "count", "?")
+        return Span[
+            Span(">>> ", tstyle(:accent, bold = true)),
+            Span("Firing $n tool calls concurrently", tstyle(:accent, bold = true)),
+        ]
+    elseif startswith(line, "PROGRESS ")
+        kv = _parse_stress_kv(line)
+        aid = get(kv, "agent", "?")
+        elapsed = get(kv, "elapsed", "?")
+        step = get(kv, "step", "?")
+        msg = get(kv, "message", "")
+        return Span[
+            Span("[Agent $aid] ", tstyle(:secondary)),
+            Span("(+$(elapsed)s) ", tstyle(:text_dim)),
+            Span("PROGRESS #$step ", tstyle(:warning)),
+            Span(msg, tstyle(:text)),
+        ]
+    elseif startswith(line, "RESULT ")
+        kv = _parse_stress_kv(line)
+        aid = get(kv, "agent", "?")
+        elapsed = get(kv, "elapsed", "?")
+        ok = get(kv, "ok", "false")
+        is_ok = ok == "true"
+        result_text = get(kv, "result", "")
+        return Span[
+            Span("[Agent $aid] ", tstyle(:secondary)),
+            Span("(+$(elapsed)s) ", tstyle(:text_dim)),
+            Span(is_ok ? "OK " : "FAIL ", tstyle(is_ok ? :success : :error, bold = true)),
+            Span(result_text, tstyle(:text)),
+        ]
+    elseif startswith(line, "ERROR ")
+        kv = _parse_stress_kv(line)
+        aid = get(kv, "agent", "?")
+        elapsed = get(kv, "elapsed", "?")
+        msg = get(kv, "message", "unknown")
+        return Span[
+            Span("[Agent $aid] ", tstyle(:secondary)),
+            Span("(+$(elapsed)s) ", tstyle(:text_dim)),
+            Span("ERROR: ", tstyle(:error, bold = true)),
+            Span(msg, tstyle(:error)),
+        ]
+    elseif startswith(line, "SUMMARY ")
+        kv = _parse_stress_kv(line)
+        tt = get(kv, "total_time", "?")
+        succ = get(kv, "succeeded", "?")
+        fail = get(kv, "failed", "?")
+        return Span[
+            Span("SUMMARY ", tstyle(:accent, bold = true)),
+            Span("$(tt)s total  ", tstyle(:text)),
+            Span("$succ ok  ", tstyle(:success, bold = true)),
+            Span("$fail failed", tstyle(parse(Int, fail) > 0 ? :error : :text_dim)),
+        ]
+    elseif startswith(line, "START ")
+        kv = _parse_stress_kv(line)
+        n = get(kv, "agents", "?")
+        return Span[
+            Span(">>> ", tstyle(:accent, bold = true)),
+            Span("Stress test: $n agents", tstyle(:accent, bold = true)),
+        ]
+    elseif line == "DONE"
+        return Span[Span(">>> Complete", tstyle(:success, bold = true))]
+    elseif line == "CANCELLED"
+        return Span[Span(">>> Cancelled by user", tstyle(:warning, bold = true))]
+    else
+        return Span[Span(line, tstyle(:text))]
+    end
+end
+
+"""Handle all key events while a stress form field is in edit mode.
+This intercepts ALL input (including numbers, letters) so global shortcuts don't fire."""
+function _handle_stress_field_edit!(m::MCPReplModel, evt::KeyEvent)
+    fi = m.stress_field_idx
+
+    if fi == 1 && m.stress_code_area !== nothing
+        # Code field — full CodeEditor editing
+        if evt.key == :escape
+            m.stress_code = Tachikoma.text(m.stress_code_area)
+            m.stress_editing = false
+            return
+        end
+        m.stress_code_area.tick = m.tick
+        handle_key!(m.stress_code_area, evt)
+    elseif fi == 2
+        # Session selector — left/right to cycle, Enter/Escape to close
+        if evt.key in (:escape, :enter)
+            m.stress_editing = false
+        elseif evt.key == :left
+            sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+            n = max(1, length(sessions))
+            m.stress_session_idx = mod1(m.stress_session_idx - 1, n)
+        elseif evt.key == :right
+            sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+            n = max(1, length(sessions))
+            m.stress_session_idx = mod1(m.stress_session_idx + 1, n)
+        end
+    else
+        # Inline text fields (Agents, Stagger, Timeout)
+        if evt.key == :escape || evt.key == :enter
+            m.stress_editing = false
+        elseif evt.key == :char
+            if fi == 3
+                m.stress_agents *= evt.char
+            elseif fi == 4
+                m.stress_stagger *= evt.char
+            elseif fi == 5
+                m.stress_timeout *= evt.char
+            end
+        elseif evt.key == :backspace
+            if fi == 3
+                m.stress_agents = _stress_backspace(m.stress_agents)
+            elseif fi == 4
+                m.stress_stagger = _stress_backspace(m.stress_stagger)
+            elseif fi == 5
+                m.stress_timeout = _stress_backspace(m.stress_timeout)
+            end
+        end
+    end
+end
+
+"""Handle char key events on the Advanced tab (when NOT in field edit mode)."""
+function _handle_stress_key!(m::MCPReplModel, evt::KeyEvent)
+    # Nothing to do for char events when not editing — form navigation is
+    # handled by up/down in _handle_scroll!, and Enter opens edit mode.
+end
+
+"""Handle Enter on the Advanced tab — open field for editing or run."""
+function _handle_stress_enter!(m::MCPReplModel)
+    m.stress_state == STRESS_RUNNING && return
+
+    fp = get(m.focused_pane, 5, 1)
+    if fp == 1
+        fi = m.stress_field_idx
+        if fi == 1
+            # Code field: open the CodeEditor (syntax highlighting + line numbers)
+            m.stress_code_area =
+                CodeEditor(text = m.stress_code, focused = true, tick = m.tick)
+            m.stress_editing = true
+        elseif fi == 6
+            # Run button: launch the test
+            _launch_stress_test!(m)
+        else
+            # Fields 2-5: enter edit mode for this field
+            m.stress_editing = true
+        end
+    end
+end
+
+"""Handle left/right arrow keys on the Advanced tab (not in edit mode)."""
+function _handle_stress_arrow!(m::MCPReplModel, evt::KeyEvent)
+    # Left/right do nothing outside of edit mode
+end
+
+"""Delete the last character from a string."""
+function _stress_backspace(s::String)::String
+    isempty(s) ? s : s[1:prevind(s, lastindex(s))]
+end
+
+
+# ── Advanced Tab View ────────────────────────────────────────────────────────
+
+function view_advanced(m::MCPReplModel, area::Rect, buf::Buffer)
+    panes = split_layout(m.advanced_layout, area)
+    length(panes) < 2 && return
+
+    # ── Top pane: Configuration form ──
+    _view_stress_form(m, panes[1], buf)
+
+    # ── Bottom pane: Output with live agent visualization ──
+    _view_stress_output(m, panes[2], buf)
+
+    render_resize_handles!(buf, m.advanced_layout)
+end
+
+"""Render the stress test configuration form."""
+function _view_stress_form(m::MCPReplModel, area::Rect, buf::Buffer)
+    is_running = m.stress_state == STRESS_RUNNING
+    fp = get(m.focused_pane, 5, 1)
+    form_focused = fp == 1
+
+    # If code editor is open, render it as an overlay instead of the form
+    if m.stress_editing && m.stress_field_idx == 1 && m.stress_code_area !== nothing
+        _view_stress_code_editor(m, area, buf)
+        return
+    end
+
+    # Animated border when running
+    if is_running && animations_enabled()
+        border_shimmer!(
+            buf,
+            area,
+            tstyle(:warning).fg,
+            m.tick;
+            box = BOX_HEAVY,
+            intensity = 0.2,
+        )
+        if area.width > 4
+            si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+            title = " $(SPINNER_BRAILLE[si]) Stress Test Running... "
+            set_string!(buf, area.x + 2, area.y, title, tstyle(:warning, bold = true))
+        end
+        inner =
+            Rect(area.x + 1, area.y + 1, max(0, area.width - 2), max(0, area.height - 2))
+    else
+        title_style = form_focused ? tstyle(:accent, bold = true) : tstyle(:text_dim)
+        border_style = form_focused ? tstyle(:accent) : tstyle(:border)
+        block = Block(
+            title = " Stress Test Configuration ",
+            border_style = border_style,
+            title_style = title_style,
+        )
+        inner = render(block, area, buf)
+    end
+    inner.width < 10 && return
+
+    # Clear interior
+    for row = inner.y:bottom(inner)
+        for col = inner.x:right(inner)
+            set_char!(buf, col, row, ' ', Style())
+        end
+    end
+
+    x = inner.x + 1
+    y = inner.y
+    label_w = 10
+    fi = m.stress_field_idx
+
+    sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+    sess_name = if !isempty(sessions)
+        idx = clamp(m.stress_session_idx, 1, length(sessions))
+        sessions[idx].name
+    else
+        "(no sessions)"
+    end
+
+    # ── Field 1: Code (multiline preview, Enter to edit) ──
+    is_code_active = !is_running && form_focused && fi == 1
+    set_string!(buf, x, y, rpad("Code:", label_w), tstyle(:text_dim))
+    vx = x + label_w
+    vw = inner.width - label_w - 2
+    # Show first line of code as preview
+    code_lines = Base.split(m.stress_code, '\n')
+    preview = first(code_lines)
+    n_extra = length(code_lines) - 1
+    suffix = n_extra > 0 ? " (+$(n_extra) lines)" : ""
+    if is_code_active
+        set_string!(
+            buf,
+            vx,
+            y,
+            first(string(preview), max(1, vw - length(suffix))),
+            tstyle(:accent, bold = true),
+        )
+        set_string!(
+            buf,
+            vx + min(length(preview), vw - length(suffix)),
+            y,
+            suffix,
+            tstyle(:text_dim),
+        )
+        # Hint
+        hint = " [Enter] edit"
+        hint_x = right(inner) - length(hint)
+        if hint_x > vx + length(preview) + length(suffix)
+            set_string!(buf, hint_x, y, hint, tstyle(:accent))
+        end
+    else
+        display = first(string(preview) * suffix, vw)
+        set_string!(buf, vx, y, display, tstyle(:text))
+    end
+    y += 1
+
+    # ── Fields 2-5: Session, Agents, Stagger, Timeout ──
+    inline_fields = [
+        ("Session:", sess_name, 2),
+        ("Agents:", m.stress_agents, 3),
+        ("Stagger:", m.stress_stagger, 4),
+        ("Timeout:", m.stress_timeout, 5),
+    ]
+
+    for (label, value, idx) in inline_fields
+        y > bottom(inner) - 2 && break
+        is_focused = !is_running && form_focused && fi == idx
+        is_editing_this = is_focused && m.stress_editing
+
+        set_string!(buf, x, y, rpad(label, label_w), tstyle(:text_dim))
+
+        display_val = if idx == 2
+            n = length(sessions)
+            n > 1 ? "◂ $value ▸" : value
+        else
+            value
+        end
+
+        if is_editing_this
+            # In edit mode — bright highlight + cursor
+            field_text = length(display_val) > vw ? first(display_val, vw) : display_val
+            set_string!(buf, vx, y, field_text, tstyle(:accent, bold = true))
+            if idx != 2  # text cursor on text fields
+                cursor_x = vx + min(length(display_val), vw)
+                if cursor_x <= right(inner) && m.tick % 30 < 20
+                    set_char!(buf, cursor_x, y, '▎', tstyle(:accent))
+                end
+            end
+            # Hints for editing mode
+            hint = idx == 2 ? " [◂▸] cycle  [Esc/Enter] done" : " [Esc/Enter] done"
+            hint_x = right(inner) - length(hint)
+            if hint_x > vx + length(display_val)
+                set_string!(buf, hint_x, y, hint, tstyle(:text_dim))
+            end
+        elseif is_focused
+            # Focused but not editing — dim highlight + Enter hint
+            field_text = length(display_val) > vw ? first(display_val, vw) : display_val
+            set_string!(buf, vx, y, field_text, tstyle(:accent))
+            hint = " [Enter] edit"
+            hint_x = right(inner) - length(hint)
+            if hint_x > vx + length(display_val)
+                set_string!(buf, hint_x, y, hint, tstyle(:text_dim))
+            end
+        else
+            set_string!(buf, vx, y, first(display_val, vw), tstyle(:text))
+        end
+        y += 1
+    end
+
+    # ── Field 6: Run / Cancel button ──
+    y += 1
+    if y <= bottom(inner)
+        if is_running
+            cancel_label = "[ Cancel (Esc) ]"
+            if animations_enabled()
+                p = pulse(m.tick; period = 40, lo = 0.5, hi = 1.0)
+                base = to_rgb(tstyle(:error).fg)
+                pulsed = brighten(base, (1.0 - p) * 0.3)
+                set_string!(buf, x + 2, y, cancel_label, Style(fg = pulsed, bold = true))
+            else
+                set_string!(buf, x + 2, y, cancel_label, tstyle(:error, bold = true))
+            end
+        else
+            run_label = "[ Run Stress Test ]"
+            btn_x = x + 2
+            btn_focused = form_focused && fi == 6
+            if btn_focused
+                if animations_enabled()
+                    p = pulse(m.tick; period = 60, lo = 0.0, hi = 0.25)
+                    base = to_rgb(tstyle(:accent).fg)
+                    pulsed = brighten(base, p)
+                    set_string!(buf, btn_x, y, run_label, Style(fg = pulsed, bold = true))
+                else
+                    set_string!(buf, btn_x, y, run_label, tstyle(:accent, bold = true))
+                end
+                hint_x = btn_x + length(run_label) + 2
+                if hint_x + 10 <= right(inner)
+                    set_string!(buf, hint_x, y, "[Enter] run", tstyle(:text_dim))
+                end
+            else
+                set_string!(buf, btn_x, y, run_label, tstyle(:text_dim))
+            end
+        end
+    end
+
+    # ── Bottom hint bar ──
+    y += 1
+    if y <= bottom(inner) && !is_running
+        set_string!(
+            buf,
+            x,
+            y,
+            "[↑↓] navigate  [Tab] switch pane  [Enter] interact",
+            tstyle(:text_dim),
+        )
+    end
+end
+
+"""Render the code editor overlay (TextArea in a bordered panel)."""
+function _view_stress_code_editor(m::MCPReplModel, area::Rect, buf::Buffer)
+    ce = m.stress_code_area
+    ce.tick = m.tick
+
+    # Shimmer border for the editor
+    if animations_enabled()
+        border_shimmer!(
+            buf,
+            area,
+            tstyle(:accent).fg,
+            m.tick;
+            box = BOX_HEAVY,
+            intensity = 0.12,
+        )
+        if area.width > 4
+            set_string!(
+                buf,
+                area.x + 2,
+                area.y,
+                " Code Editor ",
+                tstyle(:accent, bold = true),
+            )
+        end
+        inner =
+            Rect(area.x + 1, area.y + 1, max(0, area.width - 2), max(0, area.height - 2))
+    else
+        block = Block(
+            title = " Code Editor ",
+            border_style = tstyle(:accent, bold = true),
+            title_style = tstyle(:accent, bold = true),
+            box = BOX_HEAVY,
+        )
+        inner = render(block, area, buf)
+    end
+    inner.width < 4 && return
+
+    # Clear interior
+    for row = inner.y:bottom(inner)
+        for col = inner.x:right(inner)
+            set_char!(buf, col, row, ' ', Style())
+        end
+    end
+
+    # Render the CodeEditor in the main area, leaving 1 row for the hint
+    editor_h = max(1, inner.height - 1)
+    render(ce, Rect(inner.x, inner.y, inner.width, editor_h), buf)
+
+    # Hint bar at bottom
+    hint_y = inner.y + editor_h
+    if hint_y <= bottom(inner)
+        set_string!(
+            buf,
+            inner.x + 1,
+            hint_y,
+            "[Esc] save and close  [Tab] indent",
+            tstyle(:text_dim),
+        )
+        # Show line count
+        n_lines = length(ce.lines)
+        line_info = "$(ce.cursor_row):$(ce.cursor_col) ($(n_lines) lines)"
+        info_x = right(inner) - length(line_info)
+        if info_x > inner.x + 36
+            set_string!(buf, info_x, hint_y, line_info, tstyle(:text_dim))
+        end
+    end
+end
+
+"""Render the stress test output pane with live agent visualization."""
+function _view_stress_output(m::MCPReplModel, area::Rect, buf::Buffer)
+    fp = get(m.focused_pane, 5, 1)
+    horde_focused = fp == 2
+    log_focused = fp == 3
+
+    all_output = lock(m.stress_output_lock) do
+        copy(m.stress_output)
+    end
+    agents = _parse_stress_results(all_output)
+
+    # If we have agent data and enough space, split into visualization + log
+    has_agents = !isempty(agents)
+    show_viz = has_agents && area.height > 8 && area.width > 30
+
+    if show_viz
+        # Split: left side for agent horde visualization, right side for log
+        viz_w = min(max(area.width ÷ 3, 24), 40)
+        log_w = area.width - viz_w
+
+        viz_area = Rect(area.x, area.y, viz_w, area.height)
+        log_area = Rect(area.x + viz_w, area.y, log_w, area.height)
+
+        _view_agent_horde(m, viz_area, buf, agents, horde_focused)
+        _view_stress_log(m, log_area, buf, log_focused)
+    else
+        _view_stress_log(m, area, buf, log_focused)
+    end
+end
+
+"""Render the scrollable log output."""
+function _view_stress_log(m::MCPReplModel, area::Rect, buf::Buffer, focused::Bool)
+    # Build title
+    title = if m.stress_state == STRESS_RUNNING
+        si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+        " $(SPINNER_BRAILLE[si]) Output "
+    elseif m.stress_state == STRESS_COMPLETE
+        result_hint = isempty(m.stress_result_file) ? "" : " saved "
+        " Output (complete$result_hint) "
+    elseif m.stress_state == STRESS_ERROR
+        " Output (error) "
+    else
+        " Output "
+    end
+
+    # Ensure scroll pane exists
+    if m.stress_scroll_pane === nothing
+        m.stress_scroll_pane = ScrollPane(
+            Vector{Span}[];
+            following = true,
+            reverse = false,
+            block = nothing,
+            show_scrollbar = true,
+        )
+    end
+    pane = m.stress_scroll_pane::ScrollPane
+    pane.block = Block(
+        title = title,
+        border_style = focused ? tstyle(:accent) : tstyle(:border),
+        title_style = focused ? tstyle(:accent, bold = true) : tstyle(:text_dim),
+    )
+
+    render(pane, area, buf)
+end
+
+"""Render the agent horde visualization — a live view of all agents' status."""
+function _view_agent_horde(
+    m::MCPReplModel,
+    area::Rect,
+    buf::Buffer,
+    agents::Vector{StressAgentResult},
+    focused::Bool = false,
+)
+    n = length(agents)
+    n == 0 && return
+
+    is_running = m.stress_state == STRESS_RUNNING
+    is_complete = m.stress_state in (STRESS_COMPLETE, STRESS_ERROR)
+    has_failures = any(a -> a.status == :fail, agents)
+
+    # Compute content height to clamp scroll
+    w_est = max(1, max(0, area.width - 4))
+    cell_w_est = max(8, min(12, w_est ÷ max(1, min(n, 5))))
+    grid_cols_est = max(1, w_est ÷ cell_w_est)
+    rows_needed_est = cld(n, grid_cols_est)
+    # Total content: 2 rows for gauge + rows_needed*3 for agent cells + 6 for sparkline
+    content_h = 2 + rows_needed_est * 3 + (is_complete ? 6 : 0)
+    viewport_h = max(0, area.height - 2)  # inner height
+    max_scroll = max(0, content_h - viewport_h)
+    m.stress_horde_scroll = clamp(m.stress_horde_scroll, 0, max_scroll)
+    scroll_off = m.stress_horde_scroll
+
+    # Scroll indicator suffix for title
+    scroll_hint = if max_scroll > 0
+        top_row = scroll_off + 1
+        bot_row = min(content_h, scroll_off + viewport_h)
+        " [$top_row-$bot_row/$content_h]"
+    else
+        ""
+    end
+
+    # Border with shimmer when running
+    if is_running && animations_enabled()
+        border_shimmer!(
+            buf,
+            area,
+            focused ? tstyle(:accent).fg : tstyle(:border).fg,
+            m.tick;
+            box = BOX_HEAVY,
+            intensity = focused ? 0.3 : 0.2,
+        )
+        if area.width > 4
+            set_string!(
+                buf,
+                area.x + 2,
+                area.y,
+                " Agent Horde$scroll_hint ",
+                tstyle(:accent, bold = true),
+            )
+        end
+        inner =
+            Rect(area.x + 1, area.y + 1, max(0, area.width - 2), max(0, area.height - 2))
+    elseif is_complete && animations_enabled()
+        border_color = has_failures ? tstyle(:warning).fg : tstyle(:success).fg
+        border_shimmer!(
+            buf,
+            area,
+            focused ? border_color : tstyle(:border).fg,
+            m.tick;
+            box = BOX_HEAVY,
+            intensity = focused ? 0.2 : 0.1,
+        )
+        if area.width > 4
+            n_ok = count(a -> a.status == :ok, agents)
+            title =
+                has_failures ? " Horde ($n_ok/$n)$scroll_hint " :
+                " Horde (all passed)$scroll_hint "
+            set_string!(
+                buf,
+                area.x + 2,
+                area.y,
+                title,
+                tstyle(has_failures ? :warning : :success, bold = true),
+            )
+        end
+        inner =
+            Rect(area.x + 1, area.y + 1, max(0, area.width - 2), max(0, area.height - 2))
+    else
+        block = Block(
+            title = " Agent Horde$scroll_hint ",
+            border_style = focused ? tstyle(:accent) : tstyle(:border),
+            title_style = focused ? tstyle(:accent, bold = true) : tstyle(:text_dim),
+        )
+        inner = render(block, area, buf)
+    end
+    inner.width < 6 && return
+
+    # Animated noise background while running
+    if is_running && animations_enabled()
+        fill_noise!(
+            buf,
+            inner,
+            tstyle(:border).fg,
+            tstyle(:text_dim).fg,
+            m.tick;
+            scale = 0.3,
+            speed = 0.02,
+        )
+    else
+        for row = inner.y:bottom(inner)
+            for col = inner.x:right(inner)
+                set_char!(buf, col, row, ' ', Style())
+            end
+        end
+    end
+
+    x = inner.x + 1
+    y_base = inner.y  # top of the viewport
+    w = inner.width - 2
+    y_bottom = bottom(inner)
+
+    # All content is rendered at virtual y positions, then shifted by -scroll_off.
+    # We only draw cells that fall within the viewport.
+    vy = 0  # virtual y offset from content top
+
+    # Summary stats
+    n_ok = count(a -> a.status == :ok, agents)
+    n_fail = count(a -> a.status == :fail, agents)
+    n_active = count(a -> a.status in (:sending, :running), agents)
+
+    if is_complete
+        # Completion gauge with shimmer
+        screen_y = y_base + vy - scroll_off
+        if screen_y >= y_base && screen_y <= y_bottom
+            ratio = n > 0 ? n_ok / n : 0.0
+            gauge = Gauge(
+                ratio;
+                label = "$(n_ok)/$(n) passed",
+                filled_style = tstyle(:success),
+                empty_style = n_fail > 0 ? tstyle(:error) : tstyle(:text_dim),
+                tick = m.tick,
+            )
+            render(gauge, Rect(x, screen_y, w, 1), buf)
+        end
+        vy += 2
+    elseif is_running
+        # Animated running progress bar
+        screen_y = y_base + vy - scroll_off
+        if screen_y >= y_base && screen_y <= y_bottom
+            done_count = n_ok + n_fail
+            ratio = n > 0 ? done_count / n : 0.0
+            si = mod1(m.tick ÷ 2, length(SPINNER_BRAILLE))
+            gauge = Gauge(
+                ratio;
+                label = "$(SPINNER_BRAILLE[si]) $(done_count)/$(n) ($n_active active)",
+                filled_style = tstyle(:accent),
+                empty_style = tstyle(:text_dim),
+                tick = m.tick,
+            )
+            render(gauge, Rect(x, screen_y, w, 1), buf)
+        end
+        vy += 2
+    end
+
+    # Agent grid — each agent as a compact cell with animated effects
+    cell_w = max(8, min(12, w ÷ max(1, min(n, 5))))
+    grid_cols = max(1, w ÷ cell_w)
+    rows_needed = cld(n, grid_cols)
+
+    # Color wave palette for active agents
+    wave_colors = [tstyle(:accent).fg, tstyle(:primary).fg, tstyle(:secondary).fg]
+
+    for (i, agent) in enumerate(agents)
+        ci = mod1(i, grid_cols) - 1
+        ri = (i - 1) ÷ grid_cols
+        ax = x + ci * cell_w
+        ay_virtual = vy + ri * 3  # virtual y position for this agent cell
+
+        # Convert to screen coordinates
+        ay = y_base + ay_virtual - scroll_off
+
+        # Skip if entirely above viewport
+        ay + 2 < y_base && continue
+        # Stop if entirely below viewport
+        ay > y_bottom && break
+
+        # Agent icon and status with per-agent animation
+        icon, icon_style = if agent.status == :ok
+            "●", tstyle(:success, bold = true)
+        elseif agent.status == :fail
+            "✗", tstyle(:error, bold = true)
+        elseif agent.status == :running
+            si = mod1(m.tick ÷ 2 + i * 3, length(SPINNER_BRAILLE))
+            if animations_enabled()
+                wave_fg = color_wave(m.tick, i, wave_colors; speed = 0.06, spread = 0.12)
+                "$(SPINNER_BRAILLE[si])", Style(fg = wave_fg, bold = true)
+            else
+                "$(SPINNER_BRAILLE[si])", tstyle(:accent)
+            end
+        elseif agent.status == :sending
+            si = mod1(m.tick ÷ 3 + i * 5, length(SPINNER_BRAILLE))
+            if animations_enabled()
+                p = breathe(m.tick + i * 11; period = 45)
+                base = to_rgb(tstyle(:warning).fg)
+                "$(SPINNER_BRAILLE[si])", Style(fg = brighten(base, p * 0.3), bold = true)
+            else
+                "$(SPINNER_BRAILLE[si])", tstyle(:warning)
+            end
+        elseif agent.status == :init
+            "◐", tstyle(:text_dim)
+        else
+            "○", tstyle(:text_dim)
+        end
+
+        # Row 1: icon + agent id (only if on screen)
+        if ay >= y_base && ay <= y_bottom
+            set_string!(buf, ax, ay, icon, icon_style)
+            id_style = if agent.status in (:running, :sending) && animations_enabled()
+                f = flicker(m.tick, i; intensity = 0.15, speed = 0.1)
+                base = to_rgb(tstyle(:text).fg)
+                Style(fg = brighten(base, (1.0 - f) * 0.2))
+            else
+                tstyle(:text)
+            end
+            set_string!(buf, ax + 2, ay, "A$(agent.agent_id)", id_style)
+        end
+
+        # Row 2: elapsed time or status text
+        if ay + 1 >= y_base && ay + 1 <= y_bottom
+            if agent.elapsed > 0
+                time_str = "$(round(agent.elapsed, digits=1))s"
+                time_style = if agent.status == :ok
+                    tstyle(:success)
+                elseif agent.status == :fail
+                    tstyle(:error)
+                else
+                    tstyle(:text_dim)
+                end
+                set_string!(buf, ax, ay + 1, time_str, time_style)
+            else
+                status_str = string(agent.status)
+                set_string!(
+                    buf,
+                    ax,
+                    ay + 1,
+                    first(status_str, cell_w - 1),
+                    tstyle(:text_dim),
+                )
+            end
+        end
+
+        # Row 3: animated progress bar
+        if ay + 2 >= y_base && ay + 2 <= y_bottom
+            bar_w = min(cell_w - 1, 8)
+            if agent.status in (:running, :sending)
+                if animations_enabled()
+                    scan_pos = mod(m.tick ÷ 2 + i * 3, bar_w * 2)
+                    for bx = 0:bar_w-1
+                        dist =
+                            abs(bx - (scan_pos < bar_w ? scan_pos : bar_w * 2 - scan_pos))
+                        brightness = max(0.0, 1.0 - dist / 3.0)
+                        ch =
+                            brightness > 0.6 ? '█' :
+                            brightness > 0.3 ? '▓' : brightness > 0.1 ? '░' : ' '
+                        base = to_rgb(tstyle(:accent).fg)
+                        fg = dim_color(base, 1.0 - brightness * 0.8)
+                        set_char!(buf, ax + bx, ay + 2, ch, Style(fg = fg))
+                    end
+                else
+                    set_string!(buf, ax, ay + 2, repeat("░", bar_w), tstyle(:text_dim))
+                end
+            elseif agent.progress > 0 || agent.events > 0
+                max_ev = max(agent.events, agent.progress, 1)
+                filled = min(bar_w, cld(agent.progress * bar_w, max_ev))
+                bar = repeat("█", filled) * repeat("░", bar_w - filled)
+                set_string!(
+                    buf,
+                    ax,
+                    ay + 2,
+                    bar,
+                    tstyle(agent.status == :ok ? :success : :accent),
+                )
+            end
+        end
+    end
+
+    # Bottom section: sparkline chart for completed tests
+    if is_complete && !isempty(agents)
+        times = [a.elapsed for a in agents if a.elapsed > 0]
+        if !isempty(times)
+            spark_vy = vy + rows_needed * 3 + 1
+            spark_y = y_base + spark_vy - scroll_off
+            spark_h = y_bottom - spark_y + 1
+            if spark_h >= 2 && spark_y >= y_base && spark_y <= y_bottom
+                sparkline = Sparkline(
+                    times;
+                    block = Block(
+                        title = " Response Times ",
+                        border_style = tstyle(:border),
+                        title_style = tstyle(:text_dim),
+                    ),
+                    style = tstyle(:accent),
+                )
+                render(sparkline, Rect(x, spark_y, w, min(spark_h, 5)), buf)
+            end
+        end
     end
 end
 

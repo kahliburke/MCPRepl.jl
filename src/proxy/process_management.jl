@@ -55,16 +55,7 @@ end
 Get the path to the PID file for a proxy server on the given port.
 """
 function get_pid_file_path(port::Int = 3000)
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-
-    mkpath(cache_dir)
-    return joinpath(cache_dir, "proxy-$port.pid")
+    return joinpath(mcprepl_cache_dir(), "proxy-$port.pid")
 end
 
 """

@@ -20,6 +20,9 @@ using DBInterface
 using ..Dashboard
 using ..Database
 
+# Import cache dir helper from parent module
+import ..mcprepl_cache_dir
+
 include("session.jl")
 using .Session
 
@@ -1173,8 +1176,7 @@ function handle_request(http::HTTP.Stream)
                                         MCPRepl.start!(; julia_session_name="$session_name")
                                         """
 
-                                        julia_cmd =
-                                            `julia --project=$project_path -e $startup_code`
+                                        julia_cmd = `julia --project=$project_path -e $startup_code`
 
                                         # Add environment variables
                                         env = copy(ENV)
@@ -2296,15 +2298,7 @@ function start_foreground_server(port::Int = 3000)
 
     # Initialize database in user cache directory
     # This provides a single database shared across all MCPRepl usage
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-    mkpath(cache_dir)
-    db_path = joinpath(cache_dir, "mcprepl.db")
+    db_path = joinpath(mcprepl_cache_dir(), "mcprepl.db")
     init_database!(db_path)
 
     # Register the proxy's own MCP session for tool calls it makes on its own behalf
@@ -2526,13 +2520,7 @@ Removes:
 - `verbose::Bool=true`: Print status messages
 """
 function clean_proxy_data(port::Int = 3000; verbose::Bool = true)
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
+    cache_dir = mcprepl_cache_dir()
 
     files_removed = String[]
 

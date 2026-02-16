@@ -3,14 +3,7 @@
 # ============================================================================
 
 function setup_proxy_logging(port::Int)
-    cache_dir = get(ENV, "XDG_CACHE_HOME") do
-        if Sys.iswindows()
-            joinpath(ENV["LOCALAPPDATA"], "MCPRepl")
-        else
-            joinpath(homedir(), ".cache", "mcprepl")
-        end
-    end
-    mkpath(cache_dir)
+    cache_dir = mcprepl_cache_dir()
 
     # Two log files:
     # 1. Full debug log with everything

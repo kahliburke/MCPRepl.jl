@@ -44,13 +44,10 @@ const INDEX_FAILED_FILES = Ref{Dict{String,Int}}(Dict{String,Int}())  # file -> 
     setup_index_logging(project_path::String=pwd())
 
 Setup rotating log file for background indexing operations.
-Creates .mcprepl/indexer.log with 10MB max size and 3 file rotation (30MB total).
+Log file is stored in ~/.cache/mcprepl/indexer.log with 10MB max size and 3 file rotation (30MB total).
 """
 function setup_index_logging(project_path::String=pwd())
-    mcprepl_dir = joinpath(project_path, ".mcprepl")
-    !isdir(mcprepl_dir) && mkdir(mcprepl_dir)
-
-    log_file = joinpath(mcprepl_dir, "indexer.log")
+    log_file = joinpath(mcprepl_cache_dir(), "indexer.log")
 
     # Create rotating file logger (10MB max, 3 files = 30MB total)
     file_logger = LoggingExtras.MinLevelLogger(
@@ -92,7 +89,7 @@ Shows warning after 5+ consecutive failures, resets on success.
 function check_and_notify_index_errors()
     if INDEX_ERROR_COUNT[] >= 5 && !INDEX_USER_NOTIFIED[]
         printstyled(
-            "\n⚠️  Semantic search indexing is experiencing issues. Check .mcprepl/indexer.log for details.\n",
+            "\n⚠️  Semantic search indexing is experiencing issues. Check ~/.cache/mcprepl/indexer.log for details.\n",
             color=:yellow
         )
         INDEX_USER_NOTIFIED[] = true

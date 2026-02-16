@@ -1770,3 +1770,171 @@ Test results summary including:
         end
     end
 )
+
+stress_test_tool = @mcp_tool(
+    :stress_test,
+    """Run a stress test by spawning concurrent simulated MCP agents.
+
+This tool launches N concurrent agents that each connect to the MCP server,
+initialize a session, and execute the given Julia code via the `ex` tool.
+Useful for testing how functions scale under concurrent load.
+
+# Parameters
+
+- `code`: Julia code each agent executes (default: "sleep(1); 42")
+- `num_agents`: Number of concurrent agents to spawn, 1-100 (default: 5)
+- `stagger`: Delay in seconds between agent launches (default: 0.0)
+- `timeout`: Per-agent timeout in seconds (default: 30)
+- `session`: Target session key (auto-detects if one session connected)
+
+# Returns
+
+Structured text summary with per-agent results, success/failure counts,
+timing statistics, and path to saved results file.
+
+# Examples
+
+Run all tests:
+```julia
+{"num_agents": 3, "code": "sleep(1); 42"}
+```
+
+Run specific tests matching a pattern:
+```julia
+{"num_agents": 10, "code": "sum(1:1000)", "stagger": 0.1}
+```
+
+Run tests with coverage:
+```julia
+{"num_agents": 5, "code": "sleep(rand())", "timeout": 60}
+```
+""",
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "code" => Dict(
+                "type" => "string",
+                "description" => "Julia code each agent executes (default: \"sleep(1); 42\")",
+            ),
+            "num_agents" => Dict(
+                "type" => "integer",
+                "description" => "Number of concurrent agents to spawn, 1-100 (default: 5)",
+            ),
+            "stagger" => Dict(
+                "type" => "number",
+                "description" => "Delay in seconds between agent launches (default: 0.0)",
+            ),
+            "timeout" => Dict(
+                "type" => "integer",
+                "description" => "Per-agent timeout in seconds (default: 30)",
+            ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Target session key (auto-detects if one session connected)",
+            ),
+        ),
+        "required" => [],
+    ),
+    function (args)
+        code = get(args, "code", "sleep(1); 42")
+        num_agents = get(args, "num_agents", 5)
+        num_agents isa AbstractString && (num_agents = parse(Int, num_agents))
+        stagger = get(args, "stagger", 0.0)
+        stagger isa AbstractString && (stagger = parse(Float64, stagger))
+        timeout = get(args, "timeout", 30)
+        timeout isa AbstractString && (timeout = parse(Int, timeout))
+        session = get(args, "session", "")
+
+        on_progress = get(args, "_on_progress", nothing)
+
+        # Validate
+        num_agents = clamp(num_agents, 1, 100)
+        stagger = max(0.0, stagger)
+        timeout = clamp(timeout, 1, 600)
+
+        # Resolve session
+        mgr = BRIDGE_CONN_MGR[]
+        if mgr === nothing
+            return "ERROR: No ConnectionManager available. Is the TUI running with bridge mode enabled?"
+        end
+
+        sess_key = if isempty(session)
+            conns = connected_sessions(mgr)
+            if length(conns) == 0
+                return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+            elseif length(conns) == 1
+                short_key(conns[1])
+            else
+                available = join(["$(short_key(c)) ($(c.name))" for c in conns], ", ")
+                return "ERROR: Multiple sessions connected. Specify `session` parameter. Available: $available"
+            end
+        else
+            # Verify the session exists
+            conn = get_connection_by_key(mgr, session)
+            if conn === nothing
+                conns = connected_sessions(mgr)
+                available = join(["$(short_key(c)) ($(c.name))" for c in conns], ", ")
+                return "ERROR: No session matched '$(session)'. Available: $available"
+            end
+            short_key(conn)
+        end
+
+        port = BRIDGE_PORT[]
+
+        on_progress !== nothing && on_progress(
+            "Launching stress test: $num_agents agents, code=$(repr(code))",
+        )
+
+        # Write script and spawn subprocess
+        script_path = _write_stress_script()
+        project_dir = pkgdir(@__MODULE__)
+        cmd = `$(Base.julia_cmd()) --startup-file=no --project=$project_dir $script_path $port $sess_key $code $num_agents $stagger $timeout`
+
+        output_lines = String[]
+        t_start = time()
+
+        try
+            process = open(cmd, "r")
+            while !eof(process)
+                line = readline(process; keep = false)
+                isempty(line) && continue
+                push!(output_lines, line)
+                # Stream progress for each meaningful line
+                if on_progress !== nothing
+                    on_progress(line)
+                end
+            end
+            try
+                wait(process)
+            catch
+            end
+        catch e
+            push!(output_lines, "ERROR agent=0 elapsed=0.0 message=$(sprint(showerror, e))")
+        end
+
+        total_wall_time = time() - t_start
+
+        # Write results file
+        result_file = _write_stress_results_to_file(
+            output_lines,
+            code,
+            sess_key,
+            num_agents,
+            stagger,
+            timeout,
+        )
+
+        # Parse and format summary
+        agents = _parse_stress_results(output_lines)
+        return _format_stress_summary(
+            agents,
+            code,
+            sess_key,
+            num_agents,
+            Float64(stagger),
+            timeout,
+            total_wall_time,
+            result_file,
+        )
+    end
+)

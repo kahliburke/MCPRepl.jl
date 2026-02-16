@@ -64,18 +64,6 @@ const NEURO_GREENS = [22, 28, 34, 40, 46, 82, 118, 154, 190, 226]
 const DRAGON_PREVIEW_LINES = split(DRAGON_ASCII, '\n')[1:min(10, end)]
 const BUTTERFLY_PREVIEW_LINES = split(GENTLE_BUTTERFLY_ASCII, '\n')[1:min(10, end)]
 
-# L33T mode preview — static halftone face snippet
-const NEURO_FACE_ASCII = raw"""
-   .:x00XXX00x:.
-  :x0X##@@@##X0x:
- .x0X#@@   @@#X0.
- :0X#@@ . . @@#0:
- x0X#@@.   .@@#Xx
- :0X##@@@@@@@#X0:
-  :x0X## . ##X0:
-   .:x00XXX00x:.  """
-
-const NEURO_FACE_LINES = split(NEURO_FACE_ASCII, '\n')
 
 # Companion art for config steps
 const COMPANION_WIZ = split(wiz, '\n')
@@ -794,7 +782,7 @@ function view_mode_select(m::SetupWizardModel, f::Frame)
         "Cyberpunk matrix rain\nand hacker aesthetics\nfor the l33t",
     ]
     mode_colors = [Color256(196), Color256(219), Color256(46)]
-    mode_previews = [DRAGON_PREVIEW_LINES, BUTTERFLY_PREVIEW_LINES, NEURO_FACE_LINES]
+    mode_previews = [DRAGON_PREVIEW_LINES, BUTTERFLY_PREVIEW_LINES]
 
     for (i, name) in enumerate(mode_names)
         col_x = cols_area.x + (i - 1) * col_w
@@ -814,24 +802,33 @@ function view_mode_select(m::SetupWizardModel, f::Frame)
         blk_inner = render(blk, col_rect, buf)
         blk_inner.width < 3 && continue
 
-        # Render art preview with color cycling
-        preview = mode_previews[i]
-        for (j, line) in enumerate(preview)
-            j > blk_inner.height - 3 && break
-            cy = is_selected ? (m.tick ÷ 4 + j) : j
-            c256 = Color256(FIRE_COLORS[mod1(cy, length(FIRE_COLORS))])
-            if i == 2
-                c256 = Color256(BUTTERFLY_COLORS[mod1(cy, length(BUTTERFLY_COLORS))])
-            elseif i == 3
-                c256 = Color256(NEURO_GREENS[mod1(cy, length(NEURO_GREENS))])
+        # Render art preview
+        art_rows = 0
+        if i == 3
+            # L33T: animated cyber face (same as companion area)
+            face_h = min(10, blk_inner.height - 5)
+            face_area = Rect(blk_inner.x, blk_inner.y, blk_inner.width, face_h)
+            render_cyber_face(m, face_area, buf)
+            art_rows = face_h
+        else
+            # Standard / Gentle: static art with color cycling
+            preview = mode_previews[i]
+            for (j, line) in enumerate(preview)
+                j > blk_inner.height - 3 && break
+                cy = is_selected ? (m.tick ÷ 4 + j) : j
+                c256 = Color256(FIRE_COLORS[mod1(cy, length(FIRE_COLORS))])
+                if i == 2
+                    c256 = Color256(BUTTERFLY_COLORS[mod1(cy, length(BUTTERFLY_COLORS))])
+                end
+                style = Style(; fg = c256)
+                safe_line = length(line) > blk_inner.width ? line[1:blk_inner.width] : line
+                set_string!(buf, blk_inner.x, blk_inner.y + j - 1, safe_line, style)
             end
-            style = Style(; fg = c256)
-            safe_line = length(line) > blk_inner.width ? line[1:blk_inner.width] : line
-            set_string!(buf, blk_inner.x, blk_inner.y + j - 1, safe_line, style)
+            art_rows = min(length(preview), blk_inner.height - 5)
         end
 
         # Description below art
-        desc_y = blk_inner.y + min(length(preview), blk_inner.height - 5)
+        desc_y = blk_inner.y + art_rows
         for (j, dline) in enumerate(split(mode_descs[i], '\n'))
             y = desc_y + j
             y > bottom(blk_inner) && break
