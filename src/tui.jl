@@ -269,12 +269,65 @@ end
 const _TUI_TOOL_RESULTS_BUFFER = ToolCallResult[]
 const _TUI_TOOL_RESULTS_LOCK = ReentrantLock()
 
+const _LAST_TOOL_SUCCESS = Ref{Float64}(0.0)
+const _LAST_TOOL_ERROR = Ref{Float64}(0.0)
+
 function _push_tool_result!(r::ToolCallResult)
     lock(_TUI_TOOL_RESULTS_LOCK) do
         push!(_TUI_TOOL_RESULTS_BUFFER, r)
         while length(_TUI_TOOL_RESULTS_BUFFER) > 500
             popfirst!(_TUI_TOOL_RESULTS_BUFFER)
         end
+    end
+    # Update health gauge timestamps (thread-safe via Ref)
+    t = time()
+    if r.success
+        _LAST_TOOL_SUCCESS[] = t
+    else
+        _LAST_TOOL_ERROR[] = t
+    end
+    # Persist to database (fire-and-forget)
+    _persist_tool_call!(r)
+end
+
+"""Persist a tool call result to the SQLite analytics database."""
+function _persist_tool_call!(r::ToolCallResult)
+    db = Database.DB[]
+    db === nothing && return
+    try
+        # Parse duration string back to ms
+        dur_ms = if endswith(r.duration_str, "ms")
+            parse(Float64, r.duration_str[1:end-2])
+        elseif endswith(r.duration_str, "s")
+            parse(Float64, r.duration_str[1:end-1]) * 1000.0
+        else
+            0.0
+        end
+        summary = length(r.result_text) > 500 ? r.result_text[1:500] : r.result_text
+        Database.DBInterface.execute(
+            db,
+            """
+    INSERT INTO tool_executions (
+        mcp_session_id, request_id, tool_name, request_time,
+        duration_ms, input_size, output_size, arguments,
+        status, result_summary
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+""",
+            (
+                r.session_key,
+                string(UUIDs.uuid4()),
+                r.tool_name,
+                Dates.format(r.timestamp, dateformat"yyyy-mm-dd HH:MM:SS"),
+                dur_ms,
+                sizeof(r.args_json),
+                sizeof(r.result_text),
+                r.args_json,
+                r.success ? "success" : "error",
+                summary,
+            ),
+        )
+    catch e
+        @debug "Failed to persist tool call" exception = (e, catch_backtrace())
     end
 end
 
@@ -478,6 +531,16 @@ end
 
     # Client detection (populated async on tab switch)
     client_statuses::Vector{Pair{String,Bool}} = Pair{String,Bool}[]
+
+    # Database & analytics
+    db_initialized::Bool = false
+    activity_mode::Symbol = :live    # :live (current view) or :analytics (DB summary)
+    analytics_cache::Any = nothing   # cached query results (NamedTuple or nothing)
+    analytics_last_refresh::Float64 = 0.0
+
+    # Dynamic health gauge timestamps
+    last_tool_success::Float64 = 0.0    # time() of last successful tool call
+    last_tool_error::Float64 = 0.0      # time() of last failed tool call
 
     # Background reindex: project_path → timestamp of last files_changed notification
     _reindex_pending::Dict{String,Float64} = Dict{String,Float64}()
@@ -844,14 +907,29 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         # Activity tab actions (tab 3)
         if m.active_tab == 3
             if evt.char == 'f'
-                _cycle_activity_filter!(m)
+                m.activity_mode == :live && _cycle_activity_filter!(m)
                 return
             elseif evt.char == 'F'
-                m.activity_follow = !m.activity_follow
+                m.activity_mode == :live && (m.activity_follow = !m.activity_follow)
                 return
             elseif evt.char == 'w'
-                m.result_word_wrap = !m.result_word_wrap
-                m._detail_for_result = -1  # invalidate cached paragraph
+                m.activity_mode == :live && begin
+                    m.result_word_wrap = !m.result_word_wrap
+                    m._detail_for_result = -1  # invalidate cached paragraph
+                end
+                return
+            elseif evt.char == 'd'
+                # Toggle between live and analytics mode
+                m.activity_mode = m.activity_mode == :live ? :analytics : :live
+                if m.activity_mode == :analytics
+                    _refresh_analytics!(m)
+                end
+                return
+            elseif evt.char == 'r'
+                # Force refresh analytics data
+                if m.activity_mode == :analytics
+                    _refresh_analytics!(m; force = true)
+                end
                 return
             end
         end
@@ -930,6 +1008,8 @@ function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
             # Pane 2 (agents) and 3 (detail) — no scrolling yet
         end
     elseif tab == 3
+        # Analytics mode doesn't use the live list navigation
+        m.activity_mode == :analytics && return
         if fp == 1
             # Manual navigation disables follow mode
             m.activity_follow = false
@@ -1715,6 +1795,14 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     # Drain tool call results for Activity tab inspection
     _drain_tool_results!(m.tool_results)
 
+    # Sync health gauge timestamps from thread-safe Refs
+    if _LAST_TOOL_SUCCESS[] > m.last_tool_success
+        m.last_tool_success = _LAST_TOOL_SUCCESS[]
+    end
+    if _LAST_TOOL_ERROR[] > m.last_tool_error
+        m.last_tool_error = _LAST_TOOL_ERROR[]
+    end
+
     # Drain in-flight tool call events — track selected ID to detect index shifts
     _prev_sel_id =
         if m.selected_inflight > 0 && m.selected_inflight <= length(m.inflight_calls)
@@ -1763,6 +1851,18 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     # rendering and can report startup status in the Server tab.
     if !m.server_started
         m.server_started = true
+
+        # Initialize analytics database before server starts
+        _push_log!(:info, "Initializing database...")
+        try
+            db_path = joinpath(mcprepl_cache_dir(), "mcprepl.db")
+            Database.init_db!(db_path)
+            m.db_initialized = true
+            _push_log!(:info, "Database ready at $db_path")
+        catch e
+            _push_log!(:warning, "Database init failed: $(sprint(showerror, e))")
+        end
+
         _push_log!(:info, "Starting MCP server on port $(m.server_port)...")
         Threads.@spawn try
             security_config = load_global_security_config()
@@ -1777,6 +1877,15 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             m.server_running = true
             BRIDGE_PORT[] = m.server_port
             _push_log!(:info, "MCP server listening on port $(m.server_port)")
+
+            # Start ETL scheduler to process interactions → analytics tables
+            if Database.DB[] !== nothing
+                Threads.@spawn try
+                    Database.start_etl_scheduler(Database.DB[]; interval_seconds = 60)
+                catch e
+                    _push_log!(:warning, "ETL scheduler failed: $(sprint(showerror, e))")
+                end
+            end
         catch e
             m.server_running = false
             _push_log!(:error, "Server failed: $(sprint(showerror, e))")
@@ -2016,18 +2125,19 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             y += 1
         end
 
-        # Connection health gauge
+        # Connection health gauge (dynamic)
         y += 1
         if y + 1 <= bottom(detail_area)
             set_string!(buf, x, y, "Health", tstyle(:text_dim))
             y += 1
-            health =
-                conn.status == :connected ? 1.0 : conn.status == :connecting ? 0.5 : 0.0
+            health = _compute_health(conn, m)
+            gauge_style =
+                health >= 0.7 ? tstyle(:success) :
+                health >= 0.3 ? tstyle(:warning) : tstyle(:error)
             render(
                 Gauge(
                     health;
-                    filled_style = conn.status == :connected ? tstyle(:success) :
-                                   tstyle(:warning),
+                    filled_style = gauge_style,
                     empty_style = tstyle(:text_dim),
                     tick = m.tick,
                 ),
@@ -2044,6 +2154,26 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             tstyle(:text_dim),
         )
     end
+end
+
+"""Compute dynamic health value for a bridge connection."""
+function _compute_health(conn, m::MCPReplModel)
+    base = conn.status == :connected ? 0.8 : conn.status == :connecting ? 0.4 : 0.0
+    t = time()
+    # Boost if a tool call succeeded recently
+    momentum = (m.last_tool_success > 0.0 && t - m.last_tool_success < 10.0) ? 0.2 : 0.0
+    # Penalty if an error occurred recently
+    penalty = (m.last_tool_error > 0.0 && t - m.last_tool_error < 30.0) ? -0.2 : 0.0
+    # Idle decay when connected but no activity for >60s
+    idle_decay =
+        if conn.status == :connected &&
+           m.last_tool_success > 0.0 &&
+           (t - m.last_tool_success > 60.0)
+            -0.2 * min(1.0, (t - m.last_tool_success - 60.0) / 120.0)
+        else
+            0.0
+        end
+    return clamp(base + momentum + penalty + idle_decay, 0.0, 1.0)
 end
 
 # ── Activity Tab ──────────────────────────────────────────────────────────────
@@ -2102,7 +2232,160 @@ function _session_display_name(session_key::String)::String
     return conn.name
 end
 
+"""Refresh analytics data from the database (cached for 30s unless forced)."""
+function _refresh_analytics!(m::MCPReplModel; force::Bool = false)
+    db = Database.DB[]
+    db === nothing && return
+    t = time()
+    if !force && (t - m.analytics_last_refresh) < 30.0 && m.analytics_cache !== nothing
+        return
+    end
+    try
+        tool_summary = Database.get_tool_summary()
+        error_hotspots = Database.get_error_hotspots()
+        recent_execs = Database.get_tool_executions(; days = 1)
+        m.analytics_cache = (
+            tool_summary = tool_summary,
+            error_hotspots = error_hotspots,
+            recent_execs = recent_execs,
+        )
+        m.analytics_last_refresh = t
+    catch e
+        @debug "Analytics refresh failed" exception = (e, catch_backtrace())
+    end
+end
+
+"""Render analytics dashboard view in the Activity tab."""
+function _view_analytics(m::MCPReplModel, area::Rect, buf::Buffer)
+    # Auto-refresh every 30s
+    _refresh_analytics!(m)
+
+    cache = m.analytics_cache
+    y = area.y
+    x = area.x + 1
+    w = area.width - 2
+
+    title_block = Block(
+        title = " Analytics [d]ata [r]efresh ",
+        border_style = tstyle(:accent),
+        title_style = tstyle(:accent, bold = true),
+    )
+    inner = render(title_block, area, buf)
+    y = inner.y
+    x = inner.x + 1
+    w = inner.width - 2
+
+    if cache === nothing || Database.DB[] === nothing
+        set_string!(
+            buf,
+            x,
+            y,
+            "No analytics data yet (database not ready)",
+            tstyle(:text_dim),
+        )
+        return
+    end
+
+    # ── Tool Usage Summary ──
+    set_string!(buf, x, y, "── Tool Usage Summary ──", tstyle(:accent, bold = true))
+    y += 1
+
+    ts = cache.tool_summary
+    if isempty(ts)
+        set_string!(buf, x, y, "  No tool executions recorded", tstyle(:text_dim))
+        y += 1
+    else
+        # Table header
+        hdr =
+            rpad("Tool", 22) *
+            rpad("Count", 8) *
+            rpad("Avg(ms)", 10) *
+            rpad("Errors", 8) *
+            "Err%"
+        set_string!(buf, x, y, hdr, tstyle(:text_dim))
+        y += 1
+        for (i, row) in enumerate(ts)
+            y > bottom(inner) && break
+            name = rpad(get(row, "tool_name", "?"), 22)
+            total = get(row, "total_executions", 0)
+            count = rpad(string(total), 8)
+            avg_ms = get(row, "avg_duration_ms", 0.0)
+            avg = rpad(@sprintf("%.0f", avg_ms), 10)
+            errs = get(row, "error_count", 0)
+            err_str = rpad(string(errs), 8)
+            err_pct = total > 0 ? @sprintf("%.0f%%", 100.0 * errs / total) : "0%"
+            line = name * count * avg * err_str * err_pct
+            style = errs > 0 ? tstyle(:warning) : tstyle(:text)
+            set_string!(buf, x, y, line, style)
+            y += 1
+        end
+    end
+
+    y += 1
+    y > bottom(inner) && return
+
+    # ── Error Hotspots ──
+    set_string!(buf, x, y, "── Error Hotspots ──", tstyle(:error, bold = true))
+    y += 1
+
+    eh = cache.error_hotspots
+    if isempty(eh)
+        set_string!(buf, x, y, "  No errors recorded", tstyle(:success))
+        y += 1
+    else
+        for (i, row) in enumerate(eh)
+            i > 5 && break
+            y > bottom(inner) && break
+            cat = get(row, "error_category", "")
+            etype = get(row, "error_type", "")
+            tool = get(row, "tool_name", "")
+            cnt = get(row, "error_count", 0)
+            label = isempty(cat) ? etype : "$cat: $etype"
+            line = "  $(rpad(label, 30)) $(rpad(tool, 18)) ×$cnt"
+            set_string!(buf, x, y, line, tstyle(:error))
+            y += 1
+        end
+    end
+
+    y += 1
+    y > bottom(inner) && return
+
+    # ── Recent Activity Sparkline ──
+    set_string!(buf, x, y, "── Calls/min (last hour) ──", tstyle(:secondary, bold = true))
+    y += 1
+    y > bottom(inner) && return
+
+    # Build per-minute histogram from recent executions
+    bins = zeros(60)
+    now_t = now()
+    for row in cache.recent_execs
+        rt_str = get(row, "request_time", "")
+        isempty(rt_str) && continue
+        try
+            rt = DateTime(rt_str, dateformat"yyyy-mm-dd HH:MM:SS")
+            delta_min = Dates.value(now_t - rt) / 60000.0
+            idx = clamp(60 - floor(Int, delta_min), 1, 60)
+            bins[idx] += 1.0
+        catch
+        end
+    end
+
+    spark_w = min(w, 60)
+    spark_data = bins[max(1, 61 - spark_w):60]
+    if any(>(0), spark_data)
+        render(Sparkline(spark_data; style = tstyle(:accent)), Rect(x, y, spark_w, 1), buf)
+    else
+        set_string!(buf, x, y, "  (no recent activity)", tstyle(:text_dim))
+    end
+end
+
 function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
+    # Analytics mode: render DB-backed summary instead of live tool list
+    if m.activity_mode == :analytics
+        _view_analytics(m, area, buf)
+        return
+    end
+
     panes = split_layout(m.activity_layout, area)
     length(panes) < 2 && return
 
@@ -2226,8 +2509,8 @@ function view_activity(m::MCPReplModel, area::Rect, buf::Buffer)
     count_str = n_inflight > 0 ? "$(n_inflight) running, $nf done" : "$nf"
     follow_str = m.activity_follow ? "[F]ollow:on" : "[F]ollow:off"
     list_title =
-        isempty(filter_key) ? " Tool Calls ($count_str) [f]ilter $follow_str " :
-        " Tool Calls ($count_str) [f] $filter_label $follow_str "
+        isempty(filter_key) ? " Tool Calls ($count_str) [f]ilter $follow_str [d]ata " :
+        " Tool Calls ($count_str) [f] $filter_label $follow_str [d]ata "
 
     render(
         SelectableList(

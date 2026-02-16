@@ -42,3 +42,4 @@ coverage.info
 lcov.info
 .qdrant_index.json
 LocalPreferences.toml
+test/SuppositionDB/
