@@ -271,6 +271,7 @@ const _TUI_TOOL_RESULTS_LOCK = ReentrantLock()
 
 const _LAST_TOOL_SUCCESS = Ref{Float64}(0.0)
 const _LAST_TOOL_ERROR = Ref{Float64}(0.0)
+const _ECG_NEW_COMPLETIONS = Ref{Int}(0)
 
 function _push_tool_result!(r::ToolCallResult)
     lock(_TUI_TOOL_RESULTS_LOCK) do
@@ -286,6 +287,7 @@ function _push_tool_result!(r::ToolCallResult)
     else
         _LAST_TOOL_ERROR[] = t
     end
+    _ECG_NEW_COMPLETIONS[] += 1
     # Persist to database (fire-and-forget)
     _persist_tool_call!(r)
 end
@@ -541,6 +543,15 @@ end
     # Dynamic health gauge timestamps
     last_tool_success::Float64 = 0.0    # time() of last successful tool call
     last_tool_error::Float64 = 0.0      # time() of last failed tool call
+
+    # ECG heartbeat trace
+    ecg_trace::Vector{Float64} = fill(0.5, 240)  # rolling Y-values, scrolls left each tick
+    ecg_pending_blips::Int = 0                    # queued QRS complexes waiting to fire
+    ecg_inject_countdown::Int = 0                 # countdown within current QRS injection
+    ecg_last_ping_seen::DateTime = DateTime(0)    # latest last_ping we've consumed
+
+    # Session reaping (wall-clock based, fps-independent)
+    _last_reap_time::Float64 = time()
 
     # Background reindex: project_path → timestamp of last files_changed notification
     _reindex_pending::Dict{String,Float64} = Dict{String,Float64}()
@@ -1752,6 +1763,7 @@ end
 
 function Tachikoma.view(m::MCPReplModel, f::Frame)
     m.tick += 1
+    _advance_ecg!(m)
     buf = f.buffer
 
     # Shutdown overlay — render one frame showing the message, then quit
@@ -1841,10 +1853,11 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
         _process_pending_reindexes!(m)
     end
 
-    # Reap stale MCP agent sessions every ~30s (450 ticks at 15fps).
+    # Reap stale MCP agent sessions every ~30s.
     # Sessions with no activity for 5 minutes are closed and removed.
-    if m.tick % 450 == 0
+    if time() - m._last_reap_time > 30.0
         _reap_stale_sessions!(300.0)  # 5 min threshold
+        m._last_reap_time = time()
     end
 
     # Deferred server start — kick off on first frame so the TUI is already
@@ -2124,25 +2137,38 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
             y += 1
         end
 
-        # Connection health gauge (dynamic)
+        # Health gauge (error-rate, per-session)
+        conn_key = conn.session_id[1:min(8, length(conn.session_id))]
         y += 1
         if y + 1 <= bottom(detail_area)
+            health, _ = _compute_health(m, conn_key)
             set_string!(buf, x, y, "Health", tstyle(:text_dim))
             y += 1
-            health = _compute_health(conn, m)
-            gauge_style =
+            gs =
                 health >= 0.7 ? tstyle(:success) :
                 health >= 0.3 ? tstyle(:warning) : tstyle(:error)
             render(
                 Gauge(
                     health;
-                    filled_style = gauge_style,
+                    filled_style = gs,
                     empty_style = tstyle(:text_dim),
                     tick = m.tick,
                 ),
                 Rect(x, y, detail_area.width - 2, 1),
                 buf,
             )
+            y += 1
+        end
+
+        # ECG heartbeat
+        y += 1
+        ecg_h = 3
+        ecg_w = detail_area.width - 2
+        if y + ecg_h <= bottom(detail_area) && ecg_w >= 10
+            set_string!(buf, x, y, "Heartbeat", tstyle(:text_dim))
+            y += 1
+            _render_ecg_trace(m, Rect(x, y, ecg_w, ecg_h), buf, conn_key)
+            y += ecg_h
         end
     else
         set_string!(
@@ -2155,24 +2181,108 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
     end
 end
 
-"""Compute dynamic health value for a bridge connection."""
-function _compute_health(conn, m::MCPReplModel)
-    base = conn.status == :connected ? 0.8 : conn.status == :connecting ? 0.4 : 0.0
-    t = time()
-    # Boost if a tool call succeeded recently
-    momentum = (m.last_tool_success > 0.0 && t - m.last_tool_success < 10.0) ? 0.2 : 0.0
-    # Penalty if an error occurred recently
-    penalty = (m.last_tool_error > 0.0 && t - m.last_tool_error < 30.0) ? -0.2 : 0.0
-    # Idle decay when connected but no activity for >60s
-    idle_decay =
-        if conn.status == :connected &&
-           m.last_tool_success > 0.0 &&
-           (t - m.last_tool_success > 60.0)
-            -0.2 * min(1.0, (t - m.last_tool_success - 60.0) / 120.0)
-        else
-            0.0
+const _QRS_WAVEFORM = Float64[
+    0.5,
+    0.45,
+    0.55,
+    0.5,   # P-wave
+    0.35,                     # Q dip
+    0.95,                     # R peak (sharp spike)
+    0.1,                      # S trough
+    0.5,
+    0.55,
+    0.6,
+    0.55,
+    0.5,  # T-wave + return to baseline
+]
+
+function _advance_ecg!(m::MCPReplModel)
+    new = _ECG_NEW_COMPLETIONS[]
+    if new > 0
+        _ECG_NEW_COMPLETIONS[] = 0
+        m.ecg_pending_blips += new
+    end
+    # Heartbeat from bridge health-check pings — one blip per new ping
+    if m.conn_mgr !== nothing
+        latest = lock(m.conn_mgr.lock) do
+            foldl((acc, c) -> max(acc, c.last_ping), m.conn_mgr.connections; init = DateTime(0))
         end
-    return clamp(base + momentum + penalty + idle_decay, 0.0, 1.0)
+        if latest > m.ecg_last_ping_seen
+            m.ecg_pending_blips += 1
+            m.ecg_last_ping_seen = latest
+        end
+    end
+    if m.ecg_inject_countdown <= 0 && m.ecg_pending_blips > 0
+        m.ecg_inject_countdown = length(_QRS_WAVEFORM)
+        m.ecg_pending_blips -= 1
+    end
+    # Scroll left
+    trace = m.ecg_trace
+    for i = 1:(length(trace)-1)
+        trace[i] = trace[i+1]
+    end
+    # New rightmost value
+    if m.ecg_inject_countdown > 0
+        idx = length(_QRS_WAVEFORM) - m.ecg_inject_countdown + 1
+        trace[end] = _QRS_WAVEFORM[idx]
+        m.ecg_inject_countdown -= 1
+    else
+        trace[end] = 0.5
+    end
+end
+
+function _render_ecg_trace(m::MCPReplModel, rect::Rect, buf::Buffer, key::String = "")
+    w, h = rect.width, rect.height
+    (w < 2 || h < 1) && return
+
+    health, _ = _compute_health(m, key)
+    style =
+        health >= 0.7 ? tstyle(:success) : health >= 0.3 ? tstyle(:warning) : tstyle(:error)
+
+    c = SixelCanvas(w, h; style = style)
+    dot_w = w * 2
+    dot_h = h * 4
+    trace = m.ecg_trace
+    n = length(trace)
+    start_idx = max(1, n - dot_w + 1)
+
+    prev_dx, prev_dy = -1, -1
+    for dx = 0:(dot_w-1)
+        tidx = start_idx + dx
+        val = (tidx >= 1 && tidx <= n) ? trace[tidx] : 0.5
+        dy = round(Int, (1.0 - clamp(val, 0.0, 1.0)) * (dot_h - 1))
+        dy = clamp(dy, 0, dot_h - 1)
+        set_point!(c, dx, dy)
+        prev_dx >= 0 && line!(c, prev_dx, prev_dy, dx, dy)
+        prev_dx, prev_dy = dx, dy
+    end
+    render(c, rect, buf)
+end
+
+"""Compute error-rate health from recent tool results. Returns (health, has_data).
+When `key` is non-empty, only results matching that session key are counted."""
+function _compute_health(m::MCPReplModel, key::String = "")::Tuple{Float64,Bool}
+    results = m.tool_results
+    if isempty(key)
+        isempty(results) && return (1.0, false)
+        n = min(50, length(results))
+        recent = @view results[(end-n+1):end]
+        errors = count(r -> !r.success, recent)
+        return (1.0 - errors / n, true)
+    else
+        # Filter to this session's results, take last 50
+        matched = 0
+        errors = 0
+        for i = length(results):-1:1
+            r = results[i]
+            r.session_key == key || continue
+            matched += 1
+            r.success || (errors += 1)
+            matched >= 50 && break
+        end
+        matched == 0 && return (1.0, false)
+        return (1.0 - errors / matched, true)
+    end
 end
 
 # ── Activity Tab ──────────────────────────────────────────────────────────────
@@ -4468,5 +4578,5 @@ function tui(; port::Int = 2828, theme_name::Symbol = :kokaku)
     end
     set_theme!(theme_name)
     model = MCPReplModel(server_port = port)
-    app(model; fps = 15)
+    app(model; fps = 30)
 end
