@@ -456,10 +456,8 @@ function create_handler(
                 end
             end
 
-            # Handle MCP JSON-RPC endpoint (for standalone/proxy-compatible mode)
+            # Handle MCP JSON-RPC endpoint at /mcp path
             if req.target == "/mcp" && req.method == "POST"
-                # Route MCP JSON-RPC calls to the standard handler
-                # This allows HTTP-based MCP clients to connect directly without a proxy
                 # Fall through to the JSON-RPC handling below
             end
 

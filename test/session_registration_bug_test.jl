@@ -17,11 +17,6 @@ using MCPRepl.Database
 include("../src/session.jl")
 using .Session
 
-# We need to load proxy module which depends on many things
-# For now, test at the database level
-# include("../src/proxy.jl")
-# using .Proxy
-
 @testset "Session Registration Name Bug" begin
     db_path = tempname() * ".db"
 

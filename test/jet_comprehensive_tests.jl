@@ -24,9 +24,7 @@ using JSON
 @info "Loading MCPRepl..."
 using MCPRepl
 using MCPRepl.Database
-using MCPRepl.Proxy
 using MCPRepl.Session
-using MCPRepl.Dashboard
 
 # ============================================================================
 # Configuration
@@ -39,7 +37,7 @@ const FAIL_ON_ERRORS = get(ENV, "JET_FAIL_ON_ERRORS", "false") == "true"
 const MAX_ERRORS_PER_MODULE = 20
 
 # Modules to analyze with their test argument generators
-const MODULES_TO_ANALYZE = [:MCPRepl, :Database, :Proxy, :Session, :Dashboard]
+const MODULES_TO_ANALYZE = [:MCPRepl, :Database, :Session]
 
 # ============================================================================
 # Test Argument Generators
@@ -62,19 +60,9 @@ function get_test_args(mod::Module, func_name::Symbol)
         return get_database_test_args(func_name)
     end
 
-    # Proxy module functions
-    if mod === Proxy
-        return get_proxy_test_args(func_name)
-    end
-
     # Session module functions
     if mod === Session
         return get_session_test_args(func_name)
-    end
-
-    # Dashboard module functions
-    if mod === Dashboard
-        return get_dashboard_test_args(func_name)
     end
 
     # MCPRepl module functions
@@ -133,52 +121,6 @@ function get_database_test_args(func_name::Symbol)
     return get(args_map, func_name, nothing)
 end
 
-function get_proxy_test_args(func_name::Symbol)
-    args_map = Dict{Symbol,Any}(
-        # Server management
-        :start_server => (3000,),
-        :stop_server => (3000,),
-        :restart_server => (3000,),
-        :start_foreground_server => (3000,),
-        :start_background_server => (3000,),
-        :is_server_running => (3000,),
-        :get_server_pid => (3000,),
-        :clean_proxy_data => (3000,),
-
-        # Julia session management
-        :register_julia_session => ("uuid", "name", 4000),
-        :unregister_julia_session => ("uuid",),
-        :get_julia_session => ("uuid",),
-        :list_julia_sessions => (),
-        :update_julia_session_status => ("uuid", "ready"),
-
-        # MCP session management
-        :create_mcp_session => (nothing,),
-        :get_mcp_session => ("session-id",),
-        :save_mcp_session! => nothing,  # Needs MCPSession object
-        :delete_mcp_session! => ("session-id",),
-        :cleanup_inactive_sessions! => (),
-
-        # Client connections
-        :register_client_connection => ("session-id",),
-        :unregister_client_connection => ("session-id",),
-
-        # Logging
-        :log_db_event => ("event", Dict{String,Any}()),
-        :log_db_interaction => ("inbound", "request", "{}"),
-
-        # Tools
-        :get_proxy_tool_schemas => (),
-
-        # Helpers (skip internal functions)
-        :handle_request => nothing,
-        :route_to_session_streaming => nothing,
-        :monitor_heartbeats => nothing,
-        :init_database! => (".mcprepl/test.db",),
-    )
-    return get(args_map, func_name, nothing)
-end
-
 function get_session_test_args(func_name::Symbol)
     args_map = Dict{Symbol,Any}(
         :MCPSession => (),
@@ -189,18 +131,6 @@ function get_session_test_args(func_name::Symbol)
         :session_from_db => nothing,  # Needs NamedTuple
         :get_server_capabilities => (),
         :get_version => (),
-    )
-    return get(args_map, func_name, nothing)
-end
-
-function get_dashboard_test_args(func_name::Symbol)
-    args_map = Dict{Symbol,Any}(
-        :log_event => ("session-id", Dashboard.TOOL_CALL, Dict{String,Any}()),
-        :emit_progress => ("session-id", "token", 1),
-        :serve_static_file => ("index.html",),
-        :set_db_callback! => nothing,  # Needs function argument
-        :start_dashboard_server => (3001,),
-        :stop_dashboard_server => (),
     )
     return get(args_map, func_name, nothing)
 end
@@ -246,10 +176,6 @@ function get_mcprepl_test_args(func_name::Symbol)
         # REPL
         :execute_repllike => ("1 + 1",),
         :remove_println_calls => (:(println("test")),),
-
-        # Proxy wrappers
-        :start_proxy => (3000,),
-        :stop_proxy => (3000,),
     )
     return get(args_map, func_name, nothing)
 end
@@ -423,42 +349,6 @@ function run_critical_checks()
 
     critical_checks = [
         # ========================================
-        # Proxy module - Julia session management
-        # ========================================
-        (
-            MCPRepl.Proxy.register_julia_session,
-            ("uuid", "name", 3000),
-            "Proxy.register_julia_session(String, String, Int)",
-        ),
-        (
-            MCPRepl.Proxy.unregister_julia_session,
-            ("uuid",),
-            "Proxy.unregister_julia_session(String)",
-        ),
-        (MCPRepl.Proxy.get_julia_session, ("uuid",), "Proxy.get_julia_session(String)"),
-        (MCPRepl.Proxy.list_julia_sessions, (), "Proxy.list_julia_sessions()"),
-        (
-            MCPRepl.Proxy.update_julia_session_status,
-            ("uuid", "ready"),
-            "Proxy.update_julia_session_status(String, String)",
-        ),
-
-        # Proxy module - MCP session management
-        (MCPRepl.Proxy.get_mcp_session, ("session_id",), "Proxy.get_mcp_session(String)"),
-        (
-            MCPRepl.Proxy.delete_mcp_session!,
-            ("session_id",),
-            "Proxy.delete_mcp_session!(String)",
-        ),
-
-        # Proxy module - logging
-        (
-            MCPRepl.Proxy.log_db_event,
-            ("event", Dict{String,Any}()),
-            "Proxy.log_db_event(String, Dict)",
-        ),
-
-        # ========================================
         # Database module - Julia session operations
         # ========================================
         (
@@ -587,9 +477,6 @@ function introspect_all_methods(func::Function, func_name::String)
     for m in methods_list
         sig = m.sig
         println("      Method: $sig")
-        # Note: Actually testing each method signature requires generating
-        # appropriate arguments for each, which is complex. For now, we
-        # just list them.
         push!(results, (m, sig))
     end
 
@@ -604,13 +491,8 @@ function list_all_methods()
     println("Listing all methods in analyzed modules")
     println("="^70)
 
-    modules = [
-        (MCPRepl, "MCPRepl"),
-        (MCPRepl.Database, "Database"),
-        (MCPRepl.Proxy, "Proxy"),
-        (MCPRepl.Session, "Session"),
-        (MCPRepl.Dashboard, "Dashboard"),
-    ]
+    modules =
+        [(MCPRepl, "MCPRepl"), (MCPRepl.Database, "Database"), (MCPRepl.Session, "Session")]
 
     total_methods = 0
 

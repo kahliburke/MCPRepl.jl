@@ -91,15 +91,16 @@ using JSON
             @test !MCPRepl.validate_ip("192.168.1.1", config_lax)
         end
 
-        @testset "Quick Setup" begin
+        @testset "Config Creation and Persistence" begin
             # Remove any existing config
             config_dir = joinpath(test_dir, ".mcprepl")
             if isdir(config_dir)
                 rm(config_dir; recursive = true)
             end
 
-            # Quick setup with lax mode (default port 3000)
-            config = MCPRepl.quick_setup(:lax, 3000, test_dir)
+            # Create lax config
+            config = MCPRepl.SecurityConfig(:lax, String[], ["127.0.0.1", "::1"], 3000)
+            MCPRepl.save_security_config(config, test_dir)
             @test config.mode == :lax
             @test length(config.api_keys) == 0  # No keys in lax mode
             @test "127.0.0.1" in config.allowed_ips
@@ -117,8 +118,9 @@ using JSON
                 rm(config_dir; recursive = true)
             end
 
-            # Create initial config (default port 3000)
-            MCPRepl.quick_setup(:strict, 3000, test_dir)
+            # Create initial strict config
+            config = MCPRepl.SecurityConfig(:strict, String[], ["127.0.0.1", "::1"], 3000)
+            MCPRepl.save_security_config(config, test_dir)
 
             # Generate new key
             key = MCPRepl.add_api_key!(test_dir)

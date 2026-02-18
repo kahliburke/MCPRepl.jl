@@ -124,7 +124,7 @@ using .SessionStatus
 
     @testset "State Transition Logic" begin
         # Test state transition decision making
-        # This tests the logic that should be used in the proxy
+        # This tests the logic that should be used in the server
 
         # Function to determine what to do with a request based on status
         function request_action(status::String)

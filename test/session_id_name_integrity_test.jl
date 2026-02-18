@@ -5,7 +5,7 @@ Critical invariants:
 - id field MUST be the UUID
 - name field MUST be the logical name
 - id and name are DIFFERENT fields with DIFFERENT values
-- This applies regardless of how the session was started (proxy, manual, etc.)
+- This applies regardless of how the session was started
 """
 
 using ReTest

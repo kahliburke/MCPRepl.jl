@@ -13,7 +13,6 @@ struct SecurityConfig
     api_keys::Vector{String}
     allowed_ips::Vector{String}
     port::Int
-    bypass_proxy::Bool  # If true, run MCP server directly without proxy
     index_dirs::Vector{String}  # Directories to index for semantic search (relative to project root)
     index_extensions::Vector{String}  # File extensions to index
     created_at::Int64
@@ -27,7 +26,6 @@ function SecurityConfig(
     api_keys::Vector{String},
     allowed_ips::Vector{String},
     port::Int = 0,
-    bypass_proxy::Bool = false,
     index_dirs::Vector{String} = String[],
     index_extensions::Vector{String} = DEFAULT_INDEX_EXTENSIONS,
 )
@@ -36,7 +34,6 @@ function SecurityConfig(
         api_keys,
         allowed_ips,
         port,
-        bypass_proxy,
         index_dirs,
         index_extensions,
         Int64(round(time())),
@@ -118,7 +115,6 @@ function load_global_security_config()
         api_keys = get(data, "api_keys", String[])
         allowed_ips = get(data, "allowed_ips", ["127.0.0.1", "::1"])
         port = get(data, "port", 0)
-        bypass_proxy = get(data, "bypass_proxy", false)
         index_dirs = Vector{String}(get(data, "index_dirs", String[]))
         index_extensions =
             Vector{String}(get(data, "index_extensions", DEFAULT_INDEX_EXTENSIONS))
@@ -129,7 +125,6 @@ function load_global_security_config()
             api_keys,
             allowed_ips,
             port,
-            bypass_proxy,
             index_dirs,
             index_extensions,
             created_at,
@@ -159,7 +154,6 @@ function save_global_security_config(config::SecurityConfig)
             "api_keys" => config.api_keys,
             "allowed_ips" => config.allowed_ips,
             "port" => config.port,
-            "bypass_proxy" => config.bypass_proxy,
             "index_dirs" => config.index_dirs,
             "index_extensions" => config.index_extensions,
             "created_at" => config.created_at,
@@ -202,7 +196,7 @@ function load_security_config(workspace_dir::String = pwd())
         api_keys = get(data, "api_keys", String[])
         allowed_ips = get(data, "allowed_ips", ["127.0.0.1", "::1"])
         port = get(data, "port", 0)  # Default to 0 (dynamic port assignment)
-        bypass_proxy = get(data, "bypass_proxy", false)  # Default to false (use proxy)
+
         index_dirs = Vector{String}(get(data, "index_dirs", String[]))
         index_extensions =
             Vector{String}(get(data, "index_extensions", DEFAULT_INDEX_EXTENSIONS))
@@ -213,7 +207,6 @@ function load_security_config(workspace_dir::String = pwd())
             api_keys,
             allowed_ips,
             port,
-            bypass_proxy,
             index_dirs,
             index_extensions,
             created_at,
@@ -261,7 +254,7 @@ function save_security_config(config::SecurityConfig, workspace_dir::String = pw
             "mode" => string(config.mode),
             "api_keys" => config.api_keys,
             "allowed_ips" => config.allowed_ips,
-            "bypass_proxy" => config.bypass_proxy,
+            "port" => config.port,
             "index_dirs" => config.index_dirs,
             "index_extensions" => config.index_extensions,
             "created_at" => config.created_at,
@@ -415,7 +408,6 @@ function add_api_key!(workspace_dir::String = pwd())
         vcat(config.api_keys, [new_key]),
         config.allowed_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         config.index_extensions,
         config.created_at,
@@ -452,7 +444,6 @@ function remove_api_key!(key::String, workspace_dir::String = pwd())
         new_keys,
         config.allowed_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         config.index_extensions,
         config.created_at,
@@ -488,7 +479,6 @@ function add_allowed_ip!(ip::String, workspace_dir::String = pwd())
         config.api_keys,
         new_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         config.index_extensions,
         config.created_at,
@@ -524,7 +514,6 @@ function remove_allowed_ip!(ip::String, workspace_dir::String = pwd())
         config.api_keys,
         new_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         config.index_extensions,
         config.created_at,
@@ -558,7 +547,6 @@ function change_security_mode!(mode::Symbol, workspace_dir::String = pwd())
         config.api_keys,
         config.allowed_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         config.index_extensions,
         config.created_at,
@@ -589,7 +577,6 @@ function set_index_dirs!(dirs::Vector{String}, workspace_dir::String = pwd())
         config.api_keys,
         config.allowed_ips,
         config.port,
-        config.bypass_proxy,
         dirs,
         config.index_extensions,
         config.created_at,
@@ -623,7 +610,6 @@ function set_index_extensions!(extensions::Vector{String}, workspace_dir::String
         config.api_keys,
         config.allowed_ips,
         config.port,
-        config.bypass_proxy,
         config.index_dirs,
         extensions,
         config.created_at,

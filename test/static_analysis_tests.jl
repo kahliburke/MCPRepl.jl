@@ -22,15 +22,6 @@ using MCPRepl
         end
     end
 
-    @testset "Proxy Module Exports" begin
-        # Check that Proxy module properly imports from Session module
-        @test_call report_call = true begin
-            include("../src/proxy.jl")
-            # This will fail if Session.update_activity! is not exported
-            MCPRepl.Proxy.update_activity!
-        end
-    end
-
     @testset "Session Module Exports" begin
         # Verify all expected exports exist
         @test_call report_call = true begin
@@ -61,21 +52,6 @@ using MCPRepl
     end
 
     @testset "Export Consistency Check" begin
-        # Verify that all `using .Module` statements can resolve their names
-
-        # Test Proxy module dependencies
-        @testset "Proxy Dependencies" begin
-            using MCPRepl.Proxy
-
-            # These should all be available from imported modules
-            @test isdefined(MCPRepl.Proxy, :Dashboard)
-            @test isdefined(MCPRepl.Proxy, :Session)
-            @test isdefined(MCPRepl.Proxy, :MCPSession)
-            @test isdefined(MCPRepl.Proxy, :update_activity!)
-            @test isdefined(MCPRepl.Proxy, :get_mcp_session)
-            @test isdefined(MCPRepl.Proxy, :create_mcp_session)
-        end
-
         # Test MCPServer module dependencies
         @testset "MCPServer Dependencies" begin
             using MCPRepl.MCPServer

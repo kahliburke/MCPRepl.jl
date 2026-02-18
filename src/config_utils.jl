@@ -281,11 +281,12 @@ end
 
 function install_claude_settings()
     security_config = load_security_config()
+    port = security_config !== nothing ? security_config.port : 3000
     api_key = nothing
     if security_config !== nothing && !isempty(security_config.api_keys)
         api_key = first(security_config.api_keys)
     end
-    return Generate.create_claude_env_settings(pwd(), api_key)
+    return Generate.create_claude_env_settings(pwd(), port, api_key)
 end
 
 function configure_vscode_julia_args()

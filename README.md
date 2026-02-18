@@ -64,61 +64,15 @@ claude mcp add julia-repl http://localhost:3000 \
 
 ## Security
 
-MCPRepl.jl includes a comprehensive security layer to protect your REPL from unauthorized access. The package requires security configuration before starting and offers three security modes:
+MCPRepl.jl includes a security layer to protect your REPL from unauthorized access. The package requires security configuration before starting and offers three security modes:
 
 ### Security Modes
 
 - **`:strict` (default)** - Requires API key authentication AND IP allowlist. Most secure option for production use.
 - **`:relaxed`** - Requires API key authentication but accepts connections from any IP address.
-- **`:lax`** - Localhost-only mode (127.0.0.1, ::1) with no API key required. Suitable for local development. This mode is borderline stupid for anything other than development on a trusted machine - use with caution.
-
-### Initial Setup
-
-On first run, MCPRepl will guide you through security setup:
-
-```julia
-julia> using MCPRepl
-julia> MCPRepl.setup()  # Interactive setup wizard (dragon theme 🐉)
-
-Prefer the gentle butterfly experience? Call setup with the keyword argument:
-
-```julia
-julia> MCPRepl.setup(; gentle=true)  # Gentle butterfly theme 🦋
-```
-**Prefer a gentler experience?** Use the butterfly theme instead:
-
-Both wizards configure the same security options, just with different visual styles!
-
-Or use quick setup for automation:
-
-```julia
-julia> MCPRepl.quick_setup(:lax)    # For local development
-julia> MCPRepl.quick_setup(:strict) # For production
-```
-
-### Authentication
-
-When using `:strict` or `:relaxed` modes, clients must include an API key in the Authorization header:
-
-```bash
-# Example with curl
-curl -H "Authorization: Bearer mcprepl_YOUR_API_KEY_HERE" \
-     http://localhost:3000
-```
-
-For AI clients like Claude, configure with your API key:
-
-```sh
-# Add server with authentication
-claude mcp add julia-repl http://localhost:3000 \
-  --transport http \
-  -H "Authorization: Bearer mcprepl_YOUR_API_KEY_HERE" \
-  -H "X-MCPRepl-Target: YOUR_PROJECT_NAME"
-```
+- **`:lax`** - Localhost-only mode (127.0.0.1, ::1) with no API key required. Suitable for local development.
 
 ### Security Management
-
-MCPRepl provides helper functions to manage your security configuration:
 
 ```julia
 # View current configuration
@@ -138,32 +92,8 @@ MCPRepl.deny_ip("192.168.1.100")
 MCPRepl.set_security_mode(:relaxed)
 
 # Reset configuration and start fresh
-MCPRepl.reset()  # Removes all generated files
-```
-
-### Resetting Configuration
-
-If you need to start fresh or completely remove MCPRepl configuration:
-
-```julia
 MCPRepl.reset()
 ```
-
-This will remove:
-- `.mcprepl/` directory (security config and API keys)
-- `.julia-startup.jl` script
-- VS Code Julia startup configuration
-- MCP server entries from `.vscode/mcp.json`
-
-After resetting, you can run `MCPRepl.setup()` again to reconfigure.
-
-### Security Best Practices
-
-- Use `:strict` mode for any production or remote deployment
-- Regularly rotate API keys using `generate_key()` and `revoke_key()`
-- Keep API keys secure - they grant full REPL access
-- Review allowed IPs periodically with `security_status()`
-- Use `:lax` mode only for local development on trusted machines
 
 ### Disclaimer
 
@@ -178,7 +108,7 @@ This software is provided "as is" without warranties. Use at your own risk.
 
 ## LSP Integration
 
-MCPRepl.jl includes Language Server Protocol (LSP) integration, giving AI agents access to code navigation and refactoring capabilities. These tools enable intelligent code analysis without requiring interactive GUI features.
+MCPRepl.jl includes Language Server Protocol (LSP) integration, giving AI agents access to code navigation and refactoring capabilities.
 
 ### Available LSP Tools
 
@@ -191,153 +121,11 @@ MCPRepl.jl includes Language Server Protocol (LSP) integration, giving AI agents
 **Refactoring & Formatting:**
 - **`lsp_rename`** — Safely rename a symbol across the entire workspace
 - **`lsp_code_actions`** — Get available quick fixes and refactorings for errors/warnings
-- **`lsp_format_document`** — Format an entire Julia file
-- **`lsp_format_range`** — Format only specific lines of code
 
 > **Note for AI Agents:** For documentation and type information, use Julia's built-in introspection in the REPL:
 > - `@doc function_name` — Get documentation
 > - `methods(function_name)` — See all method signatures
 > - `?function_name` — Interactive help
-
-### Example Usage
-
-```julia
-# Find where a function is defined
-lsp_goto_definition(
-    file_path = "/path/to/file.jl",
-    line = 42,
-    column = 10
-)
-
-# Find all usages of a function
-lsp_find_references(
-    file_path = "/path/to/file.jl",
-    line = 42,
-    column = 10
-)
-
-# Rename a symbol across the entire codebase
-lsp_rename(
-    file_path = "/path/to/file.jl",
-    line = 42,
-    column = 10,
-    new_name = "better_function_name"
-)
-
-# Get available quick fixes for an error
-lsp_code_actions(
-    file_path = "/path/to/file.jl",
-    start_line = 42,
-    start_column = 10
-)
-```
-
-```
-
-### AI Agent Benefits
-
-The LSP integration enables AI agents to:
-
-- **Navigate code intelligently** — Jump to definitions and find usages instead of searching text
-- **Refactor safely** — Use rename to change symbols across the entire codebase
-- **Fix errors automatically** — Get code actions for quick fixes and suggested improvements
-- **Format consistently** — Apply standard formatting to code
-- **Discover structure** — Get document outlines and search for symbols workspace-wide
-
-All LSP operations use the Julia Language Server already running in VS Code, ensuring accurate results.
-
-> **Tip:** For documentation and type introspection, agents should use the REPL directly (`@doc`, `methods()`, `fieldnames()`, etc.) rather than LSP tools, as this provides richer information and context.
-
-## Using in Other Projects
-
-MCPRepl can be used as a dependency in your own Julia projects. The package includes:
-
-### Proxy Server
-Start a persistent MCP proxy that routes requests to REPL backends:
-
-```julia
-using MCPRepl
-
-# Start proxy (auto-starts dashboard in development mode)
-MCPRepl.start_proxy(port=3000)
-
-# Or use the CLI
-# julia proxy.jl start --background
-```
-
-The proxy provides:
-- **Persistent endpoint** - Stays up even when REPL backends restart
-- **Dashboard** - Web UI at `http://localhost:3000/dashboard` for monitoring
-- **Session routing** - Route requests to specific REPL instances
-- **Zero-downtime** - REPL can restart without breaking client connections
-
-### Standalone/Proxy-Compatible Mode
-
-MCPRepl can also run in standalone mode without the proxy, providing a complete HTTP-based
-MCP server with integrated dashboard:
-
-```julia
-using MCPRepl
-
-# Start in standalone mode (no proxy needed)
-MCPRepl.start!(register_with_proxy=false)
-
-# Or configure in security settings
-# bypass_proxy = true
-```
-
-**Standalone mode includes:**
-- ✅ **HTTP JSON-RPC** - Full MCP protocol at `/` or `/mcp` endpoints
-- ✅ **Dashboard UI** - React dashboard at `http://localhost:<port>/` or `/dashboard`
-- ✅ **Dashboard API** - RESTful API at `/api/events` for programmatic access
-- ✅ **WebSocket Updates** - Real-time event streaming at `/ws`
-- ✅ **All MCP Tools** - Complete tool registry accessible via HTTP
-- ✅ **Security layer** - Same API key, IP restrictions as proxy mode
-- ✅ **No dependencies** - Works without running the separate proxy process
-
-**When you start in standalone mode, you'll see:**
-```
-🔌 Standalone Mode (Proxy-Compatible)
-   📊 Dashboard: http://localhost:4000/
-   🔧 MCP JSON-RPC: http://localhost:4000/mcp
-   💡 Tip: This server includes the full dashboard UI and accepts MCP calls via HTTP
-```
-
-**Trade-offs:**
-- ❌ **Single session only** - No multi-REPL routing (proxy feature)
-- ❌ **No session persistence** - REPL restarts break client connections
-
-**When to use standalone mode:**
-- Single-session development workflows
-- Testing and debugging MCP integrations
-- Simplified deployment scenarios
-- Direct HTTP client access without proxy overhead
-
-The standalone mode automatically activates when:
-1. `bypass_proxy=true` in security config, OR
-2. `MCPREPL_BYPASS_PROXY=true` environment variable is set, OR  
-3. Proxy is not running on default port 3000
-
-### Dashboard
-
-The dashboard is automatically available when the proxy is running:
-- **Development**: Auto-starts Vite dev server with hot reload
-- **Production**: Serves pre-built static files (no Node.js required)
-
-Access at: `http://localhost:3000/dashboard`
-
-### Programmatic Usage
-
-```julia
-using MCPRepl
-
-# Start a REPL backend
-MCPRepl.start!(port=4000)
-
-# In another project, connect to the proxy
-# Your AI agent connects to port 3000 (proxy)
-# Proxy forwards to port 4000 (your REPL)
-```
 
 ## Similar Packages
 - [ModelContexProtocol.jl](https://github.com/JuliaSMLM/ModelContextProtocol.jl) offers a way of defining your own servers. Since MCPRepl is using a HTTP server I decieded to not go with this package.

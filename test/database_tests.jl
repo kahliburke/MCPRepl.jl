@@ -326,7 +326,7 @@ using MCPRepl.Database
         mcp_session = first(filter(s -> s.id == mcp_session_id, active_sessions))
         @test mcp_session.target_julia_session_id === nothing
 
-        # Re-register with new target (simulating proxy restart scenario)
+        # Re-register with new target (simulating server restart scenario)
         register_mcp_session!(
             mcp_session_id,
             "active";
@@ -372,7 +372,7 @@ using MCPRepl.Database
         @test session_2_updated.target_julia_session_id == julia_1
     end
 
-    @testset "MCP Session Restoration After Proxy Restart" begin
+    @testset "MCP Session Restoration After Server Restart" begin
         # Test that MCP sessions can be restored from DB with their Julia targets
         mcp_id = "persistent-mcp-session"
         julia_id = "julia-backend-uuid"
@@ -386,7 +386,7 @@ using MCPRepl.Database
         @test found.id == mcp_id
         @test found.target_julia_session_id == julia_id
 
-        # Simulate proxy restart: query DB to get the target
+        # Simulate server restart: query DB to get the target
         # (In real code, this happens in initialize handler when client provides Mcp-Session-Id header)
         restored_sessions = Database.get_active_mcp_sessions()
         restored = first(filter(s -> s.id == mcp_id, restored_sessions))

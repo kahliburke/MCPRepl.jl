@@ -405,43 +405,6 @@ Marks the session as stopped. The session will NOT automatically restart.""",
             server_uuid = SERVER[] !== nothing ? SERVER[].uuid : nothing
 
             if command == "shutdown" || command == "restart"
-                # Notify proxy of status change BEFORE exiting
-                # This allows requests to be properly buffered during restart
-                if SERVER[] !== nothing
-                    proxy_port = get(ENV, "MCPREPL_PROXY_PORT", "3000")
-                    new_status = command == "shutdown" ? "stopped" : "restarting"
-
-                    # For restart, tell proxy to spawn a new session after this one exits
-                    try
-                        request_body = Dict(
-                            "jsonrpc" => "2.0",
-                            "id" => 999,
-                            "method" => "proxy/update_status",
-                            "params" => Dict(
-                                "uuid" => SERVER[].uuid,
-                                "status" => new_status,
-                            ),
-                        )
-
-                        # If restarting, add restart request
-                        if command == "restart"
-                            request_body["params"]["restart_requested"] = true
-                        end
-
-                        HTTP.post(
-                            "http://127.0.0.1:$(proxy_port)/",
-                            ["Content-Type" => "application/json"],
-                            JSON.json(request_body);
-                            connect_timeout = 2,
-                            readtimeout = 2,
-                        )
-                        @info "Notified proxy of $new_status status" restart =
-                            (command == "restart")
-                    catch e
-                        @debug "Failed to notify proxy of status change" exception = e
-                    end
-                end
-
                 @async begin
                     # Small delay to allow response to be sent back
                     sleep(0.5)
@@ -453,11 +416,6 @@ Marks the session as stopped. The session will NOT automatically restart.""",
 
 🛑 The session will be marked as stopped.
 
-**What happens next:**
-1. The Julia REPL will exit cleanly
-2. The session will remain stopped until manually restarted
-3. Use the proxy's `start_julia_session` tool to start a new session
-
 **To restart from terminal:**
 Run the `./repl` script again from your terminal."""
                 else
@@ -468,10 +426,7 @@ Run the `./repl` script again from your terminal."""
 **AI Agent Instructions:**
 1. Wait 5 seconds before making any requests
 2. Then retry every 2 seconds until connection is reestablished
-3. Typical restart time: 5-10 seconds (may be longer if packages need recompilation)
-
-The proxy will automatically spawn a new Julia session with the same project.
-Buffered requests will be replayed when the new session is ready."""
+3. Typical restart time: 5-10 seconds (may be longer if packages need recompilation)"""
                 end
             else
                 return "Error: Invalid command '$command'. Must be 'restart' or 'shutdown'"

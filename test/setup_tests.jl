@@ -2,6 +2,13 @@ using ReTest
 using MCPRepl
 using JSON
 
+# Helper to create and save a security config for tests
+function _setup_security_config(mode::Symbol, port::Int, dir::String)
+    config = MCPRepl.SecurityConfig(mode, String[], ["127.0.0.1", "::1"], port)
+    MCPRepl.save_security_config(config, dir)
+    return config
+end
+
 @testset "Setup Tests" begin
     # Create a temporary directory for testing
     temp_dir = mktempdir()
@@ -22,7 +29,7 @@ using JSON
                 @test !isfile(mcp_path)
 
                 # Test 3: Create security config first (required for add_vscode_mcp_server)
-                MCPRepl.quick_setup(:lax, 3000, temp_dir)
+                _setup_security_config(:lax, 3000, temp_dir)
 
                 # Test 4: Add HTTP transport
                 @test MCPRepl.add_vscode_mcp_server("http") == true
@@ -40,13 +47,10 @@ using JSON
                 @test MCPRepl.check_vscode_status() == :configured_http
 
                 # Test 7: Update security config to different port
-                MCPRepl.quick_setup(:lax, 4000, temp_dir)
+                _setup_security_config(:lax, 4000, temp_dir)
                 @test MCPRepl.add_vscode_mcp_server("http") == true
                 config = MCPRepl.read_vscode_mcp_config()
                 @test config["servers"]["julia-repl"]["url"] == "http://localhost:4000"
-
-                # Note: stdio transport removed - add_vscode_mcp_server now only creates HTTP configs
-                # Skipping stdio tests (lines previously at Test 8)
 
                 # Test 8: Remove configuration
                 @test MCPRepl.remove_vscode_mcp_server() == true
@@ -54,7 +58,7 @@ using JSON
                 @test !haskey(config["servers"], "julia-repl")
                 @test MCPRepl.check_vscode_status() == :not_configured
 
-                # Test 10: Remove when already removed (idempotent)
+                # Test 9: Remove when already removed (idempotent)
                 @test MCPRepl.remove_vscode_mcp_server() == true
 
             finally
@@ -76,7 +80,7 @@ using JSON
                 @test MCPRepl.read_vscode_mcp_config() === nothing
 
                 # Test 2: Create security config, then write and read vscode config
-                MCPRepl.quick_setup(:lax, 5000, test_subdir)
+                _setup_security_config(:lax, 5000, test_subdir)
                 MCPRepl.add_vscode_mcp_server("http")
                 config = MCPRepl.read_vscode_mcp_config()
                 @test config !== nothing
@@ -105,14 +109,11 @@ using JSON
                 test_ports = [3000, 3003, 8080, 9000]
 
                 for port in test_ports
-                    MCPRepl.quick_setup(:lax, port, temp_dir)
+                    _setup_security_config(:lax, port, temp_dir)
                     MCPRepl.add_vscode_mcp_server("http")
                     config = MCPRepl.read_vscode_mcp_config()
                     @test config["servers"]["julia-repl"]["url"] == "http://localhost:$port"
                 end
-
-                # Note: stdio support removed since add_vscode_mcp_server now only creates HTTP configs
-                # and reads port from security.json
 
             finally
                 cd(original_dir)
@@ -188,7 +189,7 @@ using JSON
                 @test MCPRepl.has_startup_script() == false
 
                 # Test 2: Create security config first (install_startup_script reads from it)
-                MCPRepl.quick_setup(:lax, 3000, temp_dir)
+                _setup_security_config(:lax, 3000, temp_dir)
 
                 # Test 3: Install startup script
                 @test MCPRepl.install_startup_script() == true
@@ -197,14 +198,10 @@ using JSON
                 # Test 4: Verify script content
                 content = read(startup_path, String)
                 @test contains(content, "using MCPRepl")
-                @test contains(content, "MCPRepl.start!")
-                # Note: Port is read dynamically from security.json, not hardcoded in file
+                @test contains(content, "MCPReplBridge.serve")
 
-                # Test 4: Check has startup script
+                # Test 5: Check has startup script
                 @test MCPRepl.has_startup_script() == true
-
-                # Note: install_startup_script() no longer accepts port parameter
-                # Port is read from security.json at runtime
 
             finally
                 cd(original_dir)
