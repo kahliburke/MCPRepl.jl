@@ -371,13 +371,15 @@ manage_repl_tool = @mcp_tool(
     """Manage the Julia REPL (restart or shutdown).
 
 **Commands:**
-- `restart`: Restart the Julia REPL - proxy will automatically spawn a new session with the same project
+- `restart`: Restart the Julia REPL process. The process is replaced via exec —
+  same terminal, fresh Julia state, all code freshly compiled. Use this when
+  Revise.jl fails to pick up code changes.
 - `shutdown`: Shutdown the Julia REPL and disable auto-restart
 
 **Restart Behavior:**
-The proxy will automatically spawn a new Julia session with the same project path and settings.
-Requests are buffered during restart and replayed when the new session is ready.
-Returns immediately, then server restarts (wait 5s, retry every 2s).
+The bridge process replaces itself with a fresh Julia via exec. Same PID, same
+terminal. The session key is preserved. Typical restart: 10-30s depending on
+package precompilation. Revise is loaded automatically in the restarted session.
 
 **Shutdown Behavior:**
 Marks the session as stopped. The session will NOT automatically restart.""",
@@ -389,50 +391,58 @@ Marks the session as stopped. The session will NOT automatically restart.""",
                 "enum" => ["restart", "shutdown"],
                 "description" => "Command to execute: 'restart' or 'shutdown'",
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => ["command"],
     ),
-    (args, stream_channel = nothing) -> begin
-        try
-            command = get(args, "command", "")
+    (args) -> begin
+        command = get(args, "command", "")
+        session = get(args, "session", "")
+        isempty(command) && return "Error: command is required"
 
-            if isempty(command)
-                return "Error: command parameter is required (must be 'restart' or 'shutdown')"
+        conn, err = _resolve_bridge_conn(session)
+        err !== nothing && return err
+        mgr = BRIDGE_CONN_MGR[]
+        mgr === nothing && return "Error: No ConnectionManager available"
+        key = short_key(conn)
+
+        if command == "restart"
+            ok = send_restart!(conn)
+            if !ok
+                return "Error: Failed to send restart to session $key"
             end
 
-            # Get the current server info
-            server_port = SERVER[] !== nothing ? SERVER[].port : 3000
-            server_uuid = SERVER[] !== nothing ? SERVER[].uuid : nothing
-
-            if command == "shutdown" || command == "restart"
-                @async begin
-                    # Small delay to allow response to be sent back
-                    sleep(0.5)
-                    exit()
+            # Remove old connection from manager so the health checker doesn't
+            # race with the new bridge by cleaning up files for this session_id.
+            # The bridge handles its own file cleanup before exec.
+            lock(mgr.lock) do
+                idx = findfirst(c -> c === conn, mgr.connections)
+                if idx !== nothing
+                    disconnect!(conn)
+                    deleteat!(mgr.connections, idx)
                 end
-
-                if command == "shutdown"
-                    return """✓ Julia REPL shutdown initiated.
-
-🛑 The session will be marked as stopped.
-
-**To restart from terminal:**
-Run the `./repl` script again from your terminal."""
-                else
-                    return """✓ Julia REPL restart initiated on port $server_port.
-
-⏳ The MCP server will be temporarily offline during restart.
-
-**AI Agent Instructions:**
-1. Wait 5 seconds before making any requests
-2. Then retry every 2 seconds until connection is reestablished
-3. Typical restart time: 5-10 seconds (may be longer if packages need recompilation)"""
-                end
-            else
-                return "Error: Invalid command '$command'. Must be 'restart' or 'shutdown'"
             end
-        catch e
-            return "Error managing REPL: $e"
+
+            # Wait for new session to appear (bridge does exec, reconnects with same session_id).
+            # The watcher will discover the new metadata JSON and create a fresh connection.
+            deadline = time() + 60.0
+            while time() < deadline
+                sleep(3.0)
+                new_conn = get_connection_by_key(mgr, key)
+                if new_conn !== nothing && new_conn.status == :connected
+                    return "Session $key restarted. Fresh Julia state. Revise active."
+                end
+            end
+            return "Restart sent to $key but timed out waiting for reconnection (60s). The session may still be starting — try again shortly."
+        elseif command == "shutdown"
+            ok = send_restart!(conn)  # reuse restart to stop the bridge loop
+            disconnect!(conn)
+            return ok ? "Session $key shut down." : "Error: Failed to reach session $key."
+        else
+            return "Error: Invalid command '$command'"
         end
     end
 )

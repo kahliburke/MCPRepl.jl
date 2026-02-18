@@ -2121,11 +2121,11 @@ function tool_help(tool_id::Symbol; extended::Bool = false)
     return tool
 end
 
-function restart()
-    call_tool(:manage_repl, Dict("command" => "restart"))
+function restart(; session::String = "")
+    call_tool(:manage_repl, Dict("command" => "restart", "session" => session))
 end
-function shutdown()
-    call_tool(:manage_repl, Dict("command" => "shutdown"))
+function shutdown(; session::String = "")
+    call_tool(:manage_repl, Dict("command" => "shutdown", "session" => session))
 end
 
 end #module

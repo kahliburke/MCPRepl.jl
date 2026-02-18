@@ -665,6 +665,34 @@ function ping(conn::REPLConnection; skip_if_busy::Bool = false)
 end
 
 """
+    send_restart!(conn::REPLConnection) -> Bool
+
+Send a `:restart` command to the bridge. Returns `true` if the bridge acknowledged.
+The bridge will exec a fresh Julia process after replying.
+"""
+function send_restart!(conn::REPLConnection)
+    (conn.status != :connected || conn.req_socket === nothing) && return false
+    lock(conn.req_lock) do
+        try
+            io = IOBuffer()
+            serialize(io, (type = :restart, name = conn.name))
+            send(conn.req_socket, Message(take!(io)))
+            raw = recv(conn.req_socket)
+            response = deserialize(IOBuffer(raw))
+            conn.last_seen = now()
+            return get(response, :type, :error) == :ok
+        catch e
+            if e isa ZMQ.TimeoutError
+                _reconnect_req!(conn)
+            else
+                conn.status = :disconnected
+            end
+            return false
+        end
+    end
+end
+
+"""
     drain_stream_messages!(mgr::ConnectionManager) -> Vector{NamedTuple}
 
 Non-blocking drain of all pending streaming messages from connected bridges.

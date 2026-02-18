@@ -313,6 +313,32 @@ function _serialize_result(result)::String
     return String(take!(io))
 end
 
+"""
+    _exec_restart(name, session_id, project_path)
+
+Replace the current process with a fresh Julia via `execvp`. Same PID, same
+terminal, fresh Julia state. The `-i` flag keeps the REPL interactive.
+"""
+function _exec_restart(name::String, session_id::String, project_path::String)
+    julia_args = Base.julia_cmd().exec  # e.g. ["julia", "-Cnative", "-J..."]
+    serve_code = """
+    try; using Revise; catch; end
+    using MCPRepl
+    MCPReplBridge.serve(name=$(repr(name)), session_id=$(repr(session_id)))
+    """
+    args = vcat(julia_args, ["--project=$project_path", "-i", "-e", serve_code])
+
+    # execvp replaces the process image — same PID, same terminal
+    argv = map(String, args)
+    ptrs = Ptr{UInt8}[pointer(s) for s in argv]
+    push!(ptrs, Ptr{UInt8}(0))  # NULL terminator
+    GC.@preserve argv ccall(:execvp, Cint, (Cstring, Ptr{Ptr{UInt8}}), argv[1], ptrs)
+
+    # If we reach here, execvp failed — fall back to exit
+    @error "execvp failed, falling back to exit" errno = Base.Libc.errno()
+    exit(1)
+end
+
 function handle_message(request::NamedTuple)
     msg_type = get(request, :type, :unknown)
 
@@ -359,6 +385,26 @@ function handle_message(request::NamedTuple)
     elseif msg_type == :shutdown
         _RUNNING[] = false
         return (type = :ok, message = "shutting down")
+    elseif msg_type == :restart
+        # Save metadata before cleanup
+        old_name = string(get(request, :name, "julia"))
+        old_session_id = _SESSION_ID[]
+        old_project = dirname(Base.active_project())
+
+        _RUNNING[] = false
+
+        @async begin
+            try
+                sleep(0.3)  # Let ZMQ reply go through
+                _cleanup()  # Close sockets, remove metadata files
+                _exec_restart(old_name, old_session_id, old_project)
+            catch e
+                @error "Restart failed" exception = (e, catch_backtrace())
+                exit(1)
+            end
+        end
+
+        return (type = :ok, message = "restarting via exec")
     else
         return (type = :error, message = "unknown request type: $msg_type")
     end
@@ -404,7 +450,7 @@ end
 # ── Public API ────────────────────────────────────────────────────────────────
 
 """
-    serve(; name="julia", port=nothing)
+    serve(; name="julia", port=nothing, session_id=nothing)
 
 Start the eval bridge. Binds a ZMQ REP socket on an IPC endpoint and
 listens for eval requests from the MCPRepl TUI server.
@@ -414,6 +460,7 @@ Non-blocking — returns immediately. The bridge runs in a background task.
 # Arguments
 - `name::String`: Human-readable session name (shown in TUI)
 - `port::Union{Int,Nothing}`: If given, also bind TCP on this port (for remote)
+- `session_id::Union{String,Nothing}`: Reuse a session ID (e.g. after exec restart)
 
 # Example
 ```julia
@@ -421,7 +468,11 @@ using MCPRepl
 MCPReplBridge.serve(name="myproject")
 ```
 """
-function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
+function serve(;
+    name::String = "julia",
+    port::Union{Int,Nothing} = nothing,
+    session_id::Union{String,Nothing} = nothing,
+)
     if _RUNNING[]
         @warn "Bridge already running (session=$(_SESSION_ID[])). Call stop() first."
         return _SESSION_ID[]
@@ -430,9 +481,9 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     # Ensure socket directory exists
     mkpath(SOCK_DIR)
 
-    # Generate session ID
-    session_id = string(Base.UUID(rand(UInt128)))
-    _SESSION_ID[] = session_id
+    # Generate or reuse session ID
+    sid = session_id !== nothing ? session_id : string(Base.UUID(rand(UInt128)))
+    _SESSION_ID[] = sid
     _START_TIME[] = time()
     _MIRROR_REPL[] = try
         parentmodule(@__MODULE__).get_bridge_mirror_repl_preference()
@@ -450,13 +501,13 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     socket.rcvtimeo = 1000
 
     # Bind IPC endpoint
-    sock_path = joinpath(SOCK_DIR, "$(session_id).sock")
+    sock_path = joinpath(SOCK_DIR, "$(sid).sock")
     endpoint = "ipc://$(sock_path)"
     bind(socket, endpoint)
 
     # Create PUB socket for streaming stdout/stderr to TUI
     pub_socket = Socket(ctx, PUB)
-    stream_path = joinpath(SOCK_DIR, "$(session_id)-stream.sock")
+    stream_path = joinpath(SOCK_DIR, "$(sid)-stream.sock")
     stream_endpoint = "ipc://$(stream_path)"
     bind(pub_socket, stream_endpoint)
     _STREAM_SOCKET[] = pub_socket
@@ -467,7 +518,7 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     end
 
     # Write metadata file
-    write_metadata(session_id, name, endpoint, stream_endpoint)
+    write_metadata(sid, name, endpoint, stream_endpoint)
 
     # Register cleanup
     atexit(() -> stop())
@@ -497,7 +548,7 @@ function serve(; name::String = "julia", port::Union{Int,Nothing} = nothing)
     if _MIRROR_REPL[]
         printstyled("  host REPL mirroring enabled\n"; color = :light_black)
     end
-    return session_id
+    return sid
 end
 
 """
