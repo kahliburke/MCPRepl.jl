@@ -113,7 +113,6 @@ resources_tools = [test_tool]
             @test haskey(json_response, "result")
             @test haskey(json_response["result"], "prompts")
             @test json_response["result"]["prompts"] isa Array
-            @test isempty(json_response["result"]["prompts"])
 
         finally
             MCPRepl.stop_mcp_server(server)

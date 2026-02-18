@@ -180,7 +180,7 @@ function get_server_capabilities()
             "listChanged" => true,  # We support tools/list_changed notifications
         ),
         "prompts" => Dict{String,Any}(),  # We support prompts
-        "resources" => Dict{String,Any}(),  # We support resources
+        "resources" => Dict{String,Any}("listChanged" => true),  # We support resources
         "logging" => Dict{String,Any}(),  # We support logging
     )
 end

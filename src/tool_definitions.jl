@@ -159,10 +159,11 @@ ping_tool = @mcp_tool(
             status *= "\n\nSessions: $(length(conns)) connected / $(length(all_conns)) total"
             for conn in all_conns
                 key = short_key(conn)
+                dname = isempty(conn.display_name) ? conn.name : conn.display_name
                 icon =
                     conn.status == :connected ? "●" :
                     conn.status == :connecting ? "◐" : "○"
-                status *= "\n  $icon $key $(conn.name) ($(conn.status), Julia $(conn.julia_version), PID $(conn.pid))"
+                status *= "\n  $icon $key $dname ($(conn.status), Julia $(conn.julia_version), PID $(conn.pid))"
                 status *= "\n    project: $(conn.project_path)"
             end
         end
@@ -415,6 +416,11 @@ Marks the session as stopped. The session will NOT automatically restart.""",
                 return "Error: Failed to send restart to session $key"
             end
 
+            # Suppress resource notifications during restart — session key stays
+            # stable so the agent doesn't need to re-discover resources.
+            old_cb = mgr.on_sessions_changed
+            mgr.on_sessions_changed = nothing
+
             # Remove old connection from manager so the health checker doesn't
             # race with the new bridge by cleaning up files for this session_id.
             # The bridge handles its own file cleanup before exec.
@@ -433,9 +439,11 @@ Marks the session as stopped. The session will NOT automatically restart.""",
                 sleep(3.0)
                 new_conn = get_connection_by_key(mgr, key)
                 if new_conn !== nothing && new_conn.status == :connected
+                    mgr.on_sessions_changed = old_cb
                     return "Session $key restarted. Fresh Julia state. Revise active."
                 end
             end
+            mgr.on_sessions_changed = old_cb
             return "Restart sent to $key but timed out waiting for reconnection (60s). The session may still be starting — try again shortly."
         elseif command == "shutdown"
             ok = send_restart!(conn)  # reuse restart to stop the bridge loop

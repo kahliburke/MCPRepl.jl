@@ -241,56 +241,114 @@ render_text(m; kw...) = join(render_activity(m; kw...), "\n")
     end
 
     @testset "Dynamic Health Computation" begin
-        conn_up = (status = :connected,)
-        conn_ing = (status = :connecting,)
-        conn_down = (status = :disconnected,)
+        # _compute_health(model, key) returns (health::Float64, has_data::Bool)
+        # health = 1.0 - (errors / n) over the last 50 tool results
 
-        @testset "Base values by connection status" begin
+        @testset "No results → perfect health, no data" begin
             m = MCPRepl.MCPReplModel()
-            @test MCPRepl._compute_health(conn_up, m) == 0.8
-            @test MCPRepl._compute_health(conn_ing, m) == 0.4
-            @test MCPRepl._compute_health(conn_down, m) == 0.0
+            h, has_data = MCPRepl._compute_health(m)
+            @test h == 1.0
+            @test !has_data
         end
 
-        @testset "Momentum boost on recent success" begin
-            m = MCPRepl.MCPReplModel(last_tool_success = time())
-            @test MCPRepl._compute_health(conn_up, m) == 1.0
+        @testset "All successes → health 1.0" begin
+            m = MCPRepl.MCPReplModel()
+            for _ = 1:5
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(Dates.now(), "ex", "{}", "ok", "1ms", true, ""),
+                )
+            end
+            h, has_data = MCPRepl._compute_health(m)
+            @test h == 1.0
+            @test has_data
         end
 
         @testset "Error penalty" begin
-            m = MCPRepl.MCPReplModel(last_tool_error = time())
-            @test MCPRepl._compute_health(conn_up, m) ≈ 0.6
+            m = MCPRepl.MCPReplModel()
+            # 4 successes + 1 error = 80% health
+            for _ = 1:4
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(Dates.now(), "ex", "{}", "ok", "1ms", true, ""),
+                )
+            end
+            push!(
+                m.tool_results,
+                MCPRepl.ToolCallResult(Dates.now(), "ex", "{}", "ERROR", "1ms", false, ""),
+            )
+            h, has_data = MCPRepl._compute_health(m)
+            @test h ≈ 0.8
+            @test has_data
         end
 
-        @testset "Momentum and penalty cancel out" begin
-            m = MCPRepl.MCPReplModel(last_tool_success = time(), last_tool_error = time())
-            @test MCPRepl._compute_health(conn_up, m) == 0.8
+        @testset "All errors → health 0.0" begin
+            m = MCPRepl.MCPReplModel()
+            for _ = 1:5
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(
+                        Dates.now(),
+                        "ex",
+                        "{}",
+                        "ERROR",
+                        "1ms",
+                        false,
+                        "",
+                    ),
+                )
+            end
+            h, has_data = MCPRepl._compute_health(m)
+            @test h == 0.0
+            @test has_data
         end
 
-        @testset "Idle decay after 60s" begin
-            m = MCPRepl.MCPReplModel(last_tool_success = time() - 180.0)
-            h = MCPRepl._compute_health(conn_up, m)
-            @test h < 0.8
-            @test h >= 0.6
+        @testset "Per-session filtering" begin
+            m = MCPRepl.MCPReplModel()
+            # 2 successes for session "aaaa"
+            for _ = 1:2
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(
+                        Dates.now(),
+                        "ex",
+                        "{}",
+                        "ok",
+                        "1ms",
+                        true,
+                        "aaaa",
+                    ),
+                )
+            end
+            # 1 error for session "bbbb"
+            push!(
+                m.tool_results,
+                MCPRepl.ToolCallResult(
+                    Dates.now(),
+                    "ex",
+                    "{}",
+                    "ERROR",
+                    "1ms",
+                    false,
+                    "bbbb",
+                ),
+            )
+            # Session "aaaa" should have perfect health
+            h_a, _ = MCPRepl._compute_health(m, "aaaa")
+            @test h_a == 1.0
+            # Session "bbbb" should have 0.0 health
+            h_b, _ = MCPRepl._compute_health(m, "bbbb")
+            @test h_b == 0.0
         end
 
         @testset "Clamped to [0, 1]" begin
-            m = MCPRepl.MCPReplModel(
-                last_tool_error = time(),
-                last_tool_success = time() - 300.0,
+            m = MCPRepl.MCPReplModel()
+            push!(
+                m.tool_results,
+                MCPRepl.ToolCallResult(Dates.now(), "ex", "{}", "ok", "1ms", true, ""),
             )
-            @test MCPRepl._compute_health(conn_down, m) == 0.0
-            m2 = MCPRepl.MCPReplModel(last_tool_success = time())
-            @test MCPRepl._compute_health(conn_up, m2) == 1.0
-        end
-
-        @testset "Monotonic: connected > connecting > disconnected" begin
-            m = MCPRepl.MCPReplModel(last_tool_success = time())
-            h_up = MCPRepl._compute_health(conn_up, m)
-            h_ing = MCPRepl._compute_health(conn_ing, m)
-            h_down = MCPRepl._compute_health(conn_down, m)
-            @test h_up >= h_ing
-            @test h_ing >= h_down
+            h, _ = MCPRepl._compute_health(m)
+            @test 0.0 <= h <= 1.0
         end
     end
 

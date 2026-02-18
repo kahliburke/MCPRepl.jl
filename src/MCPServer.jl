@@ -218,6 +218,35 @@ include("prompts.jl")
 using .Prompts
 
 # ============================================================================
+# Resource Change Notification Queue
+# ============================================================================
+
+"""Pending JSON-RPC notifications to flush on the next SSE response."""
+const _PENDING_NOTIFICATIONS = Channel{Dict{String,Any}}(32)
+
+"""
+    register_sessions_changed_callback!(mgr::ConnectionManager)
+
+Wire up `mgr.on_sessions_changed` so it enqueues a
+`notifications/resources/list_changed` notification for the next SSE flush.
+"""
+function register_sessions_changed_callback!(mgr)
+    mgr.on_sessions_changed =
+        () -> begin
+            try
+                push!(
+                    _PENDING_NOTIFICATIONS,
+                    Dict{String,Any}(
+                        "jsonrpc" => "2.0",
+                        "method" => "notifications/resources/list_changed",
+                    ),
+                )
+            catch
+            end
+        end
+end
+
+# ============================================================================
 # REPL Resource Helpers (for MCP resources/list and resources/read)
 # ============================================================================
 
@@ -227,13 +256,14 @@ function _list_repl_resources()
     resources = Dict{String,Any}[]
     for conn in connected_sessions(mgr)
         key = short_key(conn)
+        dname = isempty(conn.display_name) ? conn.name : conn.display_name
         proj = isempty(conn.project_path) ? "unknown" : basename(conn.project_path)
         push!(
             resources,
             Dict{String,Any}(
                 "uri" => "repl://$(key)",
                 "name" => key,
-                "title" => "$(conn.name) — $proj",
+                "title" => "$(dname) — $proj",
                 "description" => "Julia $(conn.julia_version) (PID $(conn.pid)) | Project: $(conn.project_path) | Session: $(key)",
                 "mimeType" => "application/json",
             ),
@@ -248,10 +278,11 @@ function _read_repl_resource(uri::String)
     mgr === nothing && return JSON.json(Dict("error" => "No connection manager"))
     conn = get_connection_by_key(mgr, key)
     conn === nothing && return JSON.json(Dict("error" => "Session not found: $key"))
+    dname = isempty(conn.display_name) ? conn.name : conn.display_name
     return JSON.json(
         Dict(
             "key" => short_key(conn),
-            "name" => conn.name,
+            "name" => dname,
             "session_id" => conn.session_id,
             "status" => string(conn.status),
             "project_path" => conn.project_path,
@@ -1262,6 +1293,23 @@ function _handle_bridge_tool_sse(
     HTTP.startwrite(http)
 
     progress_token = "tool-$(tool_name_str)-$(round(Int, time()))"
+
+    # ── Flush pending notifications (e.g., resource list changes) ─────────
+    # Write an SSE event helper (defined below) is not available yet, so
+    # inline the flush here before the main send_sse_event closure.
+    while isready(_PENDING_NOTIFICATIONS)
+        notif = try
+            take!(_PENDING_NOTIFICATIONS)
+        catch
+            break
+        end
+        try
+            notif_json = JSON.json(notif)
+            write(http, "data: $(notif_json)\n\n")
+            flush(http)
+        catch
+        end
+    end
     step_counter = Ref(0)
     last_event_time = Ref(time())
 

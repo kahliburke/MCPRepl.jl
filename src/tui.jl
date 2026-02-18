@@ -810,6 +810,7 @@ function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
     # Start connection manager (discovers REPL bridges)
     m.conn_mgr = ConnectionManager()
     start!(m.conn_mgr)
+    register_sessions_changed_callback!(m.conn_mgr)
     m.bridge_mirror_repl = get_bridge_mirror_repl_preference()
 
     # Enable bridge mode — tool evals route to connected REPLs
@@ -2036,7 +2037,8 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
         style =
             conn.status == :connected ? tstyle(:success) :
             conn.status == :connecting ? tstyle(:warning) : tstyle(:error)
-        label = "$icon $(conn.name)"
+        dname = isempty(conn.display_name) ? conn.name : conn.display_name
+        label = "$icon $dname"
         padded = rpad(label, 20)
         status_text = string(conn.status)
         push!(items, ListItem("$padded $status_text", style))
@@ -2118,8 +2120,9 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
         y = detail_area.y
         x = detail_area.x + 1
 
+        dname = isempty(conn.display_name) ? conn.name : conn.display_name
         fields = [
-            ("Name", conn.name),
+            ("Name", dname),
             ("Status", string(conn.status)),
             ("Path", _short_path(conn.project_path)),
             ("Julia", conn.julia_version),
@@ -2338,7 +2341,7 @@ function _session_display_name(session_key::String)::String
     mgr === nothing && return session_key
     conn = get_connection_by_key(mgr, session_key)
     conn === nothing && return session_key
-    return conn.name
+    return isempty(conn.display_name) ? conn.name : conn.display_name
 end
 
 """Refresh analytics data from the database (cached for 30s unless forced)."""

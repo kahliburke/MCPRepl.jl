@@ -14,6 +14,7 @@
 mutable struct REPLConnection
     session_id::String
     name::String
+    display_name::String         # derived from project_path, with dedup suffix
     socket_path::String          # filesystem path to .sock
     endpoint::String             # ipc:// endpoint
     stream_endpoint::String      # ipc:// endpoint for PUB/SUB streaming
@@ -39,6 +40,7 @@ end
 function REPLConnection(;
     session_id::String,
     name::String = "julia",
+    display_name::String = "",
     socket_path::String = "",
     endpoint::String = "",
     stream_endpoint::String = "",
@@ -50,6 +52,7 @@ function REPLConnection(;
     REPLConnection(
         session_id,
         name,
+        display_name,
         socket_path,
         endpoint,
         stream_endpoint,
@@ -73,6 +76,38 @@ function REPLConnection(;
     )
 end
 
+# ── Display Name Derivation ───────────────────────────────────────────────────
+
+"""
+    _derive_display_name(project_path, julia_version, existing_names) -> String
+
+Derive a short display name from the project path, deduplicating against
+already-assigned names.  Rules:
+  - Non-empty project_path → `basename(project_path)` (e.g. "MyApp")
+  - Global env or empty path → `@v<julia_version>` (e.g. "@v1.12")
+  - Collisions get a `-2`, `-3`, … suffix
+"""
+function _derive_display_name(
+    project_path::String,
+    julia_version::String,
+    existing_names::Vector{String},
+)::String
+    base = if isempty(project_path) || project_path == homedir()
+        # Global environment — use Julia version
+        "@v$(julia_version)"
+    else
+        basename(project_path)
+    end
+    # Deduplicate: if "Foo" exists, try "Foo-2", "Foo-3", ...
+    name = base
+    n = 2
+    while name in existing_names
+        name = "$base-$n"
+        n += 1
+    end
+    return name
+end
+
 # ── Connection Manager ────────────────────────────────────────────────────────
 
 mutable struct ConnectionManager
@@ -83,6 +118,7 @@ mutable struct ConnectionManager
     watcher_task::Union{Task,Nothing}
     health_task::Union{Task,Nothing}
     lock::ReentrantLock
+    on_sessions_changed::Union{Function,Nothing}  # called when session list changes
 end
 
 function ConnectionManager(; sock_dir::String = joinpath(mcprepl_cache_dir(), "sock"))
@@ -94,7 +130,17 @@ function ConnectionManager(; sock_dir::String = joinpath(mcprepl_cache_dir(), "s
         nothing,
         nothing,
         ReentrantLock(),
+        nothing,
     )
+end
+
+"""Fire the sessions-changed callback (if registered). Swallows errors."""
+function _fire_sessions_changed(mgr::ConnectionManager)
+    cb = mgr.on_sessions_changed
+    cb !== nothing && try
+        cb()
+    catch
+    end
 end
 
 # ── PID & Stale Session Helpers ──────────────────────────────────────────────
@@ -240,6 +286,19 @@ function discover_sessions(mgr::ConnectionManager)
             julia_version = get(meta, "julia_version", ""),
             pid = pid,
         )
+
+        # Derive display name from project_path, deduplicating against existing
+        existing = lock(mgr.lock) do
+            [c.display_name for c in mgr.connections]
+        end
+        # Also account for other new connections discovered in this batch
+        append!(
+            existing,
+            [c.display_name for c in new_connections if !isempty(c.display_name)],
+        )
+        conn.display_name =
+            _derive_display_name(conn.project_path, conn.julia_version, existing)
+
         push!(new_connections, conn)
     end
 
@@ -748,7 +807,8 @@ function drain_stream_messages!(mgr::ConnectionManager)
                 end
 
                 if !routed
-                    push!(messages, (channel = ch, data = data, session_name = conn.name))
+                    dname = isempty(conn.display_name) ? conn.name : conn.display_name
+                    push!(messages, (channel = ch, data = data, session_name = dname))
                 end
 
                 # Forward stdout/stderr to all active inboxes during streaming
@@ -789,15 +849,18 @@ function start!(mgr::ConnectionManager)
         while mgr.running
             try
                 new_conns = discover_sessions(mgr)
+                added = false
                 for conn in new_conns
                     if connect!(mgr, conn)
                         lock(mgr.lock) do
                             push!(mgr.connections, conn)
                         end
-                        @debug "Connected to bridge" name = conn.name session_id =
-                            conn.session_id
+                        added = true
+                        @debug "Connected to bridge" name = conn.name display_name =
+                            conn.display_name session_id = conn.session_id
                     end
                 end
+                added && _fire_sessions_changed(mgr)
             catch e
                 @debug "Watcher error" exception = e
             end
@@ -820,7 +883,22 @@ function start!(mgr::ConnectionManager)
                 for conn in conns
                     if conn.status == :connected
                         result = ping(conn; skip_if_busy = true)
-                        if result === nothing
+                        if result !== nothing
+                            # Update project_path from live pong data
+                            new_path = get(result, :project_path, "")
+                            if !isempty(new_path) && new_path != conn.project_path
+                                conn.project_path = new_path
+                                existing = lock(mgr.lock) do
+                                    [c.display_name for c in mgr.connections if c !== conn]
+                                end
+                                conn.display_name = _derive_display_name(
+                                    new_path,
+                                    conn.julia_version,
+                                    existing,
+                                )
+                                _fire_sessions_changed(mgr)
+                            end
+                        else
                             @debug "Bridge unresponsive, disconnecting" name = conn.name
                             disconnect!(conn)
                             if !isfile(conn.socket_path)
@@ -848,6 +926,7 @@ function start!(mgr::ConnectionManager)
                             end
                         end
                     end
+                    _fire_sessions_changed(mgr)
                 end
             catch e
                 @debug "Health check error" exception = e
