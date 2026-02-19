@@ -78,10 +78,10 @@ Lists exported names (public API). Use `all=true` for internal symbols.
 list_names("Base")
 ```
 
-### LSP Navigation (requires VS Code)
-- `lsp_goto_definition(file, line, col)` — Jump to where a symbol is defined
-- `lsp_find_references(file, line, col)` — Find all usages of a symbol
-- `lsp_workspace_symbols(query="...")` — Search for symbols across workspace
+### Code Navigation (via Julia reflection)
+- `goto_definition(file, line, col)` — Jump to where a symbol is defined
+- `document_symbols(file)` — List all symbols defined in a file
+- `workspace_symbols(query="...")` — Search for symbols across loaded modules
 
 ## Quick Execution Guide
 
@@ -144,7 +144,7 @@ qdrant_search_code(query="code that reads configuration from files or environmen
 ## Tips
 
 1. **Start broad, then narrow** — Refine based on initial results
-2. **Combine with LSP** — Use semantic search to find files, then LSP for precise navigation
+2. **Combine with navigation tools** — Use semantic search to find files, then `goto_definition`/`document_symbols` for precise navigation
 3. **Check index** — `qdrant_collection_info(collection="Name")` to verify code is indexed
 4. **Rephrase** — Try different descriptions if first attempt doesn't find what you need
 5. **Sync after changes** — `qdrant_sync_index()` to update index after code changes
@@ -189,7 +189,7 @@ type_info("MyCustomType")
 
 - `search_methods("func")` — Find all methods for a type
 - `list_names("Module")` — Discover available types in a module
-- `lsp_goto_definition()` — Jump to type source code
+- `goto_definition()` — Jump to type source code
 """
     else
         return nothing

@@ -8,7 +8,7 @@ MCPRepl provides Julia-native code discovery tools. Prefer these over grep/shell
 - **`type_info("Type")`** — Complete type info: fields, hierarchy, subtypes
 - **`search_methods("function")`** — All method signatures and overloads
 - **`list_names("Module")`** — Exported (or all) names in a module
-- **`lsp_goto_definition / lsp_find_references / lsp_workspace_symbols`** — LSP navigation (requires VS Code)
+- **`goto_definition / document_symbols / workspace_symbols`** — Code navigation via Julia reflection
 
 ---
 
@@ -71,7 +71,7 @@ ex(e="function f() ... end", q=false)    # Definitions
 **Execution:** `ex(e="code")` — primary tool for everything
 **Introspection:** `list_names("Module")`, `type_info("Type")`, `search_methods("func")`
 **Semantic search:** `qdrant_search_code(query="...")`, `qdrant_list_collections()`
-**LSP navigation:** `lsp_goto_definition()`, `lsp_find_references()`, `lsp_document_symbols()`, `lsp_workspace_symbols()`
+**Code navigation:** `goto_definition()`, `document_symbols()`, `workspace_symbols()`
 **Testing:** `run_tests(pattern="...")` — spawns subprocess, streams results
 **Utilities:** `format_code(path)`, `ping()`, `investigate_environment()`, `manage_repl(command="restart")`
 **Help:** `tool_help("tool_name")` or `tool_help("tool_name", extended=true)`

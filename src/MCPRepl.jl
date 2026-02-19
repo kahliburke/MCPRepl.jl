@@ -223,8 +223,7 @@ include("tool_definitions.jl")
 include("MCPServer.jl")
 include("config_utils.jl")
 include("vscode.jl")
-include("lsp.jl")
-include("lsp_tool_definitions.jl")
+include("reflection_tools.jl")
 include("qdrant_tools.jl")
 include("qdrant_indexer.jl")
 
@@ -1297,11 +1296,11 @@ end
 """
     collect_tools() -> Vector{MCPTool}
 
-Assemble all MCP tools (core, LSP, Qdrant) into a single vector.
+Assemble all MCP tools (core, reflection, Qdrant) into a single vector.
 Used by both `start!()` and the TUI to build the tool list for the MCP server.
 """
 function collect_tools()::Vector{MCPTool}
-    lsp_tools = create_lsp_tools()
+    reflection_tools = create_reflection_tools()
     qdrant_tools = create_qdrant_tools()
 
     return MCPTool[
@@ -1337,7 +1336,7 @@ function collect_tools()::Vector{MCPTool}
         pkg_rm_tool,
         run_tests_tool,
         stress_test_tool,
-        lsp_tools...,
+        reflection_tools...,
         qdrant_tools...,
     ]
 end
