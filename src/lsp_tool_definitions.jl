@@ -1,6 +1,6 @@
 goto_definition_tool = @mcp_tool(
     :lsp_goto_definition,
-    "Find where a symbol is defined using Julia LSP. Provide the position where a symbol is USED/REFERENCED, and this returns the file path and position where that symbol is DEFINED. Returns text information only by default. Set navigate=true to automatically open the definition location in VS Code. Useful for understanding code structure: 'where does this function/type come from?'",
+    "Find where a symbol is defined using Julia LSP. Returns file path and position of the definition. Set navigate=true to open in VS Code. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -137,7 +137,7 @@ goto_definition_tool = @mcp_tool(
 
 find_references_tool = @mcp_tool(
     :lsp_find_references,
-    "Find all references to a symbol using Julia LSP. Lists all locations in the workspace where a given symbol is referenced.",
+    "Find all references to a symbol using Julia LSP. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -197,7 +197,7 @@ find_references_tool = @mcp_tool(
 
 document_symbols_tool = @mcp_tool(
     :lsp_document_symbols,
-    "List all symbols in a file using Julia LSP. Returns a list of symbols defined within a specific document, such as functions, classes, and variables.",
+    "List all symbols in a file using Julia LSP. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -241,7 +241,7 @@ document_symbols_tool = @mcp_tool(
 
 workspace_symbols_tool = @mcp_tool(
     :lsp_workspace_symbols,
-    "Search for symbols across the workspace using Julia LSP. Allows searching for symbols by name across the entire workspace.",
+    "Search for symbols across the workspace using Julia LSP. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -282,7 +282,7 @@ workspace_symbols_tool = @mcp_tool(
 # Rename symbol tool
 rename_tool = @mcp_tool(
     :lsp_rename,
-    "Rename a symbol across the workspace using Julia LSP. Renames a symbol (e.g., variable, function) and updates all references to it throughout the workspace.",
+    "Rename a symbol and update all references across the workspace using Julia LSP. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -348,7 +348,7 @@ rename_tool = @mcp_tool(
 # Code actions tool
 code_actions_tool = @mcp_tool(
     :lsp_code_actions,
-    "Get available code actions and quick fixes using Julia LSP. Retrieves a list of available code actions, such as quick fixes and refactorings, at a given position in a file.",
+    "Get available code actions and quick fixes at a position using Julia LSP. Requires VS Code with Julia extension.",
     Dict(
         "type" => "object",
         "properties" => Dict(

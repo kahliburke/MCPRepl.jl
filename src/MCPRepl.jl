@@ -479,21 +479,44 @@ function remove_println_calls(
             func = expr.args[1]
             # List of functions to remove (always, regardless of level)
             print_funcs = [:println, :print, :printstyled]
-            # Match direct calls (println, print, printstyled)
-            if func in print_funcs
-                was_stripped[] = true
-                return nothing
-            end
-            # Match qualified calls (Base.println, Main.print, etc.)
-            if (
+            # Check if this is a print call targeting stdout (no IO arg)
+            # vs an IO-targeted call like println(io, ...) which should be kept
+            func_name = if func in print_funcs
+                func
+            elseif (
                 func isa Expr &&
                 func.head == :. &&
                 length(func.args) >= 2 &&
                 func.args[end] isa QuoteNode &&
                 func.args[end].value in print_funcs
             )
-                was_stripped[] = true
-                return nothing
+                func.args[end].value
+            else
+                nothing
+            end
+            if func_name !== nothing
+                # Only strip stdout-targeted calls:
+                # - println("msg"), print("a", "b"), printstyled("x", color=:red)
+                # - Explicit stdout: println(stdout, "msg")
+                # Keep IO-targeted calls: println(io, "msg"), print(buf, "data")
+                #
+                # Heuristic: IO-targeted iff first positional arg is a variable
+                # (Symbol) that isn't stdout/stderr. This correctly handles keyword
+                # args in printstyled and multi-arg print to stdout.
+                pos_args = [
+                    a for a in expr.args[2:end] if
+                    !(a isa Expr && a.head in (:kw, :parameters))
+                ]
+                first_pos = length(pos_args) >= 1 ? pos_args[1] : nothing
+                is_io_targeted =
+                    length(pos_args) >= 2 &&
+                    first_pos isa Symbol &&
+                    first_pos ∉ (:stdout, :stderr)
+                if !is_io_targeted
+                    was_stripped[] = true
+                    return nothing
+                end
+                # IO-targeted print call — keep it
             end
         elseif expr.head == :macrocall
             macro_name = expr.args[1]

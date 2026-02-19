@@ -199,49 +199,11 @@ usage_instructions_tool =
 
 usage_quiz_tool = @mcp_tool(
     :usage_quiz,
-    """Test your understanding of MCPRepl usage patterns with a self-graded quiz.
+    """Self-graded quiz on MCPRepl usage patterns.
 
-This tool helps AI agents verify they understand the correct usage patterns for the `ex` tool
-and the shared REPL model before working with users.
-
-# Modes
-
-**Default (no arguments):** Returns quiz questions
-- 6 questions testing understanding of:
-  - Shared REPL model
-  - When to use q=false vs q=true (default)
-  - Communication channels (TEXT vs code vs println)
-  - Token efficiency
-  - Real-world scenarios
-- Agent should answer questions and output responses to user
-
-**With show_sols=true:** Returns solutions and grading instructions
-- Canonical answers for all questions
-- Point values and grading rubrics
-- Instructions to self-grade and report score to user
-- If score < 75, agent must review usage_instructions and retake
-
-# Usage
-
-```julia
-# Take the quiz
-usage_quiz()
-# [Agent answers questions in their response to user]
-
-# Check answers and grade yourself
-usage_quiz(show_sols=true)
-# [Agent compares answers, calculates score, reports to user]
-```
-
-# Purpose
-
-Ensures agents understand:
-- NOT to use println for communication (user sees REPL output directly)
-- Default to q=true (quiet mode) - only use q=false when you need return values for decisions
-- Token efficiency (70-90% savings with correct usage)
-- Communication happens in TEXT responses, not code
-
-**Recommended:** New agents should take this quiz before starting work to verify understanding.""",
+Default: returns quiz questions. With show_sols=true: returns solutions and grading rubric.
+Tests understanding of shared REPL model, q=true/false usage, multi-session routing, and tool selection.
+If score < 75, review usage_instructions and retake.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -278,17 +240,11 @@ Ensures agents understand:
 
 repl_tool = @mcp_tool(
     :ex,
-    """Execute Julia code in a persistent REPL. User typically sees code execute in real-time.
+    """Execute Julia code in a persistent REPL. User sees code in real-time.
 
-Primary tool: use `ex` for almost everything (run code, tests, docs, quick checks).
-Default (q=true): Returns only errors, suppresses return values (saves 70-90% tokens).
-Verbose (q=false): Returns full output including return value - use ONLY when you need the result to make a decision.
-
-🚨 CRITICAL: println is ALWAYS stripped - never use it. To see values, use q=false with the value as final expression: ex(e="result", q=false)
-
-Silent mode (s=true) is rare: it suppresses the 'agent>' prompt and real-time REPL echo to avoid spamming the user with intentionally huge output.
-
-Never use `julia` in bash. Call usage_instructions first for workflow guidance.""",
+Default q=true: suppresses return values (token-efficient). Use q=false only when you need the result.
+println/print to stdout are stripped from agent code. Use q=false with a final expression to see values.
+s=true (rare): suppresses agent> prompt and REPL echo for large outputs.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -371,19 +327,9 @@ manage_repl_tool = @mcp_tool(
     :manage_repl,
     """Manage the Julia REPL (restart or shutdown).
 
-**Commands:**
-- `restart`: Restart the Julia REPL process. The process is replaced via exec —
-  same terminal, fresh Julia state, all code freshly compiled. Use this when
-  Revise.jl fails to pick up code changes.
-- `shutdown`: Shutdown the Julia REPL and disable auto-restart
-
-**Restart Behavior:**
-The bridge process replaces itself with a fresh Julia via exec. Same PID, same
-terminal. The session key is preserved. Typical restart: 10-30s depending on
-package precompilation. Revise is loaded automatically in the restarted session.
-
-**Shutdown Behavior:**
-Marks the session as stopped. The session will NOT automatically restart.""",
+Commands:
+- restart: Fresh Julia state. Use when Revise fails to pick up changes. Session key is preserved.
+- shutdown: Stop the session permanently.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -457,46 +403,10 @@ Marks the session as stopped. The session will NOT automatically restart.""",
 
 vscode_command_tool = @mcp_tool(
     :execute_vscode_command,
-    """Execute any VS Code command via the Remote Control extension.
+    """Execute a VS Code command via the Remote Control extension.
 
-This tool can trigger any VS Code command that has been allowlisted in the extension configuration.
-Useful for automating editor operations like saving files, running tasks, managing windows, etc.
-
-**Prerequisites:**
-- VS Code Remote Control extension must be installed (via MCPRepl.setup())
-- The command must be in the allowed commands list (see usage_instructions tool for complete list)
-
-**Bidirectional Communication:**
-- Set `wait_for_response=true` to wait for and return the command's result
-- Useful for commands that return values (e.g., getting debug variable values)
-- Default timeout is 5 seconds (configurable via `timeout` parameter)
-
-**Common Command Categories:**
-- REPL & Window Control: restartREPL, startREPL, reloadWindow
-- File Operations: saveAll, closeAllEditors, openFile
-- Navigation: terminal.focus, focusActiveEditorGroup, focusFilesExplorer, quickOpen
-- Terminal Operations: sendSequence (execute shell commands without approval dialogs)
-- Testing & Debugging: tasks.runTask, debug.start, debug.stop
-- Git: git.commit, git.refresh, git.sync
-- Search: findInFiles, replaceInFiles
-- Window Management: splitEditor, togglePanel, toggleSidebarVisibility
-- Extensions: installExtension
-
-**Examples:**
-```
-execute_vscode_command("workbench.action.files.saveAll")
-execute_vscode_command("workbench.action.terminal.focus")
-execute_vscode_command("workbench.action.tasks.runTask", ["test"])
-
-# Execute shell commands (RECOMMENDED for julia --project commands):
-execute_vscode_command("workbench.action.terminal.sendSequence",
-  ["{\"text\": \"julia --project -e 'using Pkg; Pkg.test()'\\r\"}"])
-
-# Get a value back from VS Code:
-execute_vscode_command("someCommand", wait_for_response=true, timeout=10.0)
-```
-
-For the complete list of available commands and their descriptions, call the usage_instructions tool.""",
+Set wait_for_response=true to get return values (default timeout: 5s).
+Use list_vscode_commands to see available commands.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1354,19 +1264,7 @@ or when LSP goto_definition doesn't work.
 # High-level debugging workflow tools
 open_and_breakpoint_tool = @mcp_tool(
     :open_file_and_set_breakpoint,
-    """Open a file in VS Code and set a breakpoint at a specific line.
-
-This is a convenience tool that combines file opening and breakpoint setting
-into a single operation, making it easier to set up debugging.
-
-# Arguments
-- `file_path`: Absolute path to the file to open
-- `line`: Line number to set the breakpoint (optional, defaults to current cursor position)
-
-# Examples
-- Open file and set breakpoint at line 42: `{"file_path": "/path/to/file.jl", "line": 42}`
-- Open file (breakpoint at cursor): `{"file_path": "/path/to/file.jl"}`
-""",
+    "Open a file in VS Code and set a breakpoint at a specific line. Requires VS Code.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1432,14 +1330,7 @@ into a single operation, making it easier to set up debugging.
 
 start_debug_session_tool = @mcp_tool(
     :start_debug_session,
-    """Start a debugging session in VS Code.
-
-Opens the debug view and starts debugging with the current configuration.
-Useful after setting breakpoints to begin stepping through code.
-
-# Examples
-- Start debugging: `{}`
-""",
+    "Start a debugging session in VS Code. Opens debug view and begins debugging. Requires VS Code.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     function (args)
         try
@@ -1462,19 +1353,7 @@ Useful after setting breakpoints to begin stepping through code.
 
 add_watch_expression_tool = @mcp_tool(
     :add_watch_expression,
-    """Add a watch expression to monitor during debugging.
-
-Watch expressions let you monitor the value of variables or expressions
-as you step through code during debugging.
-
-# Arguments
-- `expression`: The Julia expression to watch (e.g., "x", "length(arr)", "myvar > 10")
-
-# Examples
-- Watch a variable: `{"expression": "x"}`
-- Watch an expression: `{"expression": "length(my_array)"}`
-- Watch a condition: `{"expression": "counter > 100"}`
-""",
+    "Add a watch expression to monitor during debugging. Requires VS Code with active debug session.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1510,33 +1389,7 @@ as you step through code during debugging.
 
 copy_debug_value_tool = @mcp_tool(
     :copy_debug_value,
-    """Copy the value of a variable or expression during debugging to the clipboard.
-
-This tool allows AI agents to inspect variable values during a debug session.
-The value is copied to the clipboard and can then be read using shell commands.
-
-**Prerequisites:**
-- Must be in an active debug session (paused at a breakpoint)
-- The variable/expression must be selected or focused in the debug view
-
-**Workflow:**
-1. Focus the appropriate debug view (Variables or Watch)
-2. The user or AI should have the variable selected/focused
-3. Copy the value to clipboard
-4. Read clipboard contents to get the value
-
-# Arguments
-- `view`: Which debug view to focus - "variables" or "watch" (default: "variables")
-
-# Examples
-- Copy from variables view: `{"view": "variables"}`
-- Copy from watch view: `{"view": "watch"}`
-
-**Note:** After copying, use a shell command to read the clipboard:
-- macOS: `pbpaste`
-- Linux: `xclip -selection clipboard -o` or `xsel --clipboard --output`
-- Windows: `powershell Get-Clipboard`
-""",
+    "Copy a debug variable value to clipboard. Read with pbpaste (macOS) or xclip (Linux). Requires VS Code with active debug session.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1589,15 +1442,7 @@ Note: Make sure a variable is selected/focused in the debug view before copying.
 # Enhanced debugging tools using bidirectional communication
 debug_step_over_tool = @mcp_tool(
     :debug_step_over,
-    """Step over the current line in the debugger.
-
-Executes the current line and moves to the next line without entering function calls.
-Must be in an active debug session (paused at a breakpoint).
-
-# Examples
-- `debug_step_over()`
-- `debug_step_over(wait_for_response=true)` - Wait for confirmation
-""",
+    "Step over the current line in the debugger. Requires VS Code with active debug session.",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1618,14 +1463,7 @@ Must be in an active debug session (paused at a breakpoint).
 
 debug_step_into_tool = @mcp_tool(
     :debug_step_into,
-    """Step into a function call in the debugger.
-
-Enters the function on the current line to debug its internals.
-Must be in an active debug session (paused at a breakpoint).
-
-# Examples
-- `debug_step_into()`
-""",
+    "Step into a function call in the debugger. Requires VS Code with active debug session.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     args -> vscode_debug_command(
         "workbench.action.debug.stepInto",
@@ -1635,14 +1473,7 @@ Must be in an active debug session (paused at a breakpoint).
 
 debug_step_out_tool = @mcp_tool(
     :debug_step_out,
-    """Step out of the current function in the debugger.
-
-Continues execution until the current function returns to its caller.
-Must be in an active debug session (paused at a breakpoint).
-
-# Examples
-- `debug_step_out()`
-""",
+    "Step out of the current function in the debugger. Requires VS Code with active debug session.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     args -> vscode_debug_command(
         "workbench.action.debug.stepOut",
@@ -1652,14 +1483,7 @@ Must be in an active debug session (paused at a breakpoint).
 
 debug_continue_tool = @mcp_tool(
     :debug_continue,
-    """Continue execution in the debugger.
-
-Resumes execution until the next breakpoint or program completion.
-Must be in an active debug session (paused at a breakpoint).
-
-# Examples
-- `debug_continue()`
-""",
+    "Continue execution until next breakpoint or completion. Requires VS Code with active debug session.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     args ->
         vscode_debug_command("workbench.action.debug.continue", "Continued execution")
@@ -1667,13 +1491,7 @@ Must be in an active debug session (paused at a breakpoint).
 
 debug_stop_tool = @mcp_tool(
     :debug_stop,
-    """Stop the current debug session.
-
-Terminates the active debug session and returns to normal execution.
-
-# Examples
-- `debug_stop()`
-""",
+    "Stop the current debug session. Requires VS Code.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     args ->
         vscode_debug_command("workbench.action.debug.stop", "Debug session stopped")
@@ -1751,38 +1569,8 @@ run_tests_tool = @mcp_tool(
     :run_tests,
     """Run tests and optionally generate coverage reports.
 
-This tool provides comprehensive test execution with optional coverage analysis.
-
-# Parameters
-
-- `pattern`: Optional test pattern to filter which tests to run (ReTest pattern syntax)
-- `coverage`: Boolean flag to enable coverage collection (default: false)
-- `verbose`: Verbosity level for test output (default: 1.0)
-
-# Examples
-
-Run all tests:
-```julia
-{"pattern": ""}
-```
-
-Run specific tests matching a pattern:
-```julia
-{"pattern": "security", "verbose": true}
-```
-
-Run tests with coverage:
-```julia
-{"coverage": true}
-```
-
-# Returns
-
-Test results summary including:
-- Number of tests passed/failed
-- Coverage percentage (if coverage=true)
-- Detailed failure information (if any)
-""",
+Spawns a subprocess with correct test environment. Streams results in real-time.
+Pattern uses ReTest regex syntax to filter tests.""",
     Dict(
         "type" => "object",
         "properties" => Dict(
@@ -1877,37 +1665,13 @@ stress_test_tool = @mcp_tool(
     :stress_test,
     """Run a stress test by spawning concurrent simulated MCP agents.
 
-This tool launches N concurrent agents that each connect to the MCP server,
-initialize a session, and execute the given Julia code via the `ex` tool.
-Useful for testing how functions scale under concurrent load.
-
-# Parameters
-
-- `code`: Julia code each agent executes (default: "sleep(1); 42")
-- `num_agents`: Number of concurrent agents to spawn, 1-100 (default: 5)
-- `stagger`: Delay in seconds between agent launches (default: 0.0)
-- `timeout`: Per-agent timeout in seconds (default: 30)
-- `session`: Target session key (auto-detects if one session connected)
-
-# Returns
-
-Structured text summary with per-agent results, success/failure counts,
-timing statistics, and path to saved results file.
+Launches N agents that each execute the given Julia code via `ex`. Returns per-agent results, timing stats, and success/failure counts.
 
 # Examples
 
-Run all tests:
 ```julia
 {"num_agents": 3, "code": "sleep(1); 42"}
-```
-
-Run specific tests matching a pattern:
-```julia
 {"num_agents": 10, "code": "sum(1:1000)", "stagger": 0.1}
-```
-
-Run tests with coverage:
-```julia
 {"num_agents": 5, "code": "sleep(rand())", "timeout": 60}
 ```
 """,

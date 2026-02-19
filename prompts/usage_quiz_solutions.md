@@ -3,67 +3,50 @@
 ## Self-Grading Instructions
 
 1. Compare your answers with solutions below
-2. Award points based on key concepts captured
-3. Partial credit allowed for main ideas
-4. Calculate total score out of 100
-5. If below 75, review `usage_instructions` and retake
+2. Award points based on key concepts captured (partial credit allowed)
+3. Calculate total score out of 100
+4. If below 75, review `usage_instructions` and retake
 
 ---
 
-## Question 1: Shared REPL Model (10 points)
+## Question 1: Shared REPL Model (15 points)
 
 **Answer:** User and agent work in the same REPL in real-time. Everything you execute appears in their REPL immediately with the same output.
 
-**Key implication:** DO NOT use `println` to communicate. They already see your code execute. Use TEXT responses (outside tool calls) to explain.
+**Key implication:** DO NOT use `println` to communicate — it's stripped. User already sees your code execute. Use TEXT responses (outside tool calls) to explain what you're doing.
 
 **Grading:**
-- 10: Explained shared REPL + no println for communication
-- 7: Shared REPL mentioned, missed println issue
-- 4: Vague understanding, missed communication implication
+- 15: Explained shared REPL + println stripped + use TEXT responses
+- 10: Shared REPL mentioned, missed println stripping
+- 5: Vague understanding
 - 0: Didn't understand shared model
 
 ---
 
-## Question 2: Communication Channels (15 points)
-
-**Answer:**
-1. **Explain testing:** TEXT response - "Let me test the function:"
-2. **Execute test:** `q=true` (default) - `ex(e="result = test_function(data)")`
-3. **Show result:** They already see it! Only use `q=false` if YOU need the value for decision-making
-
-**Grading:**
-- 15: All correct, ruled out println
-- 12: Main channels right, minor q=false confusion
-- 8: TEXT vs code understood, q parameter confused
-- 4: Major confusion
-- 0: Completely wrong (e.g., use println)
-
----
-
-## Question 3: When to Use `q=false` (20 points)
+## Question 2: When to Use `q=false` (25 points)
 
 **Answers:**
-- a) `q=true` - no return value needed
-- b) `q=true` - don't need to see the value
-- c) `q=false` - NEED value to decide (is it 2 or 3?)
-- d) `q=true` - don't need to see function object
-- e) `q=false` - need to analyze method signatures
+- a) `q=true` — no return value needed (import)
+- b) `q=true` — don't need to see the array (assignment)
+- c) `q=false` — NEED value to decide (is it the right length?)
+- d) `q=true` — don't need to see function object (definition)
+- e) `q=false` — need to analyze method signatures
 
 **Key:** Only `q=false` when you need the return value for decision-making.
 
-**Grading:** 4 points each (correct answer + reasoning)
+**Grading:** 5 points each (correct answer + reasoning)
 
 ---
 
-## Question 4: Critique This Code (25 points)
+## Question 3: Critique This Code (25 points)
 
 **Problems:**
 
-1. **Excessive printlns (10 pts)** - User already sees code execute. Use TEXT responses instead.
+1. **println is stripped (10 pts)** — All println calls to stdout are removed. Use TEXT responses instead.
 
-2. **Unnecessary q=false (10 pts)** - Wastes ~400 tokens. Use `q=true` default for assignments/imports.
+2. **Unnecessary q=false (10 pts)** — Wastes tokens. Use `q=true` (default) for assignments/imports.
 
-3. **No batching (5 pts)** - Four separate calls could be combined.
+3. **No batching (5 pts)** — Four separate calls could be combined into one or two.
 
 **Corrected:**
 ```julia
@@ -73,7 +56,7 @@ ex(e="m", q=false)  # Only if you need to inspect the value
 ```
 
 **Grading:**
-- 25: All three problems identified
+- 25: All three problems identified with corrections
 - 20: println + q=false issues found
 - 15: Only println issue found
 - 10: Vague awareness something's wrong
@@ -81,44 +64,35 @@ ex(e="m", q=false)  # Only if you need to inspect the value
 
 ---
 
-## Question 5: Token Efficiency (15 points)
+## Question 4: Multi-Session Concept (20 points)
 
-**Answer:** `q=true` suppresses unnecessary return values, saving **70-90% of tokens**. Matters because:
-- Every token counts toward context budget
-- More waste = shorter conversations
-- Can execute 5-10x more operations in same budget
+**Answers:**
 
-**Grading:**
-- 15: Explained percentage + context impact
-- 12: Mentioned savings, weak impact explanation
-- 8: Vague understanding
-- 4: Knew it's "good" but not why
-- 0: No understanding
+a) A session is a separate Julia REPL process connected via ZMQ bridge. Each has its own state, packages, and project. (5 pts)
+
+b) Use `ping()` to list connected sessions, or check `resources/list` which shows available sessions with their keys. (5 pts)
+
+c) Pass `ses="<8-char-key>"` to route a tool call to a specific session. Required when multiple sessions are connected. (5 pts)
+
+d) Error — the tool returns an error asking you to specify which session to use. (5 pts)
+
+**Grading:** 5 points per sub-question
 
 ---
 
-## Question 6: Real-World Scenario (15 points)
+## Question 5: Tool Selection (15 points)
 
-**Answer:**
-```julia
-ex(e="test_data = [1, 2, 3, 4, 5]")              # q=true - no return needed
-ex(e="result = moving_average(test_data, 3)")   # q=true - no return needed
-ex(e="length(result)", q=false)                  # q=false - NEED value to decide
-# Result already stored in step 2 - nothing more needed
-```
+**Answers:**
 
-**Alternative (more efficient):**
-```julia
-ex(e="test_data = [1,2,3,4,5]; result = moving_average(test_data, 3)")
-ex(e="length(result)", q=false)
-```
+a) `search_methods("push!")` — Purpose-built for method discovery. Better than `ex(e="methods(push!)", q=false)` because it formats output and handles edge cases. (~4 pts)
 
-**Grading:**
-- 15: Correct q usage with reasoning
-- 12: Correct but could be more efficient
-- 8: Key idea (q=false for length) but wrong elsewhere
-- 4: Some understanding, multiple mistakes
-- 0: Used q=false everywhere
+b) `run_tests()` — Spawns a proper test subprocess with streaming output. Better than `ex` with `@test` for full test suites. (~4 pts)
+
+c) `type_info("DataFrame")` — Shows fields, hierarchy, and type parameters. Better than `ex(e="fieldnames(DataFrame)", q=false)` for complete picture. (~4 pts)
+
+d) `qdrant_search_code(query="WebSocket connection handling")` — Semantic search finds relevant code by meaning. (~3 pts)
+
+**Grading:** ~4 points each, partial credit for reasonable alternatives with explanation
 
 ---
 
@@ -126,39 +100,7 @@ ex(e="length(result)", q=false)
 
 **Total:** _____ / 100
 
-### Score Interpretation
-
-**90-100 - EXCELLENT ✅**
-- Strong understanding, ready to work efficiently
-- Apply principles consistently
-
-**75-89 - GOOD ✓**
-- Core concepts understood
-- Review missed areas before starting
-
-**60-74 - REVIEW NEEDED ⚠️**
-- Gaps in understanding
-- Review `usage_instructions`: Shared REPL Model, q parameter, communication channels
-- Retake quiz
-
-**Below 60 - NEEDS STUDY ❌**
-- Review `usage_instructions` carefully
-- Focus on shared REPL model section and examples
-- Must score 75+ before working with users
-
----
-
-## Report to User
-
-After grading, report:
-
-```
-Quiz Results:
-- Score: X/100
-- Grade: [Excellent/Good/Review Needed/Needs Study]
-- Struggled with: [question numbers]
-- Self-assessment: [honest evaluation]
-- Next steps: [start work / review and retake]
-```
-
-Be honest! This helps you work efficiently and save tokens.
+- **90-100 — EXCELLENT:** Ready to work efficiently
+- **75-89 — GOOD:** Review missed areas before starting
+- **60-74 — REVIEW NEEDED:** Review `usage_instructions` and retake
+- **Below 60 — NEEDS STUDY:** Must score 75+ before working with users

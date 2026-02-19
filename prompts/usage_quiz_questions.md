@@ -4,21 +4,13 @@ Test your understanding of the `ex` tool and shared REPL environment. Answer eac
 
 ---
 
-## Question 1: Shared REPL Model (10 points)
+## Question 1: Shared REPL Model (15 points)
 
 What does it mean that the user and agent work in a shared REPL, and what's the most important implication for communication?
 
 ---
 
-## Question 2: Communication Channels (15 points)
-
-You want to: (1) explain you're testing a function, (2) execute the test, (3) show the result.
-
-Where should each happen? (Options: TEXT response, `q=true`, `q=false`, println)
-
----
-
-## Question 3: When to Use `q=false` (20 points)
+## Question 2: When to Use `q=false` (25 points)
 
 Should you use `q=true` or `q=false` for each? Explain why.
 
@@ -30,7 +22,7 @@ e) `ex(e="methods(my_function)")` - to analyze signatures
 
 ---
 
-## Question 4: Critique This Code (25 points)
+## Question 3: Critique This Code (25 points)
 
 Identify ALL problems and explain what should be done instead:
 
@@ -43,17 +35,23 @@ ex(e="println('Result is: ', m)", q=false)
 
 ---
 
-## Question 5: Token Efficiency (15 points)
+## Question 4: Multi-Session Concept (20 points)
 
-Why is `q=true` (default) important? Approximately how much does it save, and why does this matter?
+a) What is a "session" in MCPRepl?
+b) How do you discover available sessions?
+c) When and how do you use the `ses` parameter on `ex` and other tools?
+d) What happens if you call `ex` without `ses` when multiple sessions are connected?
 
 ---
 
-## Question 6: Real-World Scenario (15 points)
+## Question 5: Tool Selection (15 points)
 
-Test a `moving_average` function by: (1) creating test data, (2) calling the function, (3) checking if length is 2 or 3, (4) storing the result.
+For each task, which tool should you use and why?
 
-Write the `ex` calls with correct `q` parameter choices.
+a) You want to see all methods of `push!`
+b) You want to run the project's test suite and see pass/fail summary
+c) You want to check what fields a `DataFrame` has
+d) You want to find code that handles WebSocket connections
 
 ---
 

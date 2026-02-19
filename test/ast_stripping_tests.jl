@@ -114,6 +114,29 @@ using MCPRepl
         @test contains(string(cleaned), "y = 200")
     end
 
+    @testset "IO-Targeted Print Calls Preserved" begin
+        # println(io, ...) should be preserved (not stdout)
+        expr = Meta.parse("io = IOBuffer(); println(io, \"hello\")")
+        cleaned = MCPRepl.remove_println_calls(expr)
+        @test contains(string(cleaned), "println")
+
+        # print(io, ...) should be preserved
+        expr = Meta.parse("io = IOBuffer(); print(io, \"hello\")")
+        cleaned = MCPRepl.remove_println_calls(expr)
+        @test contains(string(cleaned), "print(io")
+
+        # println(stdout, ...) should still be stripped
+        expr = Meta.parse("println(stdout, \"test\"); x = 42")
+        cleaned = MCPRepl.remove_println_calls(expr)
+        @test !contains(string(cleaned), "println")
+        @test contains(string(cleaned), "x = 42")
+
+        # Multi-arg with IO first arg preserved inside function
+        expr = Meta.parse("function f(io) println(io, \"data\"); return nothing end")
+        cleaned = MCPRepl.remove_println_calls(expr)
+        @test contains(string(cleaned), "println")
+    end
+
     @testset "Edge Cases" begin
         # Test empty expression (parses to nothing)
         expr = Meta.parse("")
