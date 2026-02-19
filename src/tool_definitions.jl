@@ -674,10 +674,123 @@ tool_help_tool = @mcp_tool(
 investigate_tool = @mcp_tool(
     :investigate_environment,
     "Get current Julia environment info: pwd, active project, packages, dev packages, and Revise status.",
-    Dict("type" => "object", "properties" => Dict(), "required" => []),
+    Dict(
+        "type" => "object",
+        "properties" => Dict(
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID from resources/list). Required when multiple sessions are connected.",
+            ),
+        ),
+        "required" => [],
+    ),
     args -> begin
         try
-            MCPRepl.repl_status_report()
+            ses = get(args, "session", "")
+            code = raw"""
+            begin
+                import Pkg
+                import TOML
+
+                io = IOBuffer()
+
+                println(io, "🔍 Julia Environment Investigation")
+                println(io, "=" ^ 50)
+                println(io)
+
+                println(io, "📁 Current Directory:")
+                println(io, "   $(pwd())")
+                println(io)
+
+                active_proj = Base.active_project()
+                println(io, "📦 Active Project:")
+                if active_proj !== nothing
+                    println(io, "   Path: $active_proj")
+                    try
+                        project_data = TOML.parsefile(active_proj)
+                        name = get(project_data, "name", basename(dirname(active_proj)))
+                        println(io, "   Name: $name")
+                        haskey(project_data, "version") && println(io, "   Version: $(project_data["version"])")
+                    catch e
+                        println(io, "   Error reading project info: $e")
+                    end
+                else
+                    println(io, "   No active project")
+                end
+                println(io)
+
+                println(io, "📚 Package Environment:")
+                try
+                    deps = Pkg.dependencies()
+                    dev_pkgs = Dict{String,String}()
+                    for (uuid, info) in deps
+                        if info.is_direct_dep && info.is_tracking_path
+                            dev_pkgs[info.name] = info.source
+                        end
+                    end
+
+                    # Current env package
+                    current_pkg = nothing
+                    if active_proj !== nothing
+                        try
+                            pd = TOML.parsefile(active_proj)
+                            if haskey(pd, "uuid")
+                                current_pkg = (
+                                    name = get(pd, "name", basename(dirname(active_proj))),
+                                    version = get(pd, "version", "dev"),
+                                    path = dirname(active_proj),
+                                )
+                            end
+                        catch; end
+                    end
+
+                    dev_deps = [info for (_, info) in deps if info.is_direct_dep && haskey(dev_pkgs, info.name)]
+                    regular_deps = [info for (_, info) in deps if info.is_direct_dep && !haskey(dev_pkgs, info.name)]
+
+                    if !isempty(dev_deps) || current_pkg !== nothing
+                        println(io, "   🔧 Development packages (tracked by Revise):")
+                        if current_pkg !== nothing
+                            println(io, "      $(current_pkg.name) v$(current_pkg.version) [CURRENT ENV] => $(current_pkg.path)")
+                        end
+                        for info in dev_deps
+                            current_pkg !== nothing && info.name == current_pkg.name && continue
+                            println(io, "      $(info.name) v$(info.version) => $(dev_pkgs[info.name])")
+                        end
+                        println(io)
+                    end
+
+                    if !isempty(regular_deps)
+                        println(io, "   📦 Other packages in environment:")
+                        for info in regular_deps
+                            println(io, "      $(info.name) v$(info.version)")
+                        end
+                    end
+
+                    if isempty(deps) && current_pkg === nothing
+                        println(io, "   No packages in environment")
+                    end
+                catch e
+                    println(io, "   Error getting package status: $e")
+                end
+
+                println(io)
+                println(io, "🔄 Revise.jl Status:")
+                if isdefined(Main, :Revise)
+                    println(io, "   ✅ Revise.jl is loaded and active")
+                    println(io, "   📝 Development packages will auto-reload on changes")
+                else
+                    println(io, "   ⚠️  Revise.jl is not loaded")
+                end
+
+                String(take!(io))
+            end
+            """
+            execute_repllike(
+                code;
+                description = "[Investigating environment]",
+                quiet = false,
+                session = ses,
+            )
         catch e
             "Error investigating environment: $e"
         end
@@ -1611,6 +1724,29 @@ pkg_rm_tool = @mcp_tool(
         pkg_operation_tool("rm", "Removed", args; session = get(args, "session", ""))
 )
 
+"""
+    _project_has_retest(project_path::String) -> Bool
+
+Check whether a project has ReTest as a dependency by reading its TOML files.
+Checks both `test/Project.toml` (test-specific deps) and `Project.toml` (extras).
+"""
+function _project_has_retest(project_path::String)::Bool
+    for toml_path in [
+        joinpath(project_path, "test", "Project.toml"),
+        joinpath(project_path, "Project.toml"),
+    ]
+        isfile(toml_path) || continue
+        try
+            toml = TOML.parsefile(toml_path)
+            for key in ("deps", "extras")
+                haskey(get(toml, key, Dict()), "ReTest") && return true
+            end
+        catch
+        end
+    end
+    return false
+end
+
 run_tests_tool = @mcp_tool(
     :run_tests,
     """Run tests and optionally generate coverage reports.
@@ -1664,83 +1800,76 @@ Test results summary including:
                 "description" => "Enable verbose test output (default: false)",
                 "default" => 1,
             ),
+            "session" => Dict(
+                "type" => "string",
+                "description" => "Session key (8-char ID). Required when multiple sessions are connected.",
+            ),
         ),
         "required" => [],
     ),
     function (args)
-        pattern = get(args, "pattern", ".*")
+        pattern = get(args, "pattern", "")
         coverage_enabled = get(args, "coverage", false)
         verbose_arg = get(args, "verbose", 1)
         verbose = verbose_arg isa Int ? verbose_arg : parse(Int, verbose_arg)
+        session = get(args, "session", "")
+        on_progress = get(args, "_on_progress", nothing)
 
-        out_buf = IOBuffer()
-        try
-            hasReTest = "ReTest" in [p.name for p in values(Pkg.dependencies())]
-            project_path = dirname(Pkg.project().path)
-            project_name = Pkg.project().name
-
-            if coverage_enabled
-                println(out_buf, "🧪 Running tests with coverage collection...\n")
-                # Clear any previous coverage data
-                Coverage.clean_folder("src")
-                Coverage.clean_folder("test")
-
-                # Coverage requires --code-coverage flag, so spawn a subprocess
-                test_args = String[]
-                if !isempty(pattern) && pattern != ".*"
-                    push!(test_args, pattern)
-                end
-
-                cmd = if hasReTest
-                    `julia --project=$project_path --startup-file=no --code-coverage=user test/runtests.jl $test_args`
-                else
-                    `julia --project=$project_path --startup-file=no --code-coverage=user test/runtests.jl $test_args`
-                end
-
-                # Run the subprocess and capture output
-                test_output = read(cmd, String)
-                print(out_buf, test_output)
-
-                println(out_buf, "\n📊 Processing coverage data...\n")
-
-                coverage = process_folder("src")
-                covered_lines, total_lines = get_summary(coverage)
-                coverage_pct =
-                    total_lines > 0 ?
-                    round(100 * covered_lines / total_lines, digits = 2) : 0.0
-
-                println(out_buf, "Coverage Summary:")
-                println(out_buf, "  Lines covered: $covered_lines / $total_lines")
-                println(out_buf, "  Coverage: $(coverage_pct)%")
-
-                # Generate LCOV report
-                LCOV.writefile("coverage-lcov.info", coverage)
-                println(out_buf, "\n✅ Coverage report written to: coverage-lcov.info")
-            else
-                println(out_buf, "🧪 Running tests...\n")
-
-                test_args = String[]
-                if !isempty(pattern) && pattern != ".*"
-                    push!(test_args, pattern)
-                end
-
-                try
-                    cmd = if hasReTest
-                        `julia --project=$project_path --startup-file=no test/runtests.jl $test_args`
-                    else
-                        `julia --project=$project_path --startup-file=no -e "using Pkg; Pkg.test()"`
-                    end
-
-                    test_output = read(cmd, String)
-                    print(out_buf, test_output)
-                catch e
-                    print(out_buf, "Error running tests: $e")
-                end
-            end
-            return String(take!(out_buf))
-        catch e
-            return "Error running tests: $e\n$(sprint(showerror, e, catch_backtrace()))"
+        # Normalize pattern
+        if pattern == ".*"
+            pattern = ""
         end
+
+        if !BRIDGE_MODE[]
+            return "Error: run_tests requires bridge mode. Start a bridge REPL with MCPReplBridge.serve()."
+        end
+
+        conn, err = _resolve_bridge_conn(session)
+        err !== nothing && return err
+
+        # Derive project root — conn.project_path may point to a subdirectory
+        # (e.g. test/) if the user activated a different env on the session.
+        project_path = conn.project_path
+        runtests_path = joinpath(project_path, "test", "runtests.jl")
+        if !isfile(runtests_path)
+            # Try parent directory (common when project_path is test/ subdir)
+            parent = dirname(project_path)
+            parent_runtests = joinpath(parent, "test", "runtests.jl")
+            if isfile(parent_runtests)
+                project_path = parent
+                runtests_path = parent_runtests
+            else
+                return "Error: No test/runtests.jl found in $project_path. Create a test file first."
+            end
+        end
+
+        on_progress !== nothing &&
+            on_progress("Spawning test subprocess for $(basename(project_path))...")
+
+        # Spawn ephemeral test subprocess
+        run = spawn_test_run(
+            project_path;
+            pattern = pattern,
+            verbose = verbose,
+            on_progress = on_progress,
+        )
+
+        # Push to TUI buffer so the Tests tab picks it up
+        _push_test_update!(:update, run)
+
+        # Poll for completion with inflight progress
+        while run.status == RUN_RUNNING
+            sleep(0.5)
+            if on_progress !== nothing
+                n_lines = length(run.raw_output)
+                on_progress(
+                    "Running tests... $(run.total_pass) passed, $(run.total_fail) failed ($n_lines lines)",
+                )
+            end
+        end
+
+        # Return focused summary (not raw output dump)
+        return format_test_summary(run)
     end
 )
 
@@ -1834,7 +1963,7 @@ Run tests with coverage:
         sess_key = if isempty(session)
             conns = connected_sessions(mgr)
             if length(conns) == 0
-                return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")"
+                return "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve()"
             elseif length(conns) == 1
                 short_key(conns[1])
             else

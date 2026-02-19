@@ -123,7 +123,7 @@ render_text(m; kw...) = join(render_activity(m; kw...), "\n")
                 @test matching[1]["duration_ms"] == 42.0
                 @test matching[1]["input_size"] == sizeof("""{"x":1}""")
                 @test matching[1]["output_size"] == sizeof("ok")
-                @test matching[1]["mcp_session_id"] == "s001"
+                @test matching[1]["session_key"] == "s001"
             end
 
             @testset "Error tool call persisted" begin
@@ -636,41 +636,99 @@ end
 
     @testset "Health gauge always in [0, 1]" begin
         @check function health_always_clamped(
-            status_idx = Data.Integers(1, 3),
-            t_success = Data.Floats{Float64}(),
-            t_error = Data.Floats{Float64}(),
+            n_success = Data.Integers(0, 60),
+            n_error = Data.Integers(0, 60),
         )
-            assume!(isfinite(t_success) && isfinite(t_error))
-            assume!(t_success >= 0.0 && t_error >= 0.0)
-            assume!(t_success <= 1e10 && t_error <= 1e10)
-
-            statuses = [:connected, :connecting, :disconnected]
-            conn = (status = statuses[status_idx],)
-            m = MCPRepl.MCPReplModel(
-                last_tool_success = t_success,
-                last_tool_error = t_error,
-            )
-            h = MCPRepl._compute_health(conn, m)
+            m = MCPRepl.MCPReplModel(server_port = 19990)
+            for _ = 1:n_success
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(
+                        now(),
+                        "prop_test",
+                        "{}",
+                        "ok",
+                        "1ms",
+                        true,
+                        "sess1",
+                    ),
+                )
+            end
+            for _ = 1:n_error
+                push!(
+                    m.tool_results,
+                    MCPRepl.ToolCallResult(
+                        now(),
+                        "prop_test",
+                        "{}",
+                        "err",
+                        "1ms",
+                        false,
+                        "sess1",
+                    ),
+                )
+            end
+            (h, _) = MCPRepl._compute_health(m)
             0.0 <= h <= 1.0
         end
     end
 
-    @testset "Connected health >= disconnected health" begin
-        @check function connected_beats_disconnected(
-            t_success = Data.Floats{Float64}(),
-            t_error = Data.Floats{Float64}(),
+    @testset "More errors => lower health" begin
+        @check function errors_reduce_health(
+            n_success = Data.Integers(1, 50),
+            n_extra_errors = Data.Integers(1, 20),
         )
-            assume!(isfinite(t_success) && isfinite(t_error))
-            assume!(t_success >= 0.0 && t_error >= 0.0)
-            assume!(t_success <= 1e10 && t_error <= 1e10)
+            # Model with n_success successes (health = 1.0)
+            m1 = MCPRepl.MCPReplModel(server_port = 19990)
+            for _ = 1:n_success
+                push!(
+                    m1.tool_results,
+                    MCPRepl.ToolCallResult(
+                        now(),
+                        "prop_test",
+                        "{}",
+                        "ok",
+                        "1ms",
+                        true,
+                        "sess1",
+                    ),
+                )
+            end
+            (h1, _) = MCPRepl._compute_health(m1)
 
-            m = MCPRepl.MCPReplModel(
-                last_tool_success = t_success,
-                last_tool_error = t_error,
-            )
-            h_up = MCPRepl._compute_health((status = :connected,), m)
-            h_down = MCPRepl._compute_health((status = :disconnected,), m)
-            h_up >= h_down
+            # Model with same successes + extra errors
+            m2 = MCPRepl.MCPReplModel(server_port = 19990)
+            for _ = 1:n_success
+                push!(
+                    m2.tool_results,
+                    MCPRepl.ToolCallResult(
+                        now(),
+                        "prop_test",
+                        "{}",
+                        "ok",
+                        "1ms",
+                        true,
+                        "sess1",
+                    ),
+                )
+            end
+            for _ = 1:n_extra_errors
+                push!(
+                    m2.tool_results,
+                    MCPRepl.ToolCallResult(
+                        now(),
+                        "prop_test",
+                        "{}",
+                        "err",
+                        "1ms",
+                        false,
+                        "sess1",
+                    ),
+                )
+            end
+            (h2, _) = MCPRepl._compute_health(m2)
+
+            h1 >= h2
         end
     end
 

@@ -310,7 +310,7 @@ function _persist_tool_call!(r::ToolCallResult)
             db,
             """
     INSERT INTO tool_executions (
-        mcp_session_id, request_id, tool_name, request_time,
+        session_key, request_id, tool_name, request_time,
         duration_ms, input_size, output_size, arguments,
         status, result_summary
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -534,6 +534,9 @@ end
     # Client detection (populated async on tab switch)
     client_statuses::Vector{Pair{String,Bool}} = Pair{String,Bool}[]
 
+    # Async task queue (Tachikoma pattern)
+    _task_queue::TaskQueue = TaskQueue()
+
     # Database & analytics
     db_initialized::Bool = false
     activity_mode::Symbol = :live    # :live (current view) or :analytics (DB summary)
@@ -564,8 +567,17 @@ end
     # Pane focus — which pane has keyboard focus on each tab
     # Tab 1: 1=status, 2=log | Tab 2: 1=bridges, 2=agents, 3=detail
     # Tab 3: 1=list, 2=detail | Tab 4: 1=server, 2=actions, 3=clients
-    # Tab 5: 1=form, 2=output
-    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1, 5 => 1)
+    # Tab 5: 1=form, 2=output | Tab 6: 1=runs list, 2=results
+    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1, 5 => 1, 6 => 1)
+
+    # ── Tests tab (tab 6) ──
+    test_runs::Vector{TestRun} = TestRun[]
+    selected_test_run::Int = 0             # 0 = none, 1+ = index into test_runs
+    tests_layout::ResizableLayout = ResizableLayout(Horizontal, [Percent(35), Fill()])
+    test_view_mode::Symbol = :results      # :results or :output (raw)
+    test_follow::Bool = true               # follow mode: auto-select newest run
+    test_output_pane::Union{ScrollPane,Nothing} = nothing
+    _test_output_synced::Int = 0           # raw_output lines pushed to scroll pane
 
     # ── Advanced tab (stress test) ──
     stress_state::StressState = STRESS_IDLE
@@ -587,7 +599,7 @@ end
 end
 
 # Number of focusable panes per tab
-const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3, 5 => 3)
+const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3, 5 => 3, 6 => 2)
 
 """Return the border style for a pane — highlighted if focused."""
 function _pane_border(m::MCPReplModel, tab::Int, pane::Int)
@@ -857,6 +869,7 @@ function Tachikoma.cleanup!(m::MCPReplModel)
 end
 
 Tachikoma.should_quit(m::MCPReplModel) = m.quit
+Tachikoma.task_queue(m::MCPReplModel) = m._task_queue
 
 # ── Update ────────────────────────────────────────────────────────────────────
 
@@ -877,6 +890,22 @@ function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
     elseif m.active_tab == 5
         handle_resize!(m.advanced_layout, evt)
         m.stress_scroll_pane !== nothing && handle_mouse!(m.stress_scroll_pane, evt)
+    elseif m.active_tab == 6
+        handle_resize!(m.tests_layout, evt)
+        m.test_output_pane !== nothing && handle_mouse!(m.test_output_pane, evt)
+    end
+end
+
+function Tachikoma.update!(m::MCPReplModel, evt::TaskEvent)
+    if evt.id == :client_status
+        # Merge a single client detection result into the statuses list
+        name, detected = evt.value::Pair{String,Bool}
+        idx = findfirst(p -> p.first == name, m.client_statuses)
+        if idx !== nothing
+            m.client_statuses[idx] = name => detected
+        else
+            push!(m.client_statuses, name => detected)
+        end
     end
 end
 
@@ -905,11 +934,13 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         evt.char == '3' && (_switch_tab!(m, 3); return)
         evt.char == '4' && (_switch_tab!(m, 4); return)
         evt.char == '5' && (_switch_tab!(m, 5); return)
+        evt.char == '6' && (_switch_tab!(m, 6); return)
         evt.char == 's' && (_switch_tab!(m, 1); return)
         evt.char == 'e' && (_switch_tab!(m, 2); return)
         evt.char == 'a' && (_switch_tab!(m, 3); return)
         evt.char == 'c' && (_switch_tab!(m, 4); return)
         evt.char == 'v' && (_switch_tab!(m, 5); return)
+        evt.char == 't' && (_switch_tab!(m, 6); return)
         # Server tab actions (tab 1)
         if m.active_tab == 1 && evt.char == 'w'
             m.log_word_wrap = !m.log_word_wrap
@@ -956,6 +987,11 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             _handle_stress_key!(m, evt)
             return
         end
+        # Tests tab actions (tab 6)
+        if m.active_tab == 6
+            _handle_tests_key!(m, evt)
+            return
+        end
     elseif evt.key == :tab
         # Cycle focus between panes within the current tab
         tab = m.active_tab
@@ -987,12 +1023,16 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         _handle_scroll!(m, evt)
         return
     end
-    # Escape on Advanced tab cancels stress test or does nothing (don't quit)
+    # Escape on Advanced/Tests tab — cancel running ops, don't quit
     if evt.key == :escape
         if m.active_tab == 5
             if m.stress_state == STRESS_RUNNING
                 _cancel_stress_test!(m)
             end
+            return
+        end
+        if m.active_tab == 6
+            _handle_tests_escape!(m)
             return
         end
         m.shutting_down = true
@@ -1111,6 +1151,29 @@ function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
         elseif fp == 3
             # Scroll log output pane
             m.stress_scroll_pane !== nothing && handle_key!(m.stress_scroll_pane, evt)
+        end
+    elseif tab == 6
+        if fp == 1
+            # Navigate test runs list (displayed newest-first / reversed)
+            n = length(m.test_runs)
+            if n > 0
+                # Manual navigation disables follow mode
+                m.test_follow = false
+                if evt.key == :up
+                    # Up in reversed list = increase index (toward newest)
+                    m.selected_test_run = min(n, m.selected_test_run + 1)
+                    m._test_output_synced = 0  # reset output pane
+                    m.test_output_pane = nothing
+                elseif evt.key == :down
+                    # Down in reversed list = decrease index (toward oldest)
+                    m.selected_test_run = max(1, m.selected_test_run - 1)
+                    m._test_output_synced = 0
+                    m.test_output_pane = nothing
+                end
+            end
+        elseif fp == 2
+            # Scroll results/output pane
+            m.test_output_pane !== nothing && handle_key!(m.test_output_pane, evt)
         end
     end
 end
@@ -1235,10 +1298,8 @@ function execute_onboarding!(m::MCPReplModel)
         if m.onboard_scope == :project
             # Write .julia-startup.jl in the project directory
             isdir(path) || mkpath(path)
-            projname = basename(path)
             startup_file = joinpath(path, ".julia-startup.jl")
-            content =
-                Generate.render_template("julia-startup.jl"; name_expr = repr(projname))
+            content = Generate.render_template("julia-startup.jl")
             write(startup_file, content)
             m.flow_message = "Created $(_short_path(startup_file))\n\nAdd to your project's startup:\n  include(\".julia-startup.jl\")"
             m.flow_success = true
@@ -1254,10 +1315,7 @@ function execute_onboarding!(m::MCPReplModel)
                 m.flow_message = "Bridge snippet already in\n$(_short_path(startup_file))"
                 m.flow_success = true
             else
-                name_expr = "basename(something(Base.active_project(), \"julia\"))"
-                block =
-                    "\n" *
-                    Generate.render_template("julia-startup.jl"; name_expr = name_expr)
+                block = "\n" * Generate.render_template("julia-startup.jl")
                 open(startup_file, "a") do io
                     write(io, block)
                 end
@@ -1891,14 +1949,6 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             BRIDGE_PORT[] = m.server_port
             _push_log!(:info, "MCP server listening on port $(m.server_port)")
 
-            # Start ETL scheduler to process interactions → analytics tables
-            if Database.DB[] !== nothing
-                Threads.@spawn try
-                    Database.start_etl_scheduler(Database.DB[]; interval_seconds = 60)
-                catch e
-                    _push_log!(:warning, "ETL scheduler failed: $(sprint(showerror, e))")
-                end
-            end
         catch e
             m.server_running = false
             _push_log!(:error, "Server failed: $(sprint(showerror, e))")
@@ -1941,12 +1991,17 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                     Span("v", tstyle(:warning)),
                     Span("anced", tstyle(:text)),
                 ],
+                [Span("T", tstyle(:warning)), Span("ests", tstyle(:text))],
             ];
             active = m.active_tab,
         ),
         tab_area,
         buf,
     )
+
+    # ── Drain cross-thread buffers every frame (regardless of active tab) ──
+    _drain_stress_output!(m)
+    _drain_test_updates!(m.test_runs)
 
     # ── Content by tab ──
     if m.active_tab == 1
@@ -1958,8 +2013,15 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     elseif m.active_tab == 4
         view_config(m, content_area, buf)
     elseif m.active_tab == 5
-        _drain_stress_output!(m)
         view_advanced(m, content_area, buf)
+    elseif m.active_tab == 6
+        # Follow mode: always snap to newest run
+        if m.test_follow && !isempty(m.test_runs)
+            m.selected_test_run = length(m.test_runs)
+        elseif m.selected_test_run == 0 && !isempty(m.test_runs)
+            m.selected_test_run = length(m.test_runs)
+        end
+        view_tests(m, content_area, buf)
     end
 
     # ── Status bar ──
@@ -2048,7 +2110,7 @@ function view_sessions(m::MCPReplModel, area::Rect, buf::Buffer)
         push!(items, ListItem("  No REPL sessions found", tstyle(:text_dim)))
         push!(items, ListItem("", tstyle(:text_dim)))
         push!(items, ListItem("  Start a bridge in your REPL:", tstyle(:text_dim)))
-        push!(items, ListItem("  MCPReplBridge.serve(name=\"myproject\")", tstyle(:accent)))
+        push!(items, ListItem("  MCPReplBridge.serve()", tstyle(:accent)))
     end
 
     render(
@@ -4304,7 +4366,7 @@ function _dict_has_julia_repl_server(x)::Bool
 end
 
 function _detect_claude_configured()::Bool
-    # Preferred source of truth: Claude CLI's active MCP registry.
+    # Check CLI first (most authoritative).
     if Sys.which("claude") !== nothing
         try
             out = read(pipeline(`claude mcp list`; stderr = devnull), String)
@@ -4318,18 +4380,15 @@ function _detect_claude_configured()::Bool
         end
     end
 
-    # Fallback: file-based detection when CLI is unavailable.
-    # Claude uses multiple config files depending on scope/version.
+    # Fallback: file-based detection.
     paths = (
         joinpath(homedir(), ".claude", "settings.json"),
         joinpath(homedir(), ".claude", "settings.local.json"),
         joinpath(pwd(), ".mcp.json"),
         joinpath(pwd(), ".claude", "settings.local.json"),
     )
-
     for p in paths
         isfile(p) || continue
-        # Structured check first (mcpServers keys), then text fallback.
         try
             cfg = JSON.parsefile(p)
             _dict_has_julia_repl_server(cfg) && return true
@@ -4340,84 +4399,58 @@ function _detect_claude_configured()::Bool
         catch
         end
     end
-
     return false
 end
 
-# Client detection runs async; results land in model.client_statuses.
-const _CLIENT_STATUS_PENDING = Ref{Bool}(false)
+# Client detection runs as independent async tasks via Tachikoma TaskQueue.
+# Each check spawns separately so fast file checks return immediately
+# while slower CLI checks (e.g. `claude mcp list`) don't block anything.
 
 function _refresh_client_status_async!(m::MCPReplModel)
-    _CLIENT_STATUS_PENDING[] && return   # already in flight
-    _CLIENT_STATUS_PENDING[] = true
-    Threads.@spawn begin
-        try
-            statuses = Pair{String,Bool}[]
+    q = m._task_queue
 
-            # Check each client's config files for "julia-repl" presence.
-            # All checks are file-based to avoid spawning CLI processes.
+    # Claude Code — may shell out to `claude mcp list`, so gets its own task
+    spawn_task!(q, :client_status) do
+        "Claude Code" => _detect_claude_configured()
+    end
 
-            # Claude Code: support global + local config variants.
-            push!(statuses, "Claude Code" => _detect_claude_configured())
+    # Gemini
+    spawn_task!(q, :client_status) do
+        "Gemini CLI" => _detect_in_files(
+            joinpath(homedir(), ".gemini", "settings.json"),
+            joinpath(pwd(), ".gemini", "settings.json"),
+        )
+    end
 
-            # Gemini: ~/.gemini/settings.json and project .gemini/settings.json
-            push!(
-                statuses,
-                "Gemini CLI" => _detect_in_files(
-                    joinpath(homedir(), ".gemini", "settings.json"),
-                    joinpath(pwd(), ".gemini", "settings.json"),
-                ),
-            )
+    # Codex
+    spawn_task!(q, :client_status) do
+        "OpenAI Codex" => _detect_in_files(joinpath(homedir(), ".codex", "config.toml"))
+    end
 
-            # Codex: ~/.codex/config.toml
-            push!(
-                statuses,
-                "OpenAI Codex" =>
-                    _detect_in_files(joinpath(homedir(), ".codex", "config.toml")),
-            )
+    # Copilot
+    spawn_task!(q, :client_status) do
+        "GitHub Copilot" =>
+            _detect_in_files(joinpath(homedir(), ".copilot", "mcp-config.json"))
+    end
 
-            # Copilot: ~/.copilot/mcp-config.json
-            push!(
-                statuses,
-                "GitHub Copilot" =>
-                    _detect_in_files(joinpath(homedir(), ".copilot", "mcp-config.json")),
-            )
+    # VS Code
+    vscode_user_dir = if Sys.isapple()
+        joinpath(homedir(), "Library", "Application Support", "Code", "User")
+    elseif Sys.iswindows()
+        joinpath(get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")), "Code", "User")
+    else
+        joinpath(get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")), "Code", "User")
+    end
+    spawn_task!(q, :client_status) do
+        "VS Code" => _detect_in_files(
+            joinpath(vscode_user_dir, "mcp.json"),
+            joinpath(pwd(), ".vscode", "mcp.json"),
+        )
+    end
 
-            # VS Code: user-level mcp.json + project-level .vscode/mcp.json
-            vscode_user_dir = if Sys.isapple()
-                joinpath(homedir(), "Library", "Application Support", "Code", "User")
-            elseif Sys.iswindows()
-                joinpath(
-                    get(ENV, "APPDATA", joinpath(homedir(), "AppData", "Roaming")),
-                    "Code",
-                    "User",
-                )
-            else
-                joinpath(
-                    get(ENV, "XDG_CONFIG_HOME", joinpath(homedir(), ".config")),
-                    "Code",
-                    "User",
-                )
-            end
-            push!(
-                statuses,
-                "VS Code" => _detect_in_files(
-                    joinpath(vscode_user_dir, "mcp.json"),
-                    joinpath(pwd(), ".vscode", "mcp.json"),
-                ),
-            )
-
-            # KiloCode: VS Code globalStorage settings
-            push!(
-                statuses,
-                "KiloCode" =>
-                    _detect_in_files(joinpath(_kilo_settings_dir(), "mcp_settings.json")),
-            )
-
-            m.client_statuses = statuses
-        catch
-        end
-        _CLIENT_STATUS_PENDING[] = false
+    # KiloCode
+    spawn_task!(q, :client_status) do
+        "KiloCode" => _detect_in_files(joinpath(_kilo_settings_dir(), "mcp_settings.json"))
     end
 end
 
@@ -4573,6 +4606,372 @@ connections in `~/.cache/mcprepl/sock/`.
 - `port::Int=2828`: Port for the MCP HTTP server
 - `theme::Symbol=:kokaku`: Tachikoma theme name
 """
+# ── Tests Tab ─────────────────────────────────────────────────────────────────
+
+function view_tests(m::MCPReplModel, area::Rect, buf::Buffer)
+    panes = split_layout(m.tests_layout, area)
+    length(panes) < 2 && return
+
+    # ── Left pane: test runs list ──
+    _view_test_runs_list(m, panes[1], buf)
+
+    # ── Right pane: results or raw output ──
+    _view_test_detail(m, panes[2], buf)
+
+    render_resize_handles!(buf, m.tests_layout)
+end
+
+"""Render the list of test runs in the left pane (newest first)."""
+function _view_test_runs_list(m::MCPReplModel, area::Rect, buf::Buffer)
+    runs = m.test_runs
+    items = ListItem[]
+
+    # Display newest first (reversed)
+    for i in reverse(eachindex(runs))
+        run = runs[i]
+        project_name = basename(run.project_path)
+        elapsed = if run.finished_at !== nothing
+            dt = Dates.value(run.finished_at - run.started_at) / 1000.0
+            "$(round(dt, digits=1))s"
+        else
+            dt = Dates.value(now() - run.started_at) / 1000.0
+            "$(round(dt, digits=0))s..."
+        end
+
+        text, style = if run.status == RUN_RUNNING
+            si = mod1(m.tick ÷ 3, length(SPINNER_BRAILLE))
+            ("$(SPINNER_BRAILLE[si]) $project_name $elapsed", tstyle(:accent))
+        elseif run.status == RUN_PASSED
+            (". $project_name $(run.total_pass) pass $elapsed", tstyle(:success))
+        elseif run.status == RUN_FAILED
+            (
+                "X $project_name $(run.total_pass) pass, $(run.total_fail) fail $elapsed",
+                tstyle(:error),
+            )
+        elseif run.status == RUN_ERROR
+            ("! $project_name error $elapsed", tstyle(:error))
+        elseif run.status == RUN_CANCELLED
+            ("- $project_name cancelled", tstyle(:text_dim))
+        else
+            ("  $project_name", tstyle(:text))
+        end
+
+        push!(items, ListItem(text, style))
+    end
+
+    if isempty(items)
+        push!(
+            items,
+            ListItem("  No test runs yet. Press [r] to run tests.", tstyle(:text_dim)),
+        )
+    end
+
+    # Map selected_test_run (1-based index into runs) to reversed display position
+    n = length(runs)
+    display_selected = if m.selected_test_run >= 1 && m.selected_test_run <= n
+        n - m.selected_test_run + 1
+    else
+        0
+    end
+
+    follow_str = m.test_follow ? "[F]ollow:on" : "[F]ollow:off"
+    render(
+        SelectableList(
+            items;
+            selected = display_selected,
+            block = Block(
+                title = " Test Runs ($n) $follow_str ",
+                border_style = _pane_border(m, 6, 1),
+                title_style = _pane_title(m, 6, 1),
+            ),
+            highlight_style = tstyle(:accent, bold = true),
+            tick = m.tick,
+        ),
+        area,
+        buf,
+    )
+end
+
+"""Render the test detail view (results table or raw output)."""
+function _view_test_detail(m::MCPReplModel, area::Rect, buf::Buffer)
+    sel = m.selected_test_run
+    if sel < 1 || sel > length(m.test_runs)
+        render(
+            Block(
+                title = " Results ",
+                border_style = _pane_border(m, 6, 2),
+                title_style = _pane_title(m, 6, 2),
+            ),
+            area,
+            buf,
+        )
+        return
+    end
+
+    run = m.test_runs[sel]
+    mode_str = m.test_view_mode == :results ? "Results" : "Output"
+    title = " $mode_str [o]toggle "
+
+    if m.test_view_mode == :output
+        # Raw output scroll pane
+        _view_test_raw_output(m, run, area, buf, title)
+    else
+        # Structured results view
+        _view_test_results(m, run, area, buf, title)
+    end
+end
+
+"""Render structured test results as a table with failure details."""
+function _view_test_results(
+    m::MCPReplModel,
+    run::TestRun,
+    area::Rect,
+    buf::Buffer,
+    title::String,
+)
+    # Build content lines for a ScrollPane
+    if m.test_output_pane === nothing || m._test_output_synced == 0
+        lines = Vector{Span}[]
+
+        # Status header
+        status_style = if run.status == RUN_PASSED
+            tstyle(:success)
+        elseif run.status in (RUN_FAILED, RUN_ERROR)
+            tstyle(:error)
+        elseif run.status == RUN_RUNNING
+            tstyle(:accent)
+        else
+            tstyle(:text_dim)
+        end
+        status_str = uppercase(string(run.status))[5:end]  # strip "RUN_"
+        push!(
+            lines,
+            [
+                Span("Status: ", tstyle(:text)),
+                Span(status_str, status_style),
+                Span("  Pass: $(run.total_pass)", tstyle(:success)),
+                Span(
+                    "  Fail: $(run.total_fail)",
+                    run.total_fail > 0 ? tstyle(:error) : tstyle(:text),
+                ),
+                Span(
+                    "  Error: $(run.total_error)",
+                    run.total_error > 0 ? tstyle(:error) : tstyle(:text),
+                ),
+            ],
+        )
+        push!(lines, Span[])
+
+        # Testset results
+        if !isempty(run.results)
+            push!(lines, [Span("Testsets:", tstyle(:text, bold = true))])
+            for r in run.results
+                indent = "  "^(r.depth + 1)
+                marker_style =
+                    (r.fail_count > 0 || r.error_count > 0) ? tstyle(:error) :
+                    tstyle(:success)
+                marker = (r.fail_count > 0 || r.error_count > 0) ? "X" : "."
+                counts = "$(r.pass_count)p"
+                r.fail_count > 0 && (counts *= " $(r.fail_count)f")
+                r.error_count > 0 && (counts *= " $(r.error_count)e")
+                push!(
+                    lines,
+                    [
+                        Span("$indent[$marker] ", marker_style),
+                        Span(r.name, tstyle(:text)),
+                        Span("  $counts", marker_style),
+                    ],
+                )
+            end
+        end
+
+        # Failure details
+        if !isempty(run.failures)
+            push!(lines, Span[])
+            push!(lines, [Span("Failures:", tstyle(:error, bold = true))])
+            push!(lines, [Span("-"^50, tstyle(:border))])
+            for (i, f) in enumerate(run.failures)
+                push!(
+                    lines,
+                    [
+                        Span("  $i) ", tstyle(:error)),
+                        Span("$(f.file):$(f.line)", tstyle(:text)),
+                    ],
+                )
+                !isempty(f.testset) &&
+                    push!(lines, [Span("     Testset: $(f.testset)", tstyle(:text_dim))])
+                !isempty(f.expression) &&
+                    push!(lines, [Span("     Expr: $(f.expression)", tstyle(:warning))])
+                !isempty(f.evaluated) &&
+                    push!(lines, [Span("     Eval: $(f.evaluated)", tstyle(:warning))])
+                if !isempty(f.backtrace)
+                    for bt_line in first(split(f.backtrace, "\n"), 3)
+                        push!(lines, [Span("     $bt_line", tstyle(:text_dim))])
+                    end
+                end
+                push!(lines, Span[])
+            end
+        end
+
+        # If running and no results yet, show progress from raw output
+        if run.status == RUN_RUNNING && isempty(run.results)
+            n_lines = length(run.raw_output)
+            push!(lines, [Span("Running... ($n_lines lines of output)", tstyle(:accent))])
+            # Show last few lines of raw output
+            for line in last(run.raw_output, min(10, n_lines))
+                push!(lines, [Span(line, tstyle(:text_dim))])
+            end
+        end
+
+        m.test_output_pane = ScrollPane(
+            lines;
+            following = run.status == RUN_RUNNING,
+            reverse = false,
+            block = Block(
+                title = title,
+                border_style = _pane_border(m, 6, 2),
+                title_style = _pane_title(m, 6, 2),
+            ),
+            show_scrollbar = true,
+        )
+        m._test_output_synced = length(run.raw_output)
+    else
+        # Check if new output arrived — rebuild pane
+        if length(run.raw_output) > m._test_output_synced
+            m._test_output_synced = 0
+            m.test_output_pane = nothing
+            _view_test_results(m, run, area, buf, title)
+            return
+        end
+    end
+
+    m.test_output_pane !== nothing && render(m.test_output_pane, area, buf)
+end
+
+"""Render raw test output in a ScrollPane."""
+function _view_test_raw_output(
+    m::MCPReplModel,
+    run::TestRun,
+    area::Rect,
+    buf::Buffer,
+    title::String,
+)
+    if m.test_output_pane === nothing || m._test_output_synced == 0
+        lines = Vector{Span}[]
+        for line in run.raw_output
+            style = if startswith(line, "TEST_RUNNER:")
+                tstyle(:accent)
+            elseif contains(line, "Error") ||
+                   contains(line, "FAILED") ||
+                   contains(line, "FAIL")
+                tstyle(:error)
+            elseif contains(line, "Pass") || contains(line, "PASSED")
+                tstyle(:success)
+            else
+                tstyle(:text)
+            end
+            push!(lines, [Span(line, style)])
+        end
+
+        m.test_output_pane = ScrollPane(
+            lines;
+            following = run.status == RUN_RUNNING,
+            reverse = false,
+            block = Block(
+                title = title,
+                border_style = _pane_border(m, 6, 2),
+                title_style = _pane_title(m, 6, 2),
+            ),
+            show_scrollbar = true,
+        )
+        m._test_output_synced = length(run.raw_output)
+    else
+        # New output — append to pane
+        if length(run.raw_output) > m._test_output_synced
+            pane = m.test_output_pane
+            if pane !== nothing
+                for i = (m._test_output_synced+1):length(run.raw_output)
+                    line = run.raw_output[i]
+                    style = if contains(line, "Error") || contains(line, "FAIL")
+                        tstyle(:error)
+                    elseif contains(line, "Pass")
+                        tstyle(:success)
+                    else
+                        tstyle(:text)
+                    end
+                    push_line!(pane, [Span(line, style)])
+                end
+                m._test_output_synced = length(run.raw_output)
+            end
+        end
+    end
+
+    m.test_output_pane !== nothing && render(m.test_output_pane, area, buf)
+end
+
+"""Handle char keys on the Tests tab."""
+function _handle_tests_key!(m::MCPReplModel, evt::KeyEvent)
+    if evt.char == 'r'
+        # Trigger a new test run
+        _start_test_run_from_tui!(m)
+    elseif evt.char == 'o'
+        # Toggle results/output view
+        m.test_view_mode = m.test_view_mode == :results ? :output : :results
+        m.test_output_pane = nothing
+        m._test_output_synced = 0
+    elseif evt.char == 'F'
+        # Toggle follow mode
+        m.test_follow = !m.test_follow
+    elseif evt.char == 'x'
+        # Cancel running test
+        sel = m.selected_test_run
+        if sel >= 1 && sel <= length(m.test_runs)
+            run = m.test_runs[sel]
+            if run.status == RUN_RUNNING
+                cancel_test_run!(run)
+            end
+        end
+    end
+end
+
+"""Handle escape on the Tests tab — cancel running test."""
+function _handle_tests_escape!(m::MCPReplModel)
+    sel = m.selected_test_run
+    if sel >= 1 && sel <= length(m.test_runs)
+        run = m.test_runs[sel]
+        if run.status == RUN_RUNNING
+            cancel_test_run!(run)
+            return
+        end
+    end
+    # If no running test, do nothing (don't quit)
+end
+
+"""Start a test run from the TUI using the first connected bridge session."""
+function _start_test_run_from_tui!(m::MCPReplModel)
+    mgr = m.conn_mgr
+    mgr === nothing && return
+
+    conns = connected_sessions(mgr)
+    isempty(conns) && return
+
+    # Use first connected session (or could prompt for selection)
+    conn = conns[1]
+    project_path = conn.project_path
+
+    runtests_path = joinpath(project_path, "test", "runtests.jl")
+    if !isfile(runtests_path)
+        _push_log!(:warn, "No test/runtests.jl found in $project_path")
+        return
+    end
+
+    run = spawn_test_run(project_path)
+    push!(m.test_runs, run)
+    m.selected_test_run = length(m.test_runs)
+    m.test_output_pane = nothing
+    m._test_output_synced = 0
+end
+
 function tui(; port::Int = 2828, theme_name::Symbol = :kokaku)
     if Threads.nthreads() < 2
         @warn """MCPRepl TUI running with only 1 thread — UI may be unresponsive.

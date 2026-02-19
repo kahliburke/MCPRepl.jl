@@ -19,6 +19,7 @@ using Serialization
 using Preferences
 using ZMQ
 using Printf
+using UUIDs
 using Tachikoma
 
 export @mcp_tool, MCPTool
@@ -59,6 +60,8 @@ include("bridge_prefs.jl")
 include("bridge.jl")
 include("bridge_client.jl")
 include("stress_test.jl")
+include("test_output_parser.jl")
+include("test_runner.jl")
 include("tui.jl")
 
 # Export public API functions
@@ -1030,7 +1033,7 @@ function _resolve_bridge_conn(session::String)
         if isempty(available)
             return (
                 nothing,
-                "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve(name=\"myproject\")",
+                "ERROR: No REPL sessions connected. Start a bridge in your Julia REPL:\n  MCPReplBridge.serve()",
             )
         end
         return (nothing, "ERROR: No session matched '$(session)'. Available: $available")

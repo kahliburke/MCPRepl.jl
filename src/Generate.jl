@@ -64,13 +64,10 @@ function render_template(template_name::String; kwargs...)
     tmp(init = Dict(kwargs))
 end
 
-function create_startup_script(
-    project_path::String;
-    name_expr::String = repr(basename(project_path)),
-)
+function create_startup_script(project_path::String)
     println("📝 Creating Julia startup script...")
 
-    startup_content = render_template("julia-startup.jl"; name_expr = name_expr)
+    startup_content = render_template("julia-startup.jl")
 
     startup_path = joinpath(project_path, ".julia-startup.jl")
     write(startup_path, startup_content)

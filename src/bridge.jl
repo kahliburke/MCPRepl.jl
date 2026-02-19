@@ -324,7 +324,7 @@ function _exec_restart(name::String, session_id::String, project_path::String)
     serve_code = """
     try; using Revise; catch; end
     using MCPRepl
-    MCPReplBridge.serve(name=$(repr(name)), session_id=$(repr(session_id)))
+    MCPReplBridge.serve(session_id=$(repr(session_id)))
     """
     args = vcat(julia_args, ["--project=$project_path", "-i", "-e", serve_code])
 
@@ -450,29 +450,50 @@ end
 # ── Public API ────────────────────────────────────────────────────────────────
 
 """
-    serve(; name="julia", port=nothing, session_id=nothing)
+    serve(; session_id=nothing)
 
 Start the eval bridge. Binds a ZMQ REP socket on an IPC endpoint and
 listens for eval requests from the MCPRepl TUI server.
 
 Non-blocking — returns immediately. The bridge runs in a background task.
+The session name is derived automatically from the active project path.
 
 # Arguments
-- `name::String`: Human-readable session name (shown in TUI)
-- `port::Union{Int,Nothing}`: If given, also bind TCP on this port (for remote)
 - `session_id::Union{String,Nothing}`: Reuse a session ID (e.g. after exec restart)
 
 # Example
 ```julia
 using MCPRepl
-MCPReplBridge.serve(name="myproject")
+MCPReplBridge.serve()
 ```
 """
 function serve(;
-    name::String = "julia",
+    name::Union{String,Nothing} = nothing,
     port::Union{Int,Nothing} = nothing,
     session_id::Union{String,Nothing} = nothing,
 )
+    if name !== nothing
+        Base.depwarn(
+            "serve(name=...) is deprecated. The session name is now derived from the active project automatically.",
+            :serve,
+        )
+    end
+    if port !== nothing
+        Base.depwarn(
+            "serve(port=...) is deprecated. The TCP port binding has been removed; bridges use IPC only.",
+            :serve,
+        )
+    end
+    _serve(;
+        name = something(
+            name,
+            basename(dirname(something(Base.active_project(), "julia"))),
+        ),
+        session_id,
+    )
+end
+
+function _serve(; name::String, session_id::Union{String,Nothing})
     if _RUNNING[]
         @warn "Bridge already running (session=$(_SESSION_ID[])). Call stop() first."
         return _SESSION_ID[]
@@ -511,11 +532,6 @@ function serve(;
     stream_endpoint = "ipc://$(stream_path)"
     bind(pub_socket, stream_endpoint)
     _STREAM_SOCKET[] = pub_socket
-
-    # Optionally bind TCP
-    if port !== nothing
-        bind(socket, "tcp://127.0.0.1:$port")
-    end
 
     # Write metadata file
     write_metadata(sid, name, endpoint, stream_endpoint)

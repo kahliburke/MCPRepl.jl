@@ -71,51 +71,13 @@ end
 
 function get_database_test_args(func_name::Symbol)
     args_map = Dict{Symbol,Any}(
-        # Session management
-        :init_db! => (".mcprepl/test_events.db",),
-        :register_mcp_session! => ("test-session-id", "active"),
-        :register_julia_session! => ("uuid-123", "test-session", "active"),
-        :register_session! => ("session-id", "active"),
-        :get_julia_session => ("uuid-123",),
-        :get_mcp_session => ("session-id",),
-        :get_julia_sessions_by_name => ("test-session",),
-        :get_mcp_sessions_by_target => ("target-uuid",),
-        :get_active_mcp_sessions => (),
-        :get_active_sessions => (),
-        :get_all_sessions => (),
-        :update_session_status! => ("session-id", "ready"),
-        :update_mcp_session_status! => ("session-id", "connected"),
-        :update_mcp_session_target! => ("session-id", "target-id"),
-        :update_mcp_session_protocol! =>
-            ("session-id", "INITIALIZED", Dict{String,Any}()),
-
-        # Event logging
-        :log_event! => ("tool_call", Dict{String,Any}()),
-        :log_event_safe! => ("tool_call", Dict{String,Any}()),
-        :log_interaction! => ("inbound", "request", "{}"),
-        :log_interaction_safe! => ("inbound", "request", "{}"),
-
-        # Queries
-        :get_events => (),
-        :get_interactions => (),
-        :get_events_by_time_range => (; start_time = now() - Dates.Hour(1)),
-        :get_session_stats => ("session-id",),
-        :get_session_summary => ("session-id",),
-        :get_recent_session_events => ("session-id", 50),
-        :get_global_stats => (),
-        :reconstruct_session => ("session-id",),
-
-        # Analytics
+        :init_db! => (tempname() * ".db",),
         :get_tool_executions => (),
-        :get_error_analytics => (),
         :get_tool_summary => (),
         :get_error_hotspots => (),
-        :get_session_timeline => ("session-id",),
-        :get_etl_status => (),
-
-        # Maintenance
-        :cleanup_old_events! => (30,),
+        :cleanup_old_data! => (30,),
         :close_db! => (),
+        :get_default_db_path => (),
         :dataframe_to_array => nothing,  # Internal helper, skip
     )
     return get(args_map, func_name, nothing)
@@ -349,95 +311,13 @@ function run_critical_checks()
 
     critical_checks = [
         # ========================================
-        # Database module - Julia session operations
+        # Database module - analytics
         # ========================================
-        (
-            MCPRepl.Database.register_julia_session!,
-            ("uuid", "name", "active"),
-            "Database.register_julia_session!(String, String, String)",
-        ),
-        (
-            MCPRepl.Database.get_julia_session,
-            ("uuid",),
-            "Database.get_julia_session(String)",
-        ),
-        (
-            MCPRepl.Database.get_julia_sessions_by_name,
-            ("name",),
-            "Database.get_julia_sessions_by_name(String)",
-        ),
-        (
-            MCPRepl.Database.update_session_status!,
-            ("uuid", "ready"),
-            "Database.update_session_status!(String, String)",
-        ),
-
-        # Database module - MCP session operations
-        (
-            MCPRepl.Database.register_mcp_session!,
-            ("session_id", "active"),
-            "Database.register_mcp_session!(String, String)",
-        ),
-        (
-            MCPRepl.Database.get_mcp_session,
-            ("session_id",),
-            "Database.get_mcp_session(String)",
-        ),
-        (
-            MCPRepl.Database.get_active_mcp_sessions,
-            (),
-            "Database.get_active_mcp_sessions()",
-        ),
-        (
-            MCPRepl.Database.get_mcp_sessions_by_target,
-            ("target_id",),
-            "Database.get_mcp_sessions_by_target(String)",
-        ),
-        (
-            MCPRepl.Database.update_mcp_session_status!,
-            ("session_id", "connected"),
-            "Database.update_mcp_session_status!(String, String)",
-        ),
-        (
-            MCPRepl.Database.update_mcp_session_target!,
-            ("session_id", "target_id"),
-            "Database.update_mcp_session_target!(String, String)",
-        ),
-        (
-            MCPRepl.Database.update_mcp_session_protocol!,
-            ("session_id", "INITIALIZED", Dict{String,Any}()),
-            "Database.update_mcp_session_protocol!(String, String, Dict)",
-        ),
-
-        # Database module - event logging
-        (
-            MCPRepl.Database.log_event!,
-            ("tool_call", Dict{String,Any}()),
-            "Database.log_event!(String, Dict)",
-        ),
-        (
-            MCPRepl.Database.log_event_safe!,
-            ("tool_call", Dict{String,Any}()),
-            "Database.log_event_safe!(String, Dict)",
-        ),
-        (
-            MCPRepl.Database.log_interaction!,
-            ("inbound", "request", "{}"),
-            "Database.log_interaction!(String, String, String)",
-        ),
-        (
-            MCPRepl.Database.log_interaction_safe!,
-            ("inbound", "request", "{}"),
-            "Database.log_interaction_safe!(String, String, String)",
-        ),
-
-        # Database module - queries
-        (
-            MCPRepl.Database.get_session_stats,
-            ("session_id",),
-            "Database.get_session_stats(String)",
-        ),
-        (MCPRepl.Database.get_active_sessions, (), "Database.get_active_sessions()"),
+        (MCPRepl.Database.get_tool_summary, (), "Database.get_tool_summary()"),
+        (MCPRepl.Database.get_tool_executions, (), "Database.get_tool_executions()"),
+        (MCPRepl.Database.get_error_hotspots, (), "Database.get_error_hotspots()"),
+        (MCPRepl.Database.cleanup_old_data!, (30,), "Database.cleanup_old_data!(Int)"),
+        (MCPRepl.Database.close_db!, (), "Database.close_db!()"),
 
         # ========================================
         # Session module

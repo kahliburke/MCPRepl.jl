@@ -1,13 +1,9 @@
 """
 Session Status Management
 
-Defines valid session statuses and provides validated update functions.
+Defines valid session statuses and provides validation helpers.
 """
 module SessionStatus
-
-using Dates
-using SQLite
-using DBInterface
 
 # ============================================================================
 # Status Constants
@@ -41,7 +37,7 @@ const TERMINAL_STATUSES = Set([STOPPED, REPLACED])
 """
     validate_julia_status(status::String)
 
-Validate a Julia session status. Throws ArgumentError if invalid.
+Validate a Julia session status. Throws if invalid.
 """
 function validate_julia_status(status::String)
     if !(status in VALID_JULIA_STATUSES)
@@ -54,7 +50,7 @@ end
 """
     validate_mcp_status(status::String)
 
-Validate an MCP session status. Throws ArgumentError if invalid.
+Validate an MCP session status. Throws if invalid.
 """
 function validate_mcp_status(status::String)
     if !(status in VALID_MCP_STATUSES)
@@ -91,54 +87,6 @@ function is_active(status::String)
     return status in Set([READY, DOWN, RESTARTING])
 end
 
-# ============================================================================
-# Status Update Functions (require database module)
-# ============================================================================
-
-"""
-    update_julia_session_status!(db::SQLite.DB, session_id::String, status::String)
-
-Update Julia session status with validation.
-This is the ONLY function that should update Julia session status.
-"""
-function update_julia_session_status!(db::SQLite.DB, session_id::String, status::String)
-    validate_julia_status(status)
-
-    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
-
-    DBInterface.execute(
-        db,
-        """
-        UPDATE julia_sessions
-        SET status = ?, last_activity = ?
-        WHERE id = ?
-        """,
-        (status, now_str, session_id),
-    )
-end
-
-"""
-    update_mcp_session_status!(db::SQLite.DB, session_id::String, status::String)
-
-Update MCP session status with validation.
-This is the ONLY function that should update MCP session status.
-"""
-function update_mcp_session_status!(db::SQLite.DB, session_id::String, status::String)
-    validate_mcp_status(status)
-
-    now_str = Dates.format(now(), "yyyy-mm-dd HH:MM:SS.sss")
-
-    DBInterface.execute(
-        db,
-        """
-        UPDATE mcp_sessions
-        SET status = ?, last_activity = ?
-        WHERE id = ?
-        """,
-        (status, now_str, session_id),
-    )
-end
-
 export READY,
     DOWN,
     RESTARTING,
@@ -154,8 +102,6 @@ export READY,
     validate_mcp_status,
     should_buffer,
     is_terminal,
-    is_active,
-    update_julia_session_status!,
-    update_mcp_session_status!
+    is_active
 
 end # module
