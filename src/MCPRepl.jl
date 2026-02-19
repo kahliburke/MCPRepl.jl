@@ -21,6 +21,7 @@ using ZMQ
 using Printf
 using UUIDs
 using Tachikoma
+using Match
 
 export @mcp_tool, MCPTool
 export start!, stop!, test_server

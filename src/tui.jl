@@ -21,7 +21,9 @@ import Tachikoma:
     ResizableLayout,
     split_layout,
     render_resize_handles!,
-    handle_resize!
+    handle_resize!,
+    TreeView,
+    TreeNode
 # Tachikoma.split (for layouts) is not Base.split, so we alias it.
 const tsplit = Tachikoma.split
 
@@ -559,6 +561,9 @@ end
     # Background reindex: project_path → timestamp of last files_changed notification
     _reindex_pending::Dict{String,Float64} = Dict{String,Float64}()
 
+    # Tab bar area for mouse click detection
+    _tab_bar_area::Rect = Rect()
+
     # Server log scroll pane
     log_pane::Union{ScrollPane,Nothing} = nothing
     log_word_wrap::Bool = false
@@ -578,6 +583,8 @@ end
     test_follow::Bool = true               # follow mode: auto-select newest run
     test_output_pane::Union{ScrollPane,Nothing} = nothing
     _test_output_synced::Int = 0           # raw_output lines pushed to scroll pane
+    test_tree_view::Union{TreeView,Nothing} = nothing
+    _test_tree_synced::Int = 0             # raw_output length when tree was last built
 
     # ── Advanced tab (stress test) ──
     stress_state::StressState = STRESS_IDLE
@@ -692,7 +699,7 @@ function _ensure_log_pane!(m::MCPReplModel)
         m.log_pane = ScrollPane(
             Vector{Span}[];
             following = true,
-            reverse = false,
+            reverse = true,
             block = nothing,
             show_scrollbar = true,
         )
@@ -874,25 +881,45 @@ Tachikoma.task_queue(m::MCPReplModel) = m._task_queue
 # ── Update ────────────────────────────────────────────────────────────────────
 
 function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
+    # Tab bar click detection
+    if evt.button == mouse_left &&
+       evt.action == mouse_press &&
+       Base.contains(m._tab_bar_area, evt.x, evt.y)
+        tab = _tab_hit(m, evt.x)
+        tab > 0 && (_switch_tab!(m, tab); return)
+    end
+
     # Route mouse events to scroll panes and resizable layouts
-    if m.active_tab == 1
-        handle_resize!(m.server_layout, evt)
-        m.log_pane !== nothing && handle_mouse!(m.log_pane, evt)
-    elseif m.active_tab == 2
-        handle_resize!(m.sessions_layout, evt)
-        handle_resize!(m.sessions_left_layout, evt)
-    elseif m.active_tab == 3
-        handle_resize!(m.activity_layout, evt)
-        m.detail_paragraph !== nothing && handle_mouse!(m.detail_paragraph, evt)
-    elseif m.active_tab == 4
-        handle_resize!(m.config_layout, evt)
-        handle_resize!(m.config_left_layout, evt)
-    elseif m.active_tab == 5
-        handle_resize!(m.advanced_layout, evt)
-        m.stress_scroll_pane !== nothing && handle_mouse!(m.stress_scroll_pane, evt)
-    elseif m.active_tab == 6
-        handle_resize!(m.tests_layout, evt)
-        m.test_output_pane !== nothing && handle_mouse!(m.test_output_pane, evt)
+    @match m.active_tab begin
+        1 => begin
+            handle_resize!(m.server_layout, evt)
+            m.log_pane !== nothing && handle_mouse!(m.log_pane, evt)
+        end
+        2 => begin
+            handle_resize!(m.sessions_layout, evt)
+            handle_resize!(m.sessions_left_layout, evt)
+        end
+        3 => begin
+            handle_resize!(m.activity_layout, evt)
+            m.detail_paragraph !== nothing && handle_mouse!(m.detail_paragraph, evt)
+        end
+        4 => begin
+            handle_resize!(m.config_layout, evt)
+            handle_resize!(m.config_left_layout, evt)
+        end
+        5 => begin
+            handle_resize!(m.advanced_layout, evt)
+            m.stress_scroll_pane !== nothing && handle_mouse!(m.stress_scroll_pane, evt)
+        end
+        6 => begin
+            handle_resize!(m.tests_layout, evt)
+            if m.test_view_mode == :results && m.test_tree_view !== nothing
+                handle_mouse!(m.test_tree_view, evt)
+            elseif m.test_output_pane !== nothing
+                handle_mouse!(m.test_output_pane, evt)
+            end
+        end
+        _ => nothing
     end
 end
 
@@ -926,256 +953,252 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         return
     end
 
-    if evt.key == :char
-        evt.char == 'q' && (m.shutting_down = true; return)
-        # Tab switching: number keys + letter shortcuts
-        evt.char == '1' && (_switch_tab!(m, 1); return)
-        evt.char == '2' && (_switch_tab!(m, 2); return)
-        evt.char == '3' && (_switch_tab!(m, 3); return)
-        evt.char == '4' && (_switch_tab!(m, 4); return)
-        evt.char == '5' && (_switch_tab!(m, 5); return)
-        evt.char == '6' && (_switch_tab!(m, 6); return)
-        evt.char == 's' && (_switch_tab!(m, 1); return)
-        evt.char == 'e' && (_switch_tab!(m, 2); return)
-        evt.char == 'a' && (_switch_tab!(m, 3); return)
-        evt.char == 'c' && (_switch_tab!(m, 4); return)
-        evt.char == 'v' && (_switch_tab!(m, 5); return)
-        evt.char == 't' && (_switch_tab!(m, 6); return)
-        # Server tab actions (tab 1)
-        if m.active_tab == 1 && evt.char == 'w'
-            m.log_word_wrap = !m.log_word_wrap
-            _rebuild_log_pane!(m)
+    tab = m.active_tab
+
+    # ── Global keys (handled before per-tab dispatch) ──
+    @match (evt.key, evt.char) begin
+        # Quit
+        (:char, 'q') => (m.shutting_down = true; return)
+
+        # Tab switching: number keys
+        (:char, c) where {'1' <= c <= '6'} => begin
+            _switch_tab!(m, Int(c) - Int('0'))
             return
         end
-        # Activity tab actions (tab 3)
-        if m.active_tab == 3
-            if evt.char == 'f'
-                m.activity_mode == :live && _cycle_activity_filter!(m)
-                return
-            elseif evt.char == 'F'
-                m.activity_mode == :live && (m.activity_follow = !m.activity_follow)
-                return
-            elseif evt.char == 'w'
+
+        # Tab switching: letter shortcuts
+        (:char, 's') => (_switch_tab!(m, 1); return)
+        (:char, 'e') => (_switch_tab!(m, 2); return)
+        (:char, 'a') => (_switch_tab!(m, 3); return)
+        (:char, 'c') => (_switch_tab!(m, 4); return)
+        (:char, 'v') => (_switch_tab!(m, 5); return)
+        (:char, 't') => (_switch_tab!(m, 6); return)
+
+        # Pane focus cycling
+        (:tab, _) => begin
+            n_panes = get(_PANE_COUNTS, tab, 0)
+            if n_panes > 1
+                cur = get(m.focused_pane, tab, 1)
+                m.focused_pane[tab] = mod1(cur + 1, n_panes)
+            end
+            return
+        end
+        (:backtab, _) => begin
+            n_panes = get(_PANE_COUNTS, tab, 0)
+            if n_panes > 1
+                cur = get(m.focused_pane, tab, 1)
+                m.focused_pane[tab] = mod1(cur - 1, n_panes)
+            end
+            return
+        end
+
+        # Navigation keys → delegate to per-tab/pane handler
+        (:up, _) ||
+            (:down, _) ||
+            (:pageup, _) ||
+            (:pagedown, _) ||
+            (:left, _) ||
+            (:right, _) ||
+            (:enter, _) ||
+            (:home, _) ||
+            (:end_key, _) => begin
+            _handle_nav!(m, evt)
+            return
+        end
+
+        # Escape — per-tab cancel or quit
+        (:escape, _) => begin
+            @match tab begin
+                5 => (m.stress_state == STRESS_RUNNING && _cancel_stress_test!(m); return)
+                6 => (_handle_tests_escape!(m); return)
+                _ => (m.shutting_down = true)
+            end
+            return
+        end
+
+        _ => nothing  # fall through to per-tab char handling
+    end
+
+    # ── Per-tab char key actions ──
+    evt.key == :char || return
+
+    @match tab begin
+        1 => @match evt.char begin
+            'w' => (m.log_word_wrap = !m.log_word_wrap; _rebuild_log_pane!(m))
+            'F' => (
+                m.log_pane !== nothing && (m.log_pane.following = !m.log_pane.following)
+            )
+            _ => nothing
+        end
+
+        3 => @match evt.char begin
+            'f' => (m.activity_mode == :live && _cycle_activity_filter!(m))
+            'F' =>
+                (m.activity_mode == :live && (m.activity_follow = !m.activity_follow))
+            'w' => begin
                 m.activity_mode == :live && begin
                     m.result_word_wrap = !m.result_word_wrap
-                    m._detail_for_result = -1  # invalidate cached paragraph
+                    m._detail_for_result = -1
                 end
-                return
-            elseif evt.char == 'd'
-                # Toggle between live and analytics mode
+            end
+            'd' => begin
                 m.activity_mode = m.activity_mode == :live ? :analytics : :live
-                if m.activity_mode == :analytics
-                    _refresh_analytics!(m)
-                end
-                return
-            elseif evt.char == 'r'
-                # Force refresh analytics data
-                if m.activity_mode == :analytics
-                    _refresh_analytics!(m; force = true)
-                end
-                return
+                m.activity_mode == :analytics && _refresh_analytics!(m)
             end
+            'r' =>
+                (m.activity_mode == :analytics && _refresh_analytics!(m; force = true))
+            _ => nothing
         end
-        # Config tab actions (tab 4)
-        if m.active_tab == 4
-            evt.char == 'o' && begin_onboarding!(m)
-            evt.char == 'i' && begin_client_config!(m)
-            evt.char == 'm' && toggle_bridge_mirror_repl!(m)
+
+        4 => @match evt.char begin
+            'o' => begin_onboarding!(m)
+            'i' => begin_client_config!(m)
+            'm' => toggle_bridge_mirror_repl!(m)
+            _ => nothing
         end
-        # Advanced tab actions (tab 5)
-        if m.active_tab == 5
-            _handle_stress_key!(m, evt)
-            return
-        end
-        # Tests tab actions (tab 6)
-        if m.active_tab == 6
-            _handle_tests_key!(m, evt)
-            return
-        end
-    elseif evt.key == :tab
-        # Cycle focus between panes within the current tab
-        tab = m.active_tab
-        n_panes = get(_PANE_COUNTS, tab, 0)
-        if n_panes > 1
-            cur = get(m.focused_pane, tab, 1)
-            m.focused_pane[tab] = mod1(cur + 1, n_panes)
-        end
-        return
-    elseif evt.key == :backtab  # shift-tab: cycle backwards
-        tab = m.active_tab
-        n_panes = get(_PANE_COUNTS, tab, 0)
-        if n_panes > 1
-            cur = get(m.focused_pane, tab, 1)
-            m.focused_pane[tab] = mod1(cur - 1, n_panes)
-        end
-        return
-    elseif evt.key == :enter
-        if m.active_tab == 5
-            _handle_stress_enter!(m)
-            return
-        end
-    elseif evt.key in (:left, :right)
-        if m.active_tab == 5
-            _handle_stress_arrow!(m, evt)
-            return
-        end
-    elseif evt.key in (:up, :down, :pageup, :pagedown)
-        _handle_scroll!(m, evt)
-        return
-    end
-    # Escape on Advanced/Tests tab — cancel running ops, don't quit
-    if evt.key == :escape
-        if m.active_tab == 5
-            if m.stress_state == STRESS_RUNNING
-                _cancel_stress_test!(m)
-            end
-            return
-        end
-        if m.active_tab == 6
-            _handle_tests_escape!(m)
-            return
-        end
-        m.shutting_down = true
+
+        5 => _handle_stress_key!(m, evt)
+        6 => _handle_tests_key!(m, evt)
+        _ => nothing
     end
 end
 
-function _handle_scroll!(m::MCPReplModel, evt::KeyEvent)
+function _handle_nav!(m::MCPReplModel, evt::KeyEvent)
     tab = m.active_tab
     fp = get(m.focused_pane, tab, 1)
 
-    if tab == 1
-        # Pane 2 = log (only scrollable pane on server tab)
-        if fp == 2 && m.log_pane !== nothing
-            handle_key!(m.log_pane, evt)
+    @match (tab, fp) begin
+        (1, 2) => (m.log_pane !== nothing && handle_key!(m.log_pane, evt))
+
+        (2, 1) => @match evt.key begin
+            :up => (m.selected_connection = max(1, m.selected_connection - 1))
+            :down => begin
+                m.conn_mgr !== nothing && begin
+                    n = length(m.conn_mgr.connections)
+                    m.selected_connection = min(max(1, n), m.selected_connection + 1)
+                end
+            end
+            _ => nothing
         end
-    elseif tab == 2
-        if fp == 1
-            # Bridges list
-            if evt.key == :up
-                m.selected_connection = max(1, m.selected_connection - 1)
-            elseif evt.key == :down && m.conn_mgr !== nothing
-                n = length(m.conn_mgr.connections)
-                m.selected_connection = min(max(1, n), m.selected_connection + 1)
-            end
-            # Pane 2 (agents) and 3 (detail) — no scrolling yet
-        end
-    elseif tab == 3
-        # Analytics mode doesn't use the live list navigation
-        m.activity_mode == :analytics && return
-        if fp == 1
-            # Manual navigation disables follow mode
-            m.activity_follow = false
-            # Tool call list — navigate across in-flight + completed entries
-            # Display order: in-flight reversed (newest first), then completed reversed (newest first)
-            filter_key = m.activity_filter
 
-            # Build filtered in-flight indices (display order: reversed)
-            fi_indices = Int[]
-            for i = 1:length(m.inflight_calls)
-                if isempty(filter_key) || m.inflight_calls[i].session_key == filter_key
-                    push!(fi_indices, i)
-                end
-            end
-            reverse!(fi_indices)
-
-            # Build filtered completed indices (display order: reversed)
-            fc_indices = Int[]
-            for i = 1:length(m.tool_results)
-                if isempty(filter_key) || m.tool_results[i].session_key == filter_key
-                    push!(fc_indices, i)
-                end
-            end
-            reverse!(fc_indices)
-
-            total = length(fi_indices) + length(fc_indices)
-            if total > 0
-                # Find current position in combined list
-                cur = 0
-                if m.selected_inflight > 0
-                    pos = findfirst(==(m.selected_inflight), fi_indices)
-                    if pos !== nothing
-                        cur = pos
-                    end
-                elseif m.selected_result > 0
-                    pos = findfirst(==(m.selected_result), fc_indices)
-                    if pos !== nothing
-                        cur = length(fi_indices) + pos
-                    end
-                end
-
-                # Move selection
-                new_pos = cur
-                if evt.key == :up
-                    new_pos = max(1, cur - 1)
-                elseif evt.key == :down
-                    new_pos = min(total, cur + 1)
-                end
-                if new_pos == 0
-                    new_pos = 1
-                end
-
-                # Map position back to inflight or completed
-                if new_pos <= length(fi_indices)
-                    m.selected_inflight = fi_indices[new_pos]
-                    m.selected_result = 0
-                else
-                    m.selected_inflight = 0
-                    ci = new_pos - length(fi_indices)
-                    m.selected_result = fc_indices[ci]
-                end
-            end
-            m.result_scroll = 0
-            m._detail_for_result = -1  # force rebuild of detail
-        elseif fp == 2
-            # Detail panel scroll — delegate to Paragraph widget
-            if m.detail_paragraph !== nothing
-                handle_key!(m.detail_paragraph, evt)
+        (3, _) => begin
+            m.activity_mode == :analytics && return
+            if fp == 1
+                _handle_activity_scroll!(m, evt)
+            elseif fp == 2
+                m.detail_paragraph !== nothing && handle_key!(m.detail_paragraph, evt)
             end
         end
-    elseif tab == 5
-        if fp == 1
-            # Navigate form fields (1-5 = fields, 6 = Run button)
-            if evt.key == :up
-                m.stress_field_idx = max(1, m.stress_field_idx - 1)
-            elseif evt.key == :down
-                m.stress_field_idx = min(6, m.stress_field_idx + 1)
-            end
-        elseif fp == 2
-            # Scroll agent horde
+
+        (5, 1) => @match evt.key begin
+            :up => (m.stress_field_idx = max(1, m.stress_field_idx - 1))
+            :down => (m.stress_field_idx = min(6, m.stress_field_idx + 1))
+            :enter => _handle_stress_enter!(m)
+            _ => nothing
+        end
+        (5, 2) => begin
             step = evt.key in (:pageup, :pagedown) ? 5 : 1
-            if evt.key in (:up, :pageup)
-                m.stress_horde_scroll = max(0, m.stress_horde_scroll - step)
-            elseif evt.key in (:down, :pagedown)
-                m.stress_horde_scroll += step
+            @match evt.key begin
+                :up || :pageup =>
+                    (m.stress_horde_scroll = max(0, m.stress_horde_scroll - step))
+                :down || :pagedown => (m.stress_horde_scroll += step)
+                _ => nothing
             end
-        elseif fp == 3
-            # Scroll log output pane
-            m.stress_scroll_pane !== nothing && handle_key!(m.stress_scroll_pane, evt)
         end
-    elseif tab == 6
-        if fp == 1
-            # Navigate test runs list (displayed newest-first / reversed)
+        (5, 3) =>
+            (m.stress_scroll_pane !== nothing && handle_key!(m.stress_scroll_pane, evt))
+
+        (6, 1) => begin
             n = length(m.test_runs)
-            if n > 0
-                # Manual navigation disables follow mode
-                m.test_follow = false
-                if evt.key == :up
-                    # Up in reversed list = increase index (toward newest)
+            n > 0 || return
+            m.test_follow = false
+            @match evt.key begin
+                :up => begin
                     m.selected_test_run = min(n, m.selected_test_run + 1)
-                    m._test_output_synced = 0  # reset output pane
-                    m.test_output_pane = nothing
-                elseif evt.key == :down
-                    # Down in reversed list = decrease index (toward oldest)
-                    m.selected_test_run = max(1, m.selected_test_run - 1)
-                    m._test_output_synced = 0
-                    m.test_output_pane = nothing
+                    _reset_test_panes!(m)
                 end
+                :down => begin
+                    m.selected_test_run = max(1, m.selected_test_run - 1)
+                    _reset_test_panes!(m)
+                end
+                _ => nothing
             end
-        elseif fp == 2
-            # Scroll results/output pane
-            m.test_output_pane !== nothing && handle_key!(m.test_output_pane, evt)
+        end
+        (6, 2) => begin
+            # TreeView handles up/down/left/right/enter/home/end_key
+            if m.test_view_mode == :results && m.test_tree_view !== nothing
+                handle_key!(m.test_tree_view, evt)
+            elseif m.test_output_pane !== nothing
+                handle_key!(m.test_output_pane, evt)
+            end
+        end
+
+        _ => nothing
+    end
+end
+
+"""Reset test output panes and tree view (used on run selection change)."""
+function _reset_test_panes!(m::MCPReplModel)
+    m._test_output_synced = 0
+    m.test_output_pane = nothing
+    m.test_tree_view = nothing
+    m._test_tree_synced = 0
+end
+
+"""Navigate the activity tool call list (in-flight + completed, filtered)."""
+function _handle_activity_scroll!(m::MCPReplModel, evt::KeyEvent)
+    m.activity_follow = false
+    filter_key = m.activity_filter
+
+    # Build filtered in-flight indices (display order: reversed)
+    fi_indices = Int[]
+    for i = 1:length(m.inflight_calls)
+        if isempty(filter_key) || m.inflight_calls[i].session_key == filter_key
+            push!(fi_indices, i)
         end
     end
+    reverse!(fi_indices)
+
+    # Build filtered completed indices (display order: reversed)
+    fc_indices = Int[]
+    for i = 1:length(m.tool_results)
+        if isempty(filter_key) || m.tool_results[i].session_key == filter_key
+            push!(fc_indices, i)
+        end
+    end
+    reverse!(fc_indices)
+
+    total = length(fi_indices) + length(fc_indices)
+    total == 0 && return
+
+    # Find current position in combined list
+    cur = 0
+    if m.selected_inflight > 0
+        pos = findfirst(==(m.selected_inflight), fi_indices)
+        pos !== nothing && (cur = pos)
+    elseif m.selected_result > 0
+        pos = findfirst(==(m.selected_result), fc_indices)
+        pos !== nothing && (cur = length(fi_indices) + pos)
+    end
+
+    # Move selection
+    new_pos = @match evt.key begin
+        :up => max(1, cur - 1)
+        :down => min(total, cur + 1)
+        _ => cur
+    end
+    new_pos == 0 && (new_pos = 1)
+
+    # Map position back to inflight or completed
+    if new_pos <= length(fi_indices)
+        m.selected_inflight = fi_indices[new_pos]
+        m.selected_result = 0
+    else
+        m.selected_inflight = 0
+        m.selected_result = fc_indices[new_pos-length(fi_indices)]
+    end
+    m.result_scroll = 0
+    m._detail_for_result = -1
 end
 
 # ── Tab switching ────────────────────────────────────────────────────────────
@@ -1186,6 +1209,27 @@ function _switch_tab!(m::MCPReplModel, tab::Int)
     if tab == 4
         _refresh_client_status_async!(m)
     end
+end
+
+# Tab label lengths for mouse hit testing (must match the TabBar labels in view)
+const _TAB_LABEL_LENS = [6, 8, 8, 6, 8, 5]  # Server, Sessions, Activity, Config, Advanced, Tests
+const _TAB_SEPARATOR_LEN = 3  # " │ "
+
+"""Determine which tab (1-6) was clicked at `click_x`, or 0 if none."""
+function _tab_hit(m::MCPReplModel, click_x::Int)
+    x = m._tab_bar_area.x
+    for (i, llen) in enumerate(_TAB_LABEL_LENS)
+        if i > 1
+            # Skip separator region
+            x += _TAB_SEPARATOR_LEN
+        end
+        tab_w = llen + 2  # brackets/padding around label
+        if click_x >= x && click_x < x + tab_w
+            return i
+        end
+        x += tab_w
+    end
+    return 0
 end
 
 # ── Config Flow: Begin ───────────────────────────────────────────────────────
@@ -1219,73 +1263,65 @@ const SCOPE_LABELS = ["Project-level", "User-level (global)"]  # used by onboard
 function handle_flow_input!(m::MCPReplModel, evt::KeyEvent)
     flow = m.config_flow
 
-    # ── Onboarding path entry ──
     if flow == FLOW_ONBOARD_PATH
-        if evt.key == :enter
-            m.onboard_path = Tachikoma.text(m.path_input)
-            m.flow_selected = 1
-            m.config_flow = FLOW_ONBOARD_SCOPE
-        elseif evt.key == :tab
-            _complete_path!(m.path_input)
-        else
-            handle_key!(m.path_input, evt)
-        end
-
-        # ── Onboarding scope selection ──
-    elseif flow == FLOW_ONBOARD_SCOPE
-        if evt.key == :up
-            m.flow_selected = max(1, m.flow_selected - 1)
-        elseif evt.key == :down
-            m.flow_selected = min(2, m.flow_selected + 1)
-        elseif evt.key == :enter
-            m.onboard_scope = m.flow_selected == 1 ? :project : :user
-            m.flow_modal_selected = :confirm
-            m.config_flow = FLOW_ONBOARD_CONFIRM
-        end
-
-        # ── Onboarding confirm ──
-    elseif flow == FLOW_ONBOARD_CONFIRM
-        if evt.key == :left || evt.key == :right
-            m.flow_modal_selected = m.flow_modal_selected == :cancel ? :confirm : :cancel
-        elseif evt.key == :enter
-            if m.flow_modal_selected == :confirm
-                execute_onboarding!(m)
-            else
-                m.config_flow = FLOW_IDLE
+        @match evt.key begin
+            :enter => begin
+                m.onboard_path = Tachikoma.text(m.path_input)
+                m.flow_selected = 1
+                m.config_flow = FLOW_ONBOARD_SCOPE
             end
+            :tab => _complete_path!(m.path_input)
+            _ => handle_key!(m.path_input, evt)
         end
-
-        # ── Onboarding result ──
+    elseif flow == FLOW_ONBOARD_SCOPE
+        @match evt.key begin
+            :up => (m.flow_selected = max(1, m.flow_selected - 1))
+            :down => (m.flow_selected = min(2, m.flow_selected + 1))
+            :enter => begin
+                m.onboard_scope = m.flow_selected == 1 ? :project : :user
+                m.flow_modal_selected = :confirm
+                m.config_flow = FLOW_ONBOARD_CONFIRM
+            end
+            _ => nothing
+        end
+    elseif flow == FLOW_ONBOARD_CONFIRM
+        @match evt.key begin
+            :left || :right => begin
+                m.flow_modal_selected =
+                    m.flow_modal_selected == :cancel ? :confirm : :cancel
+            end
+            :enter => begin
+                m.flow_modal_selected == :confirm ? execute_onboarding!(m) :
+                (m.config_flow = FLOW_IDLE)
+            end
+            _ => nothing
+        end
     elseif flow == FLOW_ONBOARD_RESULT
-        # Any key dismisses
         m.config_flow = FLOW_IDLE
-
-        # ── Client select ──
     elseif flow == FLOW_CLIENT_SELECT
-        if evt.key == :up
-            m.flow_selected = max(1, m.flow_selected - 1)
-        elseif evt.key == :down
-            m.flow_selected = min(length(CLIENT_OPTIONS), m.flow_selected + 1)
-        elseif evt.key == :enter
-            m.client_target = CLIENT_OPTIONS[m.flow_selected]
-            m.flow_modal_selected = :confirm
-            m.config_flow = FLOW_CLIENT_CONFIRM
+        @match evt.key begin
+            :up => (m.flow_selected = max(1, m.flow_selected - 1))
+            :down => (m.flow_selected = min(length(CLIENT_OPTIONS), m.flow_selected + 1))
+            :enter => begin
+                m.client_target = CLIENT_OPTIONS[m.flow_selected]
+                m.flow_modal_selected = :confirm
+                m.config_flow = FLOW_CLIENT_CONFIRM
+            end
+            _ => nothing
         end
-
-        # ── Client confirm ──
     elseif flow == FLOW_CLIENT_CONFIRM
-        if evt.key == :enter
-            execute_client_config!(m)
-        elseif evt.char == 'r'
-            client_label = CLIENT_LABELS[findfirst(==(m.client_target), CLIENT_OPTIONS)]
-            configured = any(p -> p.first == client_label && p.second, m.client_statuses)
-            configured && remove_client_config!(m)
+        @match (evt.key, evt.char) begin
+            (:enter, _) => execute_client_config!(m)
+            (:char, 'r') => begin
+                client_label = CLIENT_LABELS[findfirst(==(m.client_target), CLIENT_OPTIONS)]
+                configured =
+                    any(p -> p.first == client_label && p.second, m.client_statuses)
+                configured && remove_client_config!(m)
+            end
+            _ => nothing
         end
-
-        # ── Client result ──
     elseif flow == FLOW_CLIENT_RESULT
         m.config_flow = FLOW_IDLE
-        # Refresh client statuses so the Config panel reflects the change
         _refresh_client_status_async!(m)
     end
 end
@@ -1342,21 +1378,15 @@ end
 function execute_client_config!(m::MCPReplModel)
     try
         port = m.server_port
-        target = m.client_target
         api_key = _get_api_key()
-
-        if target == :claude
-            _install_claude(m, port, api_key)
-        elseif target == :gemini
-            _install_gemini(m, port, api_key)
-        elseif target == :codex
-            _install_codex(m, port, api_key)
-        elseif target == :copilot
-            _install_copilot(m, port, api_key)
-        elseif target == :vscode
-            _install_vscode(m, port, api_key)
-        elseif target == :kilo
-            _install_kilo(m, port, api_key)
+        @match m.client_target begin
+            :claude => _install_claude(m, port, api_key)
+            :gemini => _install_gemini(m, port, api_key)
+            :codex => _install_codex(m, port, api_key)
+            :copilot => _install_copilot(m, port, api_key)
+            :vscode => _install_vscode(m, port, api_key)
+            :kilo => _install_kilo(m, port, api_key)
+            _ => nothing
         end
     catch e
         m.flow_message = "Error: $(sprint(showerror, e))"
@@ -1388,19 +1418,14 @@ end
 
 function remove_client_config!(m::MCPReplModel)
     try
-        target = m.client_target
-        if target == :claude
-            _remove_claude(m)
-        elseif target == :gemini
-            _remove_gemini(m)
-        elseif target == :codex
-            _remove_codex(m)
-        elseif target == :copilot
-            _remove_copilot(m)
-        elseif target == :vscode
-            _remove_vscode(m)
-        elseif target == :kilo
-            _remove_kilo(m)
+        @match m.client_target begin
+            :claude => _remove_claude(m)
+            :gemini => _remove_gemini(m)
+            :codex => _remove_codex(m)
+            :copilot => _remove_copilot(m)
+            :vscode => _remove_vscode(m)
+            :kilo => _remove_kilo(m)
+            _ => nothing
         end
     catch e
         m.flow_message = "Error: $(sprint(showerror, e))"
@@ -1975,6 +2000,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     status_area = rows[3]
 
     # ── Tab bar ──
+    m._tab_bar_area = tab_area
     render(
         TabBar(
             [
@@ -2004,24 +2030,20 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
     _drain_test_updates!(m.test_runs)
 
     # ── Content by tab ──
-    if m.active_tab == 1
-        view_server(m, content_area, buf)
-    elseif m.active_tab == 2
-        view_sessions(m, content_area, buf)
-    elseif m.active_tab == 3
-        view_activity(m, content_area, buf)
-    elseif m.active_tab == 4
-        view_config(m, content_area, buf)
-    elseif m.active_tab == 5
-        view_advanced(m, content_area, buf)
-    elseif m.active_tab == 6
-        # Follow mode: always snap to newest run
-        if m.test_follow && !isempty(m.test_runs)
-            m.selected_test_run = length(m.test_runs)
-        elseif m.selected_test_run == 0 && !isempty(m.test_runs)
-            m.selected_test_run = length(m.test_runs)
+    @match m.active_tab begin
+        1 => view_server(m, content_area, buf)
+        2 => view_sessions(m, content_area, buf)
+        3 => view_activity(m, content_area, buf)
+        4 => view_config(m, content_area, buf)
+        5 => view_advanced(m, content_area, buf)
+        6 => begin
+            # Follow mode: always snap to newest run
+            if (m.test_follow || m.selected_test_run == 0) && !isempty(m.test_runs)
+                m.selected_test_run = length(m.test_runs)
+            end
+            view_tests(m, content_area, buf)
         end
-        view_tests(m, content_area, buf)
+        _ => nothing
     end
 
     # ── Status bar ──
@@ -2937,8 +2959,9 @@ function view_server(m::MCPReplModel, area::Rect, buf::Buffer)
     wrap_hint = m.log_word_wrap ? "wrap:on" : "wrap:off"
     _ensure_log_pane!(m)
     pane = m.log_pane::ScrollPane
+    follow_hint = pane.following ? "[F]ollow:on" : "[F]ollow:off"
     pane.block = Block(
-        title = " Server Log ($(length(m.server_log))) [$wrap_hint] ",
+        title = " Server Log ($(length(m.server_log))) [$wrap_hint] $follow_hint ",
         border_style = _pane_border(m, 1, 2),
         title_style = _pane_title(m, 1, 2),
     )
@@ -3593,47 +3616,49 @@ This intercepts ALL input (including numbers, letters) so global shortcuts don't
 function _handle_stress_field_edit!(m::MCPReplModel, evt::KeyEvent)
     fi = m.stress_field_idx
 
-    if fi == 1 && m.stress_code_area !== nothing
-        # Code field — full CodeEditor editing
-        if evt.key == :escape
-            m.stress_code = Tachikoma.text(m.stress_code_area)
-            m.stress_editing = false
-            return
-        end
-        m.stress_code_area.tick = m.tick
-        handle_key!(m.stress_code_area, evt)
-    elseif fi == 2
-        # Session selector — left/right to cycle, Enter/Escape to close
-        if evt.key in (:escape, :enter)
-            m.stress_editing = false
-        elseif evt.key == :left
-            sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
-            n = max(1, length(sessions))
-            m.stress_session_idx = mod1(m.stress_session_idx - 1, n)
-        elseif evt.key == :right
-            sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
-            n = max(1, length(sessions))
-            m.stress_session_idx = mod1(m.stress_session_idx + 1, n)
-        end
-    else
-        # Inline text fields (Agents, Stagger, Timeout)
-        if evt.key == :escape || evt.key == :enter
-            m.stress_editing = false
-        elseif evt.key == :char
-            if fi == 3
-                m.stress_agents *= evt.char
-            elseif fi == 4
-                m.stress_stagger *= evt.char
-            elseif fi == 5
-                m.stress_timeout *= evt.char
+    @match fi begin
+        1 where {m.stress_code_area!==nothing} => begin
+            if evt.key == :escape
+                m.stress_code = Tachikoma.text(m.stress_code_area)
+                m.stress_editing = false
+                return
             end
-        elseif evt.key == :backspace
-            if fi == 3
-                m.stress_agents = _stress_backspace(m.stress_agents)
-            elseif fi == 4
-                m.stress_stagger = _stress_backspace(m.stress_stagger)
-            elseif fi == 5
-                m.stress_timeout = _stress_backspace(m.stress_timeout)
+            m.stress_code_area.tick = m.tick
+            handle_key!(m.stress_code_area, evt)
+        end
+        2 => begin
+            @match evt.key begin
+                :escape || :enter => (m.stress_editing = false)
+                :left => begin
+                    sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+                    m.stress_session_idx =
+                        mod1(m.stress_session_idx - 1, max(1, length(sessions)))
+                end
+                :right => begin
+                    sessions = m.conn_mgr !== nothing ? connected_sessions(m.conn_mgr) : []
+                    m.stress_session_idx =
+                        mod1(m.stress_session_idx + 1, max(1, length(sessions)))
+                end
+                _ => nothing
+            end
+        end
+        _ => begin
+            # Inline text fields (Agents=3, Stagger=4, Timeout=5)
+            @match evt.key begin
+                :escape || :enter => (m.stress_editing = false)
+                :char => @match fi begin
+                    3 => (m.stress_agents *= evt.char)
+                    4 => (m.stress_stagger *= evt.char)
+                    5 => (m.stress_timeout *= evt.char)
+                    _ => nothing
+                end
+                :backspace => @match fi begin
+                    3 => (m.stress_agents = _stress_backspace(m.stress_agents))
+                    4 => (m.stress_stagger = _stress_backspace(m.stress_stagger))
+                    5 => (m.stress_timeout = _stress_backspace(m.stress_timeout))
+                    _ => nothing
+                end
+                _ => nothing
             end
         end
     end
@@ -3648,22 +3673,16 @@ end
 """Handle Enter on the Advanced tab — open field for editing or run."""
 function _handle_stress_enter!(m::MCPReplModel)
     m.stress_state == STRESS_RUNNING && return
+    get(m.focused_pane, 5, 1) == 1 || return
 
-    fp = get(m.focused_pane, 5, 1)
-    if fp == 1
-        fi = m.stress_field_idx
-        if fi == 1
-            # Code field: open the CodeEditor (syntax highlighting + line numbers)
+    @match m.stress_field_idx begin
+        1 => begin
             m.stress_code_area =
                 CodeEditor(text = m.stress_code, focused = true, tick = m.tick)
             m.stress_editing = true
-        elseif fi == 6
-            # Run button: launch the test
-            _launch_stress_test!(m)
-        else
-            # Fields 2-5: enter edit mode for this field
-            m.stress_editing = true
         end
+        6 => _launch_stress_test!(m)
+        _ => (m.stress_editing = true)
     end
 end
 
@@ -4721,7 +4740,165 @@ function _view_test_detail(m::MCPReplModel, area::Rect, buf::Buffer)
     end
 end
 
-"""Render structured test results as a table with failure details."""
+"""Build a collapsible TreeNode from a TestRun's results.
+
+Returns a root node with testset hierarchy. Collapsed by default,
+except nodes containing errors are auto-expanded. Failures are shown
+as leaf nodes under a "Failures" child of root."""
+function _make_result_node(r::TestResult)::TreeNode
+    has_errors = r.fail_count > 0 || r.error_count > 0
+    node_style = has_errors ? tstyle(:error, bold = true) : tstyle(:success, bold = true)
+    counts = "$(r.pass_count)p"
+    r.fail_count > 0 && (counts *= " $(r.fail_count)f")
+    r.error_count > 0 && (counts *= " $(r.error_count)e")
+    label = "$(r.name)  $counts"
+    TreeNode(label; expanded = false, style = node_style)
+end
+
+"""Pre-order: parents appear before children (from Test Summary tables)."""
+function _build_tree_preorder!(root::TreeNode, results::Vector{TestResult})
+    stack = TreeNode[root]
+    for r in results
+        node = _make_result_node(r)
+        target_level = r.depth + 1
+        while length(stack) > target_level
+            pop!(stack)
+        end
+        parent = stack[end]
+        push!(parent.children, node)
+        push!(stack, node)
+    end
+end
+
+"""Post-order: children appear before parents (from TESTSET_DONE lines).
+Each testset finishes after its children, so children are emitted first."""
+function _build_tree_postorder!(root::TreeNode, results::Vector{TestResult})
+    # pending_children[depth] = nodes at that depth waiting for a parent
+    pending = Dict{Int,Vector{TreeNode}}()
+    for r in results
+        node = _make_result_node(r)
+        # Claim any pending children at depth+1 as our children
+        child_depth = r.depth + 1
+        if haskey(pending, child_depth)
+            append!(node.children, pending[child_depth])
+            delete!(pending, child_depth)
+        end
+        # Add this node to pending at its depth
+        pv = get!(Vector{TreeNode}, pending, r.depth)
+        push!(pv, node)
+    end
+    # Remaining nodes at depth 0 are top-level results → attach to root
+    if haskey(pending, 0)
+        append!(root.children, pending[0])
+    end
+    # Any orphan nodes at higher depths (shouldn't happen, but safety)
+    for d in sort(collect(keys(pending)))
+        d == 0 && continue
+        append!(root.children, pending[d])
+    end
+end
+
+function _build_test_tree(run::TestRun)::TreeNode
+    # Root label: status summary
+    status_str = uppercase(string(run.status))[5:end]  # strip "RUN_"
+    root_style = if run.status == RUN_PASSED
+        tstyle(:success, bold = true)
+    elseif run.status in (RUN_FAILED, RUN_ERROR)
+        tstyle(:error, bold = true)
+    elseif run.status == RUN_RUNNING
+        tstyle(:accent, bold = true)
+    else
+        tstyle(:text_dim)
+    end
+    counts_str =
+        if run.status == RUN_RUNNING && run.total_pass == 0 && !isempty(run.results)
+            "$(length(run.results)) testsets completed"
+        else
+            "Pass:$(run.total_pass) Fail:$(run.total_fail) Error:$(run.total_error)"
+        end
+    root = TreeNode("$status_str  $counts_str"; expanded = true, style = root_style)
+
+    # Build testset hierarchy from results.
+    # TESTSET_DONE arrives in post-order (children before parents), while
+    # Test Summary tables arrive in pre-order (parents before children).
+    # Detect: if the first result has higher depth than any later result's
+    # minimum, it's post-order. Also, if depth-0 result is last, it's post-order.
+    if !isempty(run.results)
+        is_postorder = if length(run.results) >= 2
+            # Post-order: first result depth > 0 (leaves first), or
+            # first result depth >= second (not descending from root)
+            run.results[1].depth > 0 || run.results[1].depth > run.results[2].depth
+        else
+            false  # single result, order doesn't matter
+        end
+
+        if is_postorder
+            _build_tree_postorder!(root, run.results)
+        else
+            _build_tree_preorder!(root, run.results)
+        end
+    end
+
+    # Add failure detail nodes under a "Failures" group
+    if !isempty(run.failures)
+        fail_group = TreeNode(
+            "Failures ($(length(run.failures)))";
+            expanded = true,
+            style = tstyle(:error, bold = true),
+        )
+        for (i, f) in enumerate(run.failures)
+            loc = "$(f.file):$(f.line)"
+            detail = isempty(f.expression) ? loc : "$loc — $(f.expression)"
+            push!(
+                fail_group.children,
+                TreeNode(
+                    "$i) $detail";
+                    expanded = false,
+                    style = tstyle(:error, bold = true),
+                ),
+            )
+        end
+        push!(root.children, fail_group)
+    end
+
+    # If running and no results yet, add progress indicator
+    if run.status == RUN_RUNNING && isempty(run.results)
+        n_lines = length(run.raw_output)
+        push!(
+            root.children,
+            TreeNode(
+                "Running... ($n_lines lines of output)";
+                expanded = false,
+                style = tstyle(:accent),
+            ),
+        )
+    end
+
+    # Auto-expand nodes that contain errors (walk tree, expand ancestors of error nodes)
+    _auto_expand_errors!(root)
+
+    root
+end
+
+"""Recursively expand nodes that have error descendants."""
+function _auto_expand_errors!(node::TreeNode)::Bool
+    if isempty(node.children)
+        # Leaf: check if it's an error node (style matches error)
+        return node.style == tstyle(:error)
+    end
+    has_error_child = false
+    for child in node.children
+        if _auto_expand_errors!(child)
+            has_error_child = true
+        end
+    end
+    if has_error_child
+        node.expanded = true
+    end
+    has_error_child || node.style == tstyle(:error)
+end
+
+"""Render structured test results as a collapsible TreeView."""
 function _view_test_results(
     m::MCPReplModel,
     run::TestRun,
@@ -4729,123 +4906,31 @@ function _view_test_results(
     buf::Buffer,
     title::String,
 )
-    # Build content lines for a ScrollPane
-    if m.test_output_pane === nothing || m._test_output_synced == 0
-        lines = Vector{Span}[]
-
-        # Status header
-        status_style = if run.status == RUN_PASSED
-            tstyle(:success)
-        elseif run.status in (RUN_FAILED, RUN_ERROR)
-            tstyle(:error)
-        elseif run.status == RUN_RUNNING
-            tstyle(:accent)
-        else
-            tstyle(:text_dim)
-        end
-        status_str = uppercase(string(run.status))[5:end]  # strip "RUN_"
-        push!(
-            lines,
-            [
-                Span("Status: ", tstyle(:text)),
-                Span(status_str, status_style),
-                Span("  Pass: $(run.total_pass)", tstyle(:success)),
-                Span(
-                    "  Fail: $(run.total_fail)",
-                    run.total_fail > 0 ? tstyle(:error) : tstyle(:text),
-                ),
-                Span(
-                    "  Error: $(run.total_error)",
-                    run.total_error > 0 ? tstyle(:error) : tstyle(:text),
-                ),
-            ],
-        )
-        push!(lines, Span[])
-
-        # Testset results
-        if !isempty(run.results)
-            push!(lines, [Span("Testsets:", tstyle(:text, bold = true))])
-            for r in run.results
-                indent = "  "^(r.depth + 1)
-                marker_style =
-                    (r.fail_count > 0 || r.error_count > 0) ? tstyle(:error) :
-                    tstyle(:success)
-                marker = (r.fail_count > 0 || r.error_count > 0) ? "X" : "."
-                counts = "$(r.pass_count)p"
-                r.fail_count > 0 && (counts *= " $(r.fail_count)f")
-                r.error_count > 0 && (counts *= " $(r.error_count)e")
-                push!(
-                    lines,
-                    [
-                        Span("$indent[$marker] ", marker_style),
-                        Span(r.name, tstyle(:text)),
-                        Span("  $counts", marker_style),
-                    ],
-                )
-            end
-        end
-
-        # Failure details
-        if !isempty(run.failures)
-            push!(lines, Span[])
-            push!(lines, [Span("Failures:", tstyle(:error, bold = true))])
-            push!(lines, [Span("-"^50, tstyle(:border))])
-            for (i, f) in enumerate(run.failures)
-                push!(
-                    lines,
-                    [
-                        Span("  $i) ", tstyle(:error)),
-                        Span("$(f.file):$(f.line)", tstyle(:text)),
-                    ],
-                )
-                !isempty(f.testset) &&
-                    push!(lines, [Span("     Testset: $(f.testset)", tstyle(:text_dim))])
-                !isempty(f.expression) &&
-                    push!(lines, [Span("     Expr: $(f.expression)", tstyle(:warning))])
-                !isempty(f.evaluated) &&
-                    push!(lines, [Span("     Eval: $(f.evaluated)", tstyle(:warning))])
-                if !isempty(f.backtrace)
-                    for bt_line in first(split(f.backtrace, "\n"), 3)
-                        push!(lines, [Span("     $bt_line", tstyle(:text_dim))])
-                    end
-                end
-                push!(lines, Span[])
-            end
-        end
-
-        # If running and no results yet, show progress from raw output
-        if run.status == RUN_RUNNING && isempty(run.results)
-            n_lines = length(run.raw_output)
-            push!(lines, [Span("Running... ($n_lines lines of output)", tstyle(:accent))])
-            # Show last few lines of raw output
-            for line in last(run.raw_output, min(10, n_lines))
-                push!(lines, [Span(line, tstyle(:text_dim))])
-            end
-        end
-
-        m.test_output_pane = ScrollPane(
-            lines;
-            following = run.status == RUN_RUNNING,
-            reverse = false,
+    # Build/rebuild tree when output changes
+    cur_len = length(run.raw_output) + length(run.results)
+    if m.test_tree_view === nothing || m._test_tree_synced != cur_len
+        root = _build_test_tree(run)
+        m.test_tree_view = TreeView(
+            root;
+            selected = 1,
             block = Block(
                 title = title,
                 border_style = _pane_border(m, 6, 2),
                 title_style = _pane_title(m, 6, 2),
             ),
-            show_scrollbar = true,
+            show_root = true,
         )
-        m._test_output_synced = length(run.raw_output)
+        m._test_tree_synced = cur_len
     else
-        # Check if new output arrived — rebuild pane
-        if length(run.raw_output) > m._test_output_synced
-            m._test_output_synced = 0
-            m.test_output_pane = nothing
-            _view_test_results(m, run, area, buf, title)
-            return
-        end
+        # Update block title (may change dynamically)
+        m.test_tree_view.block = Block(
+            title = title,
+            border_style = _pane_border(m, 6, 2),
+            title_style = _pane_title(m, 6, 2),
+        )
     end
 
-    m.test_output_pane !== nothing && render(m.test_output_pane, area, buf)
+    render(m.test_tree_view, area, buf)
 end
 
 """Render raw test output in a ScrollPane."""
@@ -4911,26 +4996,28 @@ end
 
 """Handle char keys on the Tests tab."""
 function _handle_tests_key!(m::MCPReplModel, evt::KeyEvent)
-    if evt.char == 'r'
-        # Trigger a new test run
-        _start_test_run_from_tui!(m)
-    elseif evt.char == 'o'
-        # Toggle results/output view
-        m.test_view_mode = m.test_view_mode == :results ? :output : :results
-        m.test_output_pane = nothing
-        m._test_output_synced = 0
-    elseif evt.char == 'F'
-        # Toggle follow mode
-        m.test_follow = !m.test_follow
-    elseif evt.char == 'x'
-        # Cancel running test
-        sel = m.selected_test_run
-        if sel >= 1 && sel <= length(m.test_runs)
-            run = m.test_runs[sel]
-            if run.status == RUN_RUNNING
-                cancel_test_run!(run)
+    @match evt.char begin
+        'r' => _start_test_run_from_tui!(m)
+        'o' => begin
+            m.test_view_mode = m.test_view_mode == :results ? :output : :results
+            _reset_test_panes!(m)
+        end
+        'F' => (m.test_follow = !m.test_follow)
+        'x' => begin
+            sel = m.selected_test_run
+            if sel >= 1 && sel <= length(m.test_runs)
+                run = m.test_runs[sel]
+                run.status == RUN_RUNNING && cancel_test_run!(run)
             end
         end
+        ' ' => begin
+            # Space toggles expand/collapse in tree view
+            fp = get(m.focused_pane, 6, 1)
+            if fp == 2 && m.test_view_mode == :results && m.test_tree_view !== nothing
+                handle_key!(m.test_tree_view, evt)
+            end
+        end
+        _ => nothing
     end
 end
 
@@ -4968,8 +5055,7 @@ function _start_test_run_from_tui!(m::MCPReplModel)
     run = spawn_test_run(project_path)
     push!(m.test_runs, run)
     m.selected_test_run = length(m.test_runs)
-    m.test_output_pane = nothing
-    m._test_output_synced = 0
+    _reset_test_panes!(m)
 end
 
 function tui(; port::Int = 2828, theme_name::Symbol = :kokaku)

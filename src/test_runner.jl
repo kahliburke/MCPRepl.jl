@@ -106,16 +106,47 @@ end
 
 flush(stdout)
 
-# ── Patch Test.jl for verbose output ──────────────────────────────────────
-# Force all @testset blocks to use verbose=true so nested results are printed.
-# We patch push_testset to set verbose=true on every DefaultTestSet before it
-# enters the stack. invoke_in_world avoids infinite recursion by calling the
-# original method from before our patch.
+# ── Patch Test.jl for verbose output + structured result emission ─────────
+# 1. Force verbose=true so the final summary table shows nested testsets
+# 2. Emit TEST_RUNNER: TESTSET_DONE lines as each testset finishes, giving
+#    the TUI real-time incremental results with hierarchy depth info.
 using Test
+
+_testset_depth = Ref(0)
+
 let _w = Base.get_world_counter()
     @eval function Test.push_testset(ts::Test.DefaultTestSet)
         ts.verbose = true
+        \$_testset_depth[] += 1
         return Base.invoke_in_world(\$_w, Test.push_testset, ts)
+    end
+end
+
+# Patch finish to emit structured TESTSET_DONE as each testset completes.
+# Emitted BEFORE calling original finish (which may throw TestSetException).
+let _w2 = Base.get_world_counter()
+    @eval function Test.finish(ts::Test.DefaultTestSet; print_results::Bool=true)
+        _depth = max(0, \$_testset_depth[] - 1)
+        \$_testset_depth[] -= 1
+
+        # Compute cumulative counts via get_test_counts.
+        # Julia 1.12+ returns a TestCounts struct; older returns an 8-tuple.
+        _tc = Test.get_test_counts(ts)
+        _p = getproperty(_tc, :passes) + getproperty(_tc, :cumulative_passes)
+        _f = getproperty(_tc, :fails) + getproperty(_tc, :cumulative_fails)
+        _e = getproperty(_tc, :errors) + getproperty(_tc, :cumulative_errors)
+        _total = _p + _f + _e
+
+        # Emit structured line (name= last to allow spaces in testset names)
+        _msg = string(
+            "TEST_RUNNER: TESTSET_DONE pass=", _p,
+            " fail=", _f, " error=", _e,
+            " total=", _total, " depth=", _depth,
+            " name=", ts.description)
+        println(_msg)
+        flush(stdout)
+
+        return Base.invoke_in_world(\$_w2, Test.finish, ts; print_results=print_results)
     end
 end
 
@@ -180,9 +211,17 @@ try
     println("TEST_RUNNER: DONE status=passed")
 catch e
     global exit_code = 1
-    println("TEST_RUNNER: ERROR \$(first(sprint(showerror, e), 500))")
-    bt = catch_backtrace()
-    println(stderr, sprint(showerror, e, bt))
+    # Test failures throw TestSetException (possibly wrapped in LoadError from include).
+    # These are expected — we already emitted TESTSET_DONE lines for each testset.
+    _is_test_failure = e isa Test.TestSetException
+    if e isa LoadError
+        _is_test_failure = e.error isa Test.TestSetException
+    end
+    if !_is_test_failure
+        println("TEST_RUNNER: ERROR \$(first(sprint(showerror, e), 500))")
+        bt = catch_backtrace()
+        println(stderr, sprint(showerror, e, bt))
+    end
     println("TEST_RUNNER: DONE status=failed")
 end
 

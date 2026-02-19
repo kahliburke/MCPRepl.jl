@@ -81,9 +81,10 @@ mutable struct _ParserState
     in_summary::Bool          # inside "Test Summary:" table
     summary_header::String    # header row of summary table
     current_testset::String   # last seen testset name for context
+    has_testset_done::Bool    # true if we've seen TESTSET_DONE lines (skip summary parsing)
 end
 
-_ParserState() = _ParserState(false, "", 0, "", "", "", String[], false, "", "")
+_ParserState() = _ParserState(false, "", 0, "", "", "", String[], false, "", "", false)
 
 # Global parser state per TestRun (keyed by run id)
 const _PARSER_STATES = Dict{Int,_ParserState}()
@@ -261,8 +262,16 @@ function _parse_runner_line!(run::TestRun, state::_ParserState, line::String)::B
         run.status = RUN_RUNNING
         return true
     elseif startswith(payload, "TESTSET_DONE")
+        state.has_testset_done = true
         kv = _parse_kv(payload)
-        name = get(kv, "name", "")
+        # name= is emitted last to allow spaces in testset names.
+        # Extract everything after " name=" rather than using _parse_kv.
+        name_idx = findfirst(" name=", payload)
+        name = if name_idx !== nothing
+            strip(payload[last(name_idx)+1:end])
+        else
+            get(kv, "name", "")
+        end
         pass = tryparse(Int, get(kv, "pass", "0"))
         fail = tryparse(Int, get(kv, "fail", "0"))
         err = tryparse(Int, get(kv, "error", "0"))
@@ -285,10 +294,16 @@ function _parse_runner_line!(run::TestRun, state::_ParserState, line::String)::B
                 something(depth, 0),
             ),
         )
-        run.total_pass = sum(r.pass_count for r in run.results; init = 0)
-        run.total_fail = sum(r.fail_count for r in run.results; init = 0)
-        run.total_error = sum(r.error_count for r in run.results; init = 0)
-        run.total_tests = sum(r.total_count for r in run.results; init = 0)
+        # Accumulate totals only from depth-0 (root) results. Each depth-0
+        # result already includes cumulative counts from its children, so we
+        # never sum non-root results. With multiple depth-0 testsets (no wrapper
+        # @testset), we += to capture all of them.
+        if something(depth, 0) == 0
+            run.total_pass += something(pass, 0)
+            run.total_fail += something(fail, 0)
+            run.total_error += something(err, 0)
+            run.total_tests += something(total, 0)
+        end
         return true
     elseif startswith(payload, "DONE")
         kv = _parse_kv(payload)
@@ -325,6 +340,15 @@ numbers from the data rows by matching column positions.
 """
 function _parse_summary_line!(run::TestRun, state::_ParserState, line::String)::Bool
     stripped = strip(line)
+
+    # If we already have structured TESTSET_DONE results, skip summary parsing
+    # but still consume lines until end of summary block to avoid mis-parsing.
+    if state.has_testset_done
+        if isempty(stripped)
+            state.in_summary = false
+        end
+        return true
+    end
 
     # Detect header row (contains column names like "Pass", "Fail", etc.)
     if isempty(state.summary_header) && contains(line, "|")
