@@ -97,9 +97,20 @@ const GENTLE_BUTTERFLY_ASCII = raw"""
             *  .  .  *  .  .  *
 """
 
+# Motivational phrases for butterfly (gentle) intro animation
+const MOTIVATIONAL_PHRASES = [
+    "You're doing great!",
+    "Security is self-care.",
+    "One step at a time.",
+    "Almost there!",
+    "You've got this!",
+    "Safe and sound.",
+]
+
 # Color palettes
 const FIRE_COLORS = [196, 202, 208, 214, 220, 226, 220, 214, 208, 202]
 const BUTTERFLY_COLORS = [219, 183, 147, 111, 75, 39, 75, 111, 147, 183]
+const PASTEL_COLORS = [218, 225, 189, 195, 159, 153, 183, 219, 225, 189]
 const WIZARD_COLORS = [33, 39, 45, 51, 87, 123, 159, 105, 69]
 const NEURO_GREENS = [22, 28, 34, 40, 46, 82, 118, 154, 190, 226]
 
@@ -779,7 +790,6 @@ function do_save!(m::SetupWizardModel)
             api_keys,
             m.allowed_ips,
             m.port,
-            false,
             m.index_dirs,
             DEFAULT_INDEX_EXTENSIONS,
         )
