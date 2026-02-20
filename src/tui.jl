@@ -573,7 +573,8 @@ end
     # Tab 1: 1=status, 2=log | Tab 2: 1=bridges, 2=agents, 3=detail
     # Tab 3: 1=list, 2=detail | Tab 4: 1=server, 2=actions, 3=clients
     # Tab 5: 1=form, 2=output | Tab 6: 1=runs list, 2=results
-    focused_pane::Dict{Int,Int} = Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1, 5 => 1, 6 => 1)
+    focused_pane::Dict{Int,Int} =
+        Dict(1 => 2, 2 => 1, 3 => 1, 4 => 1, 5 => 1, 6 => 1, 7 => 2)
 
     # ── Tests tab (tab 6) ──
     test_runs::Vector{TestRun} = TestRun[]
@@ -603,10 +604,33 @@ end
     stress_process::Any = nothing       # process handle for kill
     stress_result_file::String = ""     # path to written results
     advanced_layout::ResizableLayout = ResizableLayout(Vertical, [Fixed(14), Fill()])
+
+    # ── Search tab (tab 7) ──
+    search_layout::ResizableLayout = ResizableLayout(Vertical, [Fixed(8), Fixed(3), Fill()])
+    search_qdrant_up::Bool = false
+    search_ollama_up::Bool = false
+    search_model_available::Bool = false
+    search_collection_count::Int = 0
+    search_health_last_check::Float64 = 0.0
+    search_collections::Vector{String} = String[]
+    search_selected_collection::Int = 1
+    search_query_input::Any = nothing       # TextInput, created lazily
+    search_query_editing::Bool = false
+    search_results::Vector{Dict} = Dict[]
+    search_results_pane::Union{ScrollPane,Nothing} = nothing
+    search_chunk_type::String = "all"       # "all" / "definitions" / "windows"
+    search_result_count::Int = 10
+    search_embedding_model::String = "snowflake-arctic-embed:latest"
+
+    # ── Code staleness (Revise reload) ──
+    _code_stale::Bool = false
+    _code_last_check::Float64 = 0.0
+    _code_last_revise::Float64 = time()  # treat startup as "fresh"
+    _restart_requested::Bool = false      # unused, kept for struct stability
 end
 
 # Number of focusable panes per tab
-const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3, 5 => 3, 6 => 2)
+const _PANE_COUNTS = Dict(1 => 2, 2 => 3, 3 => 2, 4 => 3, 5 => 3, 6 => 2, 7 => 3)
 
 """Return the border style for a pane — highlighted if focused."""
 function _pane_border(m::MCPReplModel, tab::Int, pane::Int)
@@ -843,6 +867,9 @@ function Tachikoma.init!(m::MCPReplModel, _t::Tachikoma.Terminal)
 end
 
 function Tachikoma.cleanup!(m::MCPReplModel)
+    # Skip teardown on restart — we're coming right back
+    m._restart_requested && return
+
     # Disable bridge mode
     BRIDGE_MODE[] = false
     BRIDGE_CONN_MGR[] = nothing
@@ -875,7 +902,7 @@ function Tachikoma.cleanup!(m::MCPReplModel)
     _close_log_file!()
 end
 
-Tachikoma.should_quit(m::MCPReplModel) = m.quit
+Tachikoma.should_quit(m::MCPReplModel) = m.quit || m._restart_requested
 Tachikoma.task_queue(m::MCPReplModel) = m._task_queue
 
 # ── Update ────────────────────────────────────────────────────────────────────
@@ -919,6 +946,11 @@ function Tachikoma.update!(m::MCPReplModel, evt::MouseEvent)
                 handle_mouse!(m.test_output_pane, evt)
             end
         end
+        7 => begin
+            handle_resize!(m.search_layout, evt)
+            m.search_results_pane !== nothing &&
+                handle_mouse!(m.search_results_pane, evt)
+        end
         _ => nothing
     end
 end
@@ -933,6 +965,39 @@ function Tachikoma.update!(m::MCPReplModel, evt::TaskEvent)
         else
             push!(m.client_statuses, name => detected)
         end
+    elseif evt.id == :search_health
+        h = evt.value::NamedTuple
+        m.search_qdrant_up = h.qdrant_up
+        m.search_ollama_up = h.ollama_up
+        m.search_model_available = h.model_available
+        m.search_collection_count = h.collection_count
+        m.search_health_last_check = time()
+        # Also refresh collections list if Qdrant is up
+        if h.qdrant_up
+            m.search_collections = h.collections
+            if m.search_selected_collection > length(m.search_collections)
+                m.search_selected_collection = max(1, length(m.search_collections))
+            end
+        else
+            m.search_collections = String[]
+            m.search_selected_collection = 1
+        end
+    elseif evt.id == :search_results
+        m.search_results = evt.value::Vector{Dict}
+        m.search_results_pane = nothing  # force rebuild
+    elseif evt.id == :search_delete_collection
+        result = evt.value::NamedTuple
+        if result.success
+            # Remove from local list and refresh
+            filter!(c -> c != result.name, m.search_collections)
+            m.search_collection_count = length(m.search_collections)
+            if m.search_selected_collection > length(m.search_collections)
+                m.search_selected_collection = max(1, length(m.search_collections))
+            end
+        end
+        # Force a full health refresh to stay in sync
+        m.search_health_last_check = 0.0
+        _refresh_search_health_async!(m)
     end
 end
 
@@ -953,6 +1018,12 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         return
     end
 
+    # When search query is being edited, capture all input
+    if m.active_tab == 7 && m.search_query_editing
+        _handle_search_query_edit!(m, evt)
+        return
+    end
+
     tab = m.active_tab
 
     # ── Global keys (handled before per-tab dispatch) ──
@@ -960,8 +1031,11 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         # Quit
         (:char, 'q') => (m.shutting_down = true; return)
 
+        # Ctrl-U: Revise reload
+        (:ctrl, 'u') => (_revise_reload!(m); return)
+
         # Tab switching: number keys
-        (:char, c) where {'1' <= c <= '6'} => begin
+        (:char, c) where {'1' <= c <= '7'} => begin
             _switch_tab!(m, Int(c) - Int('0'))
             return
         end
@@ -973,6 +1047,7 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
         (:char, 'c') => (_switch_tab!(m, 4); return)
         (:char, 'v') => (_switch_tab!(m, 5); return)
         (:char, 't') => (_switch_tab!(m, 6); return)
+        (:char, 'h') => (_switch_tab!(m, 7); return)
 
         # Pane focus cycling
         (:tab, _) => begin
@@ -1011,6 +1086,14 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
             @match tab begin
                 5 => (m.stress_state == STRESS_RUNNING && _cancel_stress_test!(m); return)
                 6 => (_handle_tests_escape!(m); return)
+                7 => begin
+                    if m.search_query_editing
+                        m.search_query_editing = false
+                    else
+                        m.shutting_down = true
+                    end
+                    return
+                end
                 _ => (m.shutting_down = true)
             end
             return
@@ -1059,6 +1142,7 @@ function Tachikoma.update!(m::MCPReplModel, evt::KeyEvent)
 
         5 => _handle_stress_key!(m, evt)
         6 => _handle_tests_key!(m, evt)
+        7 => _handle_search_key!(m, evt)
         _ => nothing
     end
 end
@@ -1132,6 +1216,36 @@ function _handle_nav!(m::MCPReplModel, evt::KeyEvent)
                 handle_key!(m.test_output_pane, evt)
             end
         end
+
+        (7, 1) => @match evt.key begin
+            :left => begin
+                n = length(m.search_collections)
+                n > 0 && (
+                    m.search_selected_collection =
+                        max(1, m.search_selected_collection - 1)
+                )
+            end
+            :right => begin
+                n = length(m.search_collections)
+                n > 0 && (
+                    m.search_selected_collection =
+                        min(n, m.search_selected_collection + 1)
+                )
+            end
+            _ => nothing
+        end
+        (7, 2) => @match evt.key begin
+            :enter => begin
+                m.search_query_editing = true
+                if m.search_query_input === nothing
+                    m.search_query_input =
+                        TextInput(text = "", label = "Query: ", tick = m.tick)
+                end
+            end
+            _ => nothing
+        end
+        (7, 3) =>
+            (m.search_results_pane !== nothing && handle_key!(m.search_results_pane, evt))
 
         _ => nothing
     end
@@ -1208,14 +1322,16 @@ function _switch_tab!(m::MCPReplModel, tab::Int)
     # Trigger async client detection when entering the Config tab
     if tab == 4
         _refresh_client_status_async!(m)
+    elseif tab == 7
+        _refresh_search_health_async!(m)
     end
 end
 
 # Tab label lengths for mouse hit testing (must match the TabBar labels in view)
-const _TAB_LABEL_LENS = [6, 8, 8, 6, 8, 5]  # Server, Sessions, Activity, Config, Advanced, Tests
+const _TAB_LABEL_LENS = [6, 8, 8, 6, 8, 5, 6]  # Server, Sessions, Activity, Config, Advanced, Tests, Search
 const _TAB_SEPARATOR_LEN = 3  # " │ "
 
-"""Determine which tab (1-6) was clicked at `click_x`, or 0 if none."""
+"""Determine which tab (1-7) was clicked at `click_x`, or 0 if none."""
 function _tab_hit(m::MCPReplModel, click_x::Int)
     x = m._tab_bar_area.x
     for (i, llen) in enumerate(_TAB_LABEL_LENS)
@@ -1848,6 +1964,7 @@ end
 function Tachikoma.view(m::MCPReplModel, f::Frame)
     m.tick += 1
     _advance_ecg!(m)
+    _check_code_stale!(m)
     buf = f.buffer
 
     # Shutdown overlay — render one frame showing the message, then quit
@@ -2018,6 +2135,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                     Span("anced", tstyle(:text)),
                 ],
                 [Span("T", tstyle(:warning)), Span("ests", tstyle(:text))],
+                [Span("Searc", tstyle(:text)), Span("h", tstyle(:warning))],
             ];
             active = m.active_tab,
         ),
@@ -2043,6 +2161,7 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
             end
             view_tests(m, content_area, buf)
         end
+        7 => view_search(m, content_area, buf)
         _ => nothing
     end
 
@@ -2079,7 +2198,18 @@ function Tachikoma.view(m::MCPReplModel, f::Frame)
                 Span("$(n_agents) agents", tstyle(:secondary)),
             ],
             right = [
-                Span("$(uptime) ", tstyle(:text_dim)),
+                m._code_stale ?
+                Span(
+                    "● ",
+                    Style(
+                        fg = color_lerp(
+                            ColorRGB(0xff, 0xaa, 0x00),  # orange
+                            ColorRGB(0xff, 0xdd, 0x00),  # yellow
+                            breathe(m.tick; period = 45),
+                        ),
+                    ),
+                ) : Span(""),
+                Span("⏱ $(uptime) ", tstyle(:text_dim)),
                 Span(" tab:focus [q]uit ", tstyle(:text_dim)),
             ],
         ),
@@ -5058,13 +5188,559 @@ function _start_test_run_from_tui!(m::MCPReplModel)
     _reset_test_panes!(m)
 end
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Search tab (tab 7)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""Render the Search tab: status + query + results panes."""
+function view_search(m::MCPReplModel, area::Rect, buf::Buffer)
+    rows = split_layout(m.search_layout, area)
+    length(rows) >= 3 || return
+
+    _view_search_status(m, rows[1], buf)
+    _view_search_query(m, rows[2], buf)
+    _view_search_results(m, rows[3], buf)
+end
+
+"""Write a sequence of (text, style) pairs at (x, y), advancing x after each."""
+function _write_spans!(buf::Buffer, x::Int, y::Int, parts)
+    cx = x
+    for (text, style) in parts
+        set_string!(buf, cx, y, text, style)
+        cx += length(text)
+    end
+end
+
+"""Pane 1: Health status, collection selector, filter."""
+function _view_search_status(m::MCPReplModel, area::Rect, buf::Buffer)
+    blk = Block(
+        title = " Semantic Search ",
+        border_style = _pane_border(m, 7, 1),
+        title_style = _pane_title(m, 7, 1),
+    )
+    inner = render(blk, area, buf)
+    inner.height < 1 && return
+
+    y = inner.y
+    x = inner.x
+
+    # Qdrant status
+    if m.search_qdrant_up
+        _write_spans!(
+            buf,
+            x,
+            y,
+            [("● ", tstyle(:success)), ("Qdrant  connected", tstyle(:text))],
+        )
+    else
+        _write_spans!(
+            buf,
+            x,
+            y,
+            [("○ ", tstyle(:error)), ("Qdrant  not reachable", tstyle(:text))],
+        )
+    end
+    y += 1
+
+    # Ollama status
+    if m.search_ollama_up
+        if m.search_model_available
+            _write_spans!(
+                buf,
+                x,
+                y,
+                [
+                    ("● ", tstyle(:success)),
+                    ("Ollama  model ready ($(m.search_embedding_model))", tstyle(:text)),
+                ],
+            )
+        else
+            _write_spans!(
+                buf,
+                x,
+                y,
+                [
+                    ("◐ ", tstyle(:warning)),
+                    (
+                        "Ollama  up, model '$(m.search_embedding_model)' missing",
+                        tstyle(:text),
+                    ),
+                ],
+            )
+        end
+    else
+        _write_spans!(
+            buf,
+            x,
+            y,
+            [("○ ", tstyle(:error)), ("Ollama  not reachable", tstyle(:text))],
+        )
+    end
+    y += 1
+
+    # Collection selector
+    if !isempty(m.search_collections)
+        sel = clamp(m.search_selected_collection, 1, length(m.search_collections))
+        col_name = m.search_collections[sel]
+        _write_spans!(
+            buf,
+            x,
+            y,
+            [
+                ("Collection: ", tstyle(:text)),
+                (col_name, tstyle(:accent)),
+                (" ($(sel)/$(length(m.search_collections)))", tstyle(:border)),
+            ],
+        )
+    else
+        _write_spans!(
+            buf,
+            x,
+            y,
+            [("Collection: ", tstyle(:text)), ("none", tstyle(:border))],
+        )
+    end
+    y += 1
+
+    # Filter display
+    filter_label =
+        m.search_chunk_type == "all" ? "all" :
+        m.search_chunk_type == "definitions" ? "definitions" : "windows"
+    _write_spans!(
+        buf,
+        x,
+        y,
+        [
+            ("Filter: ", tstyle(:text)),
+            (filter_label, tstyle(:accent)),
+            ("  [d] cycle", tstyle(:border)),
+        ],
+    )
+    y += 1
+
+    # Key hints
+    _write_spans!(
+        buf,
+        x,
+        y,
+        [
+            ("[/]", tstyle(:warning)),
+            (" query  ", tstyle(:border)),
+            ("[r]", tstyle(:warning)),
+            (" refresh  ", tstyle(:border)),
+            ("[←→]", tstyle(:warning)),
+            (" collection  ", tstyle(:border)),
+            ("[x]", tstyle(:warning)),
+            (" delete", tstyle(:border)),
+        ],
+    )
+end
+
+"""Pane 2: Query input."""
+function _view_search_query(m::MCPReplModel, area::Rect, buf::Buffer)
+    blk = Block(
+        title = " Query ",
+        border_style = _pane_border(m, 7, 2),
+        title_style = _pane_title(m, 7, 2),
+    )
+    inner = render(blk, area, buf)
+    inner.height < 1 && return
+
+    if m.search_query_editing && m.search_query_input !== nothing
+        m.search_query_input.tick = m.tick
+        render(m.search_query_input, inner, buf)
+    else
+        text = m.search_query_input !== nothing ? Tachikoma.text(m.search_query_input) : ""
+        if isempty(text)
+            set_string!(
+                buf,
+                inner.x,
+                inner.y,
+                "Press / or Enter to search...",
+                tstyle(:border),
+            )
+        else
+            _write_spans!(
+                buf,
+                inner.x,
+                inner.y,
+                [("Query: ", tstyle(:text)), (text, tstyle(:accent))],
+            )
+        end
+    end
+end
+
+"""Pane 3: Search results displayed in a ScrollPane."""
+function _view_search_results(m::MCPReplModel, area::Rect, buf::Buffer)
+    n_results = length(m.search_results)
+
+    # Ensure scroll pane exists
+    if m.search_results_pane === nothing
+        m.search_results_pane = ScrollPane(
+            Vector{Span}[];
+            following = false,
+            reverse = false,
+            block = nothing,
+            show_scrollbar = true,
+        )
+        # Populate from current results
+        _sync_search_results_pane!(m)
+    end
+
+    pane = m.search_results_pane::ScrollPane
+    pane.block = Block(
+        title = " Results ($(n_results)) ",
+        border_style = _pane_border(m, 7, 3),
+        title_style = _pane_title(m, 7, 3),
+    )
+    render(pane, area, buf)
+end
+
+"""Rebuild the search results scroll pane content from m.search_results."""
+function _sync_search_results_pane!(m::MCPReplModel)
+    pane = m.search_results_pane
+    pane === nothing && return
+
+    if isempty(m.search_results)
+        set_content!(pane, [[Span("No results. Press / to search.", tstyle(:border))]])
+        return
+    end
+
+    # Build markdown string from results
+    md = IOBuffer()
+    for (i, result) in enumerate(m.search_results)
+        score = get(result, "score", 0.0)
+        payload = get(result, "payload", Dict())
+
+        file = get(payload, "file", "")
+        name = get(payload, "name", "")
+        start_line = get(payload, "start_line", 0)
+        end_line = get(payload, "end_line", 0)
+        chunk_type = get(payload, "type", "")
+        text = get(payload, "text", "")
+        signature = get(payload, "signature", "")
+
+        # Relative path if possible
+        if !isempty(file) && startswith(file, pwd())
+            file = relpath(file, pwd())
+        end
+
+        # Header
+        label = !isempty(signature) ? signature : name
+        println(md, "### [$i $(round(score, digits=2))] $label")
+
+        # Location
+        loc = "$file:$start_line"
+        if start_line != end_line
+            loc *= "-$end_line"
+        end
+        if !isempty(chunk_type)
+            loc *= " ($chunk_type)"
+        end
+        println(md, "`$loc`")
+        println(md)
+
+        # Code preview
+        preview = strip(string(text))
+        if length(preview) > 20
+            if length(preview) > 200
+                preview = first(preview, 200) * "…"
+            end
+            println(md, "```julia")
+            println(md, preview)
+            println(md, "```")
+        end
+        println(md)
+    end
+
+    # Render markdown to spans (with fallback to plain text)
+    md_str = String(take!(md))
+    if markdown_extension_loaded()
+        lines = Base.invokelatest(markdown_to_spans, md_str, 80)
+    else
+        lines = [[Span(l, tstyle(:text))] for l in split(md_str, '\n')]
+    end
+    set_content!(pane, lines)
+end
+
+"""Handle query text input while editing."""
+function _handle_search_query_edit!(m::MCPReplModel, evt::KeyEvent)
+    @match evt.key begin
+        :enter => begin
+            m.search_query_editing = false
+            _execute_search!(m)
+        end
+        :escape => begin
+            m.search_query_editing = false
+        end
+        _ => begin
+            m.search_query_input !== nothing && handle_key!(m.search_query_input, evt)
+        end
+    end
+end
+
+"""Handle per-tab char keys on the Search tab."""
+function _handle_search_key!(m::MCPReplModel, evt::KeyEvent)
+    @match evt.char begin
+        '/' => begin
+            m.search_query_editing = true
+            if m.search_query_input === nothing
+                m.search_query_input =
+                    TextInput(text = "", label = "Query: ", tick = m.tick)
+            end
+        end
+        'r' => _refresh_search_health_async!(m)
+        'd' => begin
+            m.search_chunk_type = if m.search_chunk_type == "all"
+                "definitions"
+            elseif m.search_chunk_type == "definitions"
+                "windows"
+            else
+                "all"
+            end
+        end
+        'x' => _delete_search_collection!(m)
+        _ => nothing
+    end
+end
+
+"""Spawn an async task to refresh Qdrant/Ollama health status."""
+function _refresh_search_health_async!(m::MCPReplModel)
+    # Cooldown: don't re-check within 10 seconds
+    if time() - m.search_health_last_check < 10.0
+        return
+    end
+    model = m.search_embedding_model
+    spawn_task!(m._task_queue, :search_health) do
+        health = check_search_health(; model = model)
+        collections = health.qdrant_up ? QdrantClient.list_collections() : String[]
+        (
+            qdrant_up = health.qdrant_up,
+            ollama_up = health.ollama_up,
+            model_available = health.model_available,
+            collection_count = health.collection_count,
+            collections = collections,
+        )
+    end
+end
+
+"""Spawn an async task to execute a semantic search."""
+function _execute_search!(m::MCPReplModel)
+    query_text =
+        m.search_query_input !== nothing ? Tachikoma.text(m.search_query_input) : ""
+    isempty(strip(query_text)) && return
+
+    # Need a collection
+    if isempty(m.search_collections)
+        m.search_results = [
+            Dict(
+                "payload" => Dict(
+                    "name" => "Error",
+                    "text" => "No collections available. Is Qdrant running?",
+                    "file" => "",
+                    "start_line" => 0,
+                    "end_line" => 0,
+                    "type" => "",
+                    "signature" => "",
+                ),
+                "score" => 0.0,
+            ),
+        ]
+        m.search_results_pane = nothing
+        return
+    end
+
+    collection = m.search_collections[clamp(
+        m.search_selected_collection,
+        1,
+        length(m.search_collections),
+    )]
+    chunk_type = m.search_chunk_type
+    limit = m.search_result_count
+    model = m.search_embedding_model
+
+    # Clear results and show "Searching..."
+    m.search_results = [
+        Dict(
+            "payload" => Dict(
+                "name" => "Searching...",
+                "text" => "Generating embedding and querying Qdrant...",
+                "file" => "",
+                "start_line" => 0,
+                "end_line" => 0,
+                "type" => "",
+                "signature" => "",
+            ),
+            "score" => 0.0,
+        ),
+    ]
+    m.search_results_pane = nothing
+
+    spawn_task!(m._task_queue, :search_results) do
+        # Pre-flight check
+        svc_err = _require_services(need_ollama = true, model = model)
+        if svc_err !== nothing
+            return Dict[Dict(
+                "payload" => Dict(
+                    "name" => "Error",
+                    "text" => svc_err,
+                    "file" => "",
+                    "start_line" => 0,
+                    "end_line" => 0,
+                    "type" => "",
+                    "signature" => "",
+                ),
+                "score" => 0.0,
+            )]
+        end
+
+        embedding = get_ollama_embedding(query_text; model = model)
+        if isempty(embedding)
+            return Dict[Dict(
+                "payload" => Dict(
+                    "name" => "Error",
+                    "text" => "Failed to generate embedding with model '$model'",
+                    "file" => "",
+                    "start_line" => 0,
+                    "end_line" => 0,
+                    "type" => "",
+                    "signature" => "",
+                ),
+                "score" => 0.0,
+            )]
+        end
+
+        # Build filter
+        filter = nothing
+        if chunk_type == "definitions"
+            filter = Dict(
+                "should" => [
+                    Dict("key" => "type", "match" => Dict("value" => "function")),
+                    Dict("key" => "type", "match" => Dict("value" => "struct")),
+                    Dict("key" => "type", "match" => Dict("value" => "macro")),
+                    Dict("key" => "type", "match" => Dict("value" => "const")),
+                    Dict("key" => "type", "match" => Dict("value" => "tool")),
+                ],
+            )
+        elseif chunk_type == "windows"
+            filter = Dict(
+                "must" => [Dict("key" => "type", "match" => Dict("value" => "window"))],
+            )
+        end
+
+        results = QdrantClient.search(collection, embedding; limit = limit, filter = filter)
+
+        # Check for error results
+        if length(results) == 1 && haskey(first(results), "error")
+            return Dict[Dict(
+                "payload" => Dict(
+                    "name" => "Error",
+                    "text" => first(results)["error"],
+                    "file" => "",
+                    "start_line" => 0,
+                    "end_line" => 0,
+                    "type" => "",
+                    "signature" => "",
+                ),
+                "score" => 0.0,
+            )]
+        end
+
+        return Dict[r for r in results]
+    end
+end
+
+"""Delete the currently selected collection from Qdrant."""
+function _delete_search_collection!(m::MCPReplModel)
+    isempty(m.search_collections) && return
+    sel = clamp(m.search_selected_collection, 1, length(m.search_collections))
+    col_name = m.search_collections[sel]
+
+    spawn_task!(m._task_queue, :search_delete_collection) do
+        ok = QdrantClient.delete_collection(col_name)
+        (name = col_name, success = ok)
+    end
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Code staleness / Revise reload
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""Check if any source files have been modified since the last Revise reload."""
+function _check_code_stale!(m::MCPReplModel)
+    now = time()
+    now - m._code_last_check < 3.0 && return  # check every 3 seconds
+    m._code_last_check = now
+
+    pkg = pkgdir(MCPRepl)
+    pkg === nothing && return
+    src_dir = joinpath(pkg, "src")
+    isdir(src_dir) || return
+
+    for f in readdir(src_dir)
+        endswith(f, ".jl") || continue
+        fpath = joinpath(src_dir, f)
+        if mtime(fpath) > m._code_last_revise
+            m._code_stale = true
+            return
+        end
+    end
+    m._code_stale = false
+end
+
+"""Request TUI restart — sets flag so app() exits, tui() loop calls Revise and re-enters."""
+function _revise_reload!(m::MCPReplModel)
+    m._restart_requested = true
+end
+
+function _try_revise!()
+    for (pkg_id, mod) in Base.loaded_modules
+        if pkg_id.name == "Revise"
+            revise_fn = getfield(mod, :revise)
+            Base.invokelatest(revise_fn)
+            return true
+        end
+    end
+    return false
+end
+
 function tui(; port::Int = 2828, theme_name::Symbol = :kokaku)
     if Threads.nthreads() < 2
         @warn """MCPRepl TUI running with only 1 thread — UI may be unresponsive.
                  Start Julia with: julia -t auto
                  Or set: JULIA_NUM_THREADS=auto"""
     end
+
+    # Load markdown extension early so it's in the world age before app() compiles
+    try
+        enable_markdown()
+    catch
+    end
+
     set_theme!(theme_name)
     model = MCPReplModel(server_port = port)
-    app(model; fps = 30)
+
+    while true
+        # invokelatest so that after Revise updates, the new method bodies
+        # for view()/update!() are visible inside Tachikoma's event loop.
+        Base.invokelatest(app, model; fps = 30)
+
+        if model._restart_requested
+            model._restart_requested = false
+            model.quit = false
+
+            revised = _try_revise!()
+            model._code_stale = false
+            model._code_last_revise = time()
+            _push_log!(
+                :info,
+                revised ? "Ctrl-U: Revise reload complete — restarting TUI" :
+                "Ctrl-U: Revise not available — restarting TUI",
+            )
+            Base.invokelatest(set_theme!, theme_name)
+            continue
+        end
+
+        break  # Normal quit
+    end
 end

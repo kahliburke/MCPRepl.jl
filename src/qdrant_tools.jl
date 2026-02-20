@@ -70,6 +70,98 @@ function get_ollama_embedding(text::String; model::String = "nomic-embed-text")
 end
 
 # ============================================================================
+# Health Checks & Service Guards
+# ============================================================================
+
+"""
+    ping_ollama() -> Bool
+
+Check if Ollama is reachable via GET /api/tags with a 2-second timeout.
+"""
+function ping_ollama()
+    try
+        response = HTTP.get(
+            "http://localhost:11434/api/tags";
+            connect_timeout = 2,
+            readtimeout = 3,
+        )
+        return response.status == 200
+    catch
+        return false
+    end
+end
+
+"""
+    check_ollama_model(model::String) -> Bool
+
+Check if a specific model is available in Ollama.
+"""
+function check_ollama_model(model::String)
+    try
+        response = HTTP.get(
+            "http://localhost:11434/api/tags";
+            connect_timeout = 2,
+            readtimeout = 3,
+        )
+        data = JSON.parse(String(response.body))
+        models = get(data, "models", [])
+        for m in models
+            name = get(m, "name", "")
+            # Match "snowflake-arctic-embed:latest" or just "snowflake-arctic-embed"
+            if name == model || startswith(name, split(model, ":")[1])
+                return true
+            end
+        end
+        return false
+    catch
+        return false
+    end
+end
+
+"""
+    check_search_health(; model=DEFAULT_EMBEDDING_MODEL)
+
+Returns a NamedTuple (qdrant_up, ollama_up, model_available, collection_count).
+"""
+function check_search_health(; model::String = DEFAULT_EMBEDDING_MODEL)
+    qdrant_up = QdrantClient.ping()
+    ollama_up = ping_ollama()
+    model_available = ollama_up ? check_ollama_model(model) : false
+    collection_count = qdrant_up ? length(QdrantClient.list_collections()) : 0
+    return (
+        qdrant_up = qdrant_up,
+        ollama_up = ollama_up,
+        model_available = model_available,
+        collection_count = collection_count,
+    )
+end
+
+"""
+    _require_services(; need_qdrant=true, need_ollama=false, model=DEFAULT_EMBEDDING_MODEL) -> Union{String,Nothing}
+
+Pre-flight check before tool execution. Returns a friendly error string if
+any required service is unavailable, or `nothing` if all checks pass.
+"""
+function _require_services(;
+    need_qdrant::Bool = true,
+    need_ollama::Bool = false,
+    model::String = DEFAULT_EMBEDDING_MODEL,
+)
+    if need_qdrant && !QdrantClient.ping()
+        return "Qdrant is not reachable at $(QdrantClient.QDRANT_URL[]). Is it running? (e.g., `docker run -p 6333:6333 qdrant/qdrant`)"
+    end
+    if need_ollama
+        if !ping_ollama()
+            return "Ollama is not reachable at http://localhost:11434. Is it running? (e.g., `ollama serve`)"
+        end
+        if !check_ollama_model(model)
+            return "Ollama model '$model' is not available. Pull it with: `ollama pull $model`"
+        end
+    end
+    return nothing
+end
+
+# ============================================================================
 # MCP Tool Definitions
 # ============================================================================
 
@@ -140,10 +232,13 @@ qdrant_list_collections_tool = @mcp_tool(
     "List all available Qdrant vector collections. Shows which code collections are available for semantic search.",
     Dict("type" => "object", "properties" => Dict(), "required" => []),
     function (args)
+        err = _require_services()
+        err !== nothing && return err
+
         collections = QdrantClient.list_collections()
 
         if isempty(collections)
-            return "No collections found. Make sure Qdrant is running on http://localhost:6333"
+            return "No collections found in Qdrant."
         end
 
         result = "📚 Available Collections:\n\n"
@@ -169,10 +264,18 @@ qdrant_collection_info_tool = @mcp_tool(
         "required" => ["collection"],
     ),
     function (args)
-        collection = get(args, "collection", "")
+        err = _require_services()
+        err !== nothing && return err
 
-        if isempty(collection)
+        raw_collection = get(args, "collection", "")
+        if isempty(raw_collection)
             return "Error: collection name is required"
+        end
+
+        collections = QdrantClient.list_collections()
+        collection, col_err = _resolve_collection(raw_collection, collections)
+        if col_err !== nothing
+            return "Error: $col_err"
         end
 
         info = QdrantClient.get_collection_info(collection)
@@ -240,25 +343,27 @@ qdrant_search_code_tool = @mcp_tool(
         "required" => ["query"],
     ),
     function (args)
+        embedding_model = get(args, "embedding_model", "snowflake-arctic-embed:latest")
+        err = _require_services(need_ollama = true, model = embedding_model)
+        err !== nothing && return err
+
         query = get(args, "query", "")
         limit = Int(get(args, "limit", 5))
         chunk_type = get(args, "chunk_type", "all")
-        embedding_model = get(args, "embedding_model", "snowflake-arctic-embed:latest")
 
         if isempty(query)
             return "Error: query is required"
         end
 
-        # Get collection name - default to current project's collection
-        collection = get(args, "collection", nothing)
-        if collection === nothing || (collection isa String && isempty(collection))
-            collection = String(get_project_collection_name(pwd()))
-
-            # Verify the collection exists
-            collections = QdrantClient.list_collections()
-            if !(collection in collections)
-                return "Error: Collection '$collection' not found for current project. Available collections: $(join(collections, ", ")). Run index_project first or specify a collection name."
-            end
+        # Resolve collection name (normalize + fuzzy match)
+        raw_collection = get(args, "collection", nothing)
+        if raw_collection isa String && isempty(raw_collection)
+            raw_collection = nothing
+        end
+        collections = QdrantClient.list_collections()
+        collection, col_err = _resolve_collection(raw_collection, collections)
+        if col_err !== nothing
+            return "Error: $col_err"
         end
 
         # Get embedding for query
@@ -381,11 +486,20 @@ qdrant_browse_collection_tool = @mcp_tool(
         "required" => ["collection"],
     ),
     function (args)
-        collection = get(args, "collection", "")
+        err = _require_services()
+        err !== nothing && return err
+
+        raw_collection = get(args, "collection", "")
         limit = get(args, "limit", 10)
 
-        if isempty(collection)
+        if isempty(raw_collection)
             return "Error: collection name is required"
+        end
+
+        collections = QdrantClient.list_collections()
+        collection, col_err = _resolve_collection(raw_collection, collections)
+        if col_err !== nothing
+            return "Error: $col_err"
         end
 
         result = QdrantClient.scroll_points(collection; limit = limit)
@@ -459,6 +573,9 @@ qdrant_index_project_tool = @mcp_tool(
         "required" => [],
     ),
     function (args)
+        err = _require_services(need_ollama = true)
+        err !== nothing && return err
+
         project_path = get(args, "project_path", pwd())
         collection = get(args, "collection", nothing)
         recreate = get(args, "recreate", false)
@@ -471,6 +588,11 @@ qdrant_index_project_tool = @mcp_tool(
             collection = nothing
         end
 
+        # Normalize for display (index_project also normalizes internally)
+        col_name =
+            collection === nothing ? get_project_collection_name(project_path) :
+            normalize_collection_name(collection)
+
         chunks = index_project(
             project_path;
             collection = collection,
@@ -479,9 +601,6 @@ qdrant_index_project_tool = @mcp_tool(
             extra_dirs = extra_dirs,
             extensions = extensions,
         )
-
-        col_name =
-            collection === nothing ? get_project_collection_name(project_path) : collection
 
         return "✓ Indexed $chunks chunks into '$col_name' from $(1 + length(extra_dirs)) director$(length(extra_dirs) == 0 ? "y" : "ies")."
     end
@@ -509,6 +628,9 @@ qdrant_sync_index_tool = @mcp_tool(
         "required" => [],
     ),
     function (args)
+        err = _require_services(need_ollama = true)
+        err !== nothing && return err
+
         project_path = get(args, "project_path", pwd())
         collection = get(args, "collection", nothing)
         verbose = get(args, "verbose", true)
@@ -517,6 +639,11 @@ qdrant_sync_index_tool = @mcp_tool(
             collection = nothing
         end
 
+        # Normalize for display (sync_index also normalizes internally)
+        col_name =
+            collection === nothing ? get_project_collection_name(project_path) :
+            normalize_collection_name(collection)
+
         result = sync_index(
             project_path;
             collection = collection,
@@ -524,8 +651,6 @@ qdrant_sync_index_tool = @mcp_tool(
             verbose = verbose,
         )
 
-        col_name =
-            collection === nothing ? get_project_collection_name(project_path) : collection
         return "✓ Sync complete for '$col_name': $(result.reindexed) files reindexed, $(result.deleted) files removed, $(result.chunks) chunks indexed."
     end
 )
@@ -552,16 +677,26 @@ qdrant_reindex_file_tool = @mcp_tool(
         "required" => ["file_path", "collection"],
     ),
     function (args)
+        err = _require_services(need_ollama = true)
+        err !== nothing && return err
+
         file_path = get(args, "file_path", "")
-        collection = get(args, "collection", "")
+        raw_collection = get(args, "collection", "")
         project_path = get(args, "project_path", pwd())
         verbose = get(args, "verbose", true)
 
         if isempty(file_path)
             return "Error: file_path is required"
         end
-        if isempty(collection)
+        if isempty(raw_collection)
             return "Error: collection is required"
+        end
+
+        # Resolve collection name (reindex_file also normalizes internally)
+        collections = QdrantClient.list_collections()
+        collection, col_err = _resolve_collection(raw_collection, collections)
+        if col_err !== nothing
+            return "Error: $col_err"
         end
 
         chunks = reindex_file(

@@ -4,6 +4,7 @@ version = "0.8.0"
 authors = ["Kahli Burke <kahli@kahliburke.com>", "Hans Würfel <git@wuerfel.io>"]
 
 [deps]
+CommonMark = "a80b9123-70ca-4bc0-993e-6e3bcb318db6"
 Coverage = "a2441757-f6aa-5fb2-8edb-039e3f45d037"
 DBInterface = "a10d1c49-ce27-4219-8d33-6db1a4562965"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
@@ -35,6 +36,7 @@ ZMQ = "c2297ded-f4af-51ae-bb23-16f91089e4e1"
 
 [compat]
 Aqua = "0.8"
+CommonMark = "0.8.16"
 Coverage = "1.8.1"
 DBInterface = "2.6.1"
 DataFrames = "1.8.1"

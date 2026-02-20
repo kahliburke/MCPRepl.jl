@@ -274,19 +274,114 @@ function get_deleted_files(project_path::String, collection::String)
 end
 
 """
-    get_project_collection_name(project_path::String=pwd()) -> String
+    normalize_collection_name(name::String) -> String
 
-Generate a collection name based on the project directory.
-Uses the directory name, sanitized for Qdrant collection naming rules.
+Normalize a collection name for Qdrant: strip `.jl` suffix, lowercase,
+replace non-alphanumeric with underscore, collapse runs, strip edges.
+
+This is the single source of truth for collection name normalization.
+Both auto-generated names (from project paths) and user-provided names
+should go through this function so that "MCPRepl.jl", "MCPRepl",
+"mcprepl", and "mcprepl_jl" all resolve to the same collection.
 """
-function get_project_collection_name(project_path::String=pwd())
-    name = basename(abspath(project_path))
+function normalize_collection_name(name::String)
+    # Strip common suffixes before normalizing
+    name = replace(name, r"\.jl$"i => "")
     # Sanitize: lowercase, replace non-alphanumeric with underscore
     name = lowercase(name)
     name = replace(name, r"[^a-z0-9]" => "_")
     name = replace(name, r"_+" => "_")  # Collapse multiple underscores
     name = strip(name, '_')
     return isempty(name) ? "default" : name
+end
+
+"""
+    get_project_collection_name(project_path::String=pwd()) -> String
+
+Generate a collection name based on the project directory.
+Uses the directory name, sanitized via `normalize_collection_name`.
+"""
+function get_project_collection_name(project_path::String=pwd())
+    return normalize_collection_name(basename(abspath(project_path)))
+end
+
+"""
+    _suggest_collections(target::String, available::Vector{String}; max_suggestions::Int=5) -> Vector{String}
+
+Return collections from `available` that are similar to `target`, sorted by relevance.
+Uses normalized prefix/substring matching and simple edit-distance heuristics.
+"""
+function _suggest_collections(target::String, available::Vector{String}; max_suggestions::Int=5)
+    isempty(available) && return String[]
+    norm_target = normalize_collection_name(target)
+
+    scored = Tuple{Float64,String}[]
+    for col in available
+        norm_col = normalize_collection_name(col)
+        score = 0.0
+
+        # Exact normalized match (shouldn't reach here, but just in case)
+        if norm_col == norm_target
+            score = 1.0
+        # One is a prefix of the other
+        elseif startswith(norm_col, norm_target) || startswith(norm_target, norm_col)
+            score = 0.8
+        # Substring match
+        elseif contains(norm_col, norm_target) || contains(norm_target, norm_col)
+            score = 0.6
+        # Shared prefix length
+        else
+            shared = 0
+            for (a, b) in zip(norm_target, norm_col)
+                a == b ? (shared += 1) : break
+            end
+            if shared > 0
+                score = 0.3 * shared / max(length(norm_target), length(norm_col))
+            end
+        end
+        score > 0.0 && push!(scored, (score, col))
+    end
+
+    sort!(scored; by=first, rev=true)
+    return [s[2] for s in scored[1:min(max_suggestions, length(scored))]]
+end
+
+"""
+    _resolve_collection(name::Union{String,Nothing}, available::Vector{String}; project_path::String=pwd()) -> (String, Union{String,Nothing})
+
+Resolve a collection name (possibly user-provided) against available collections.
+Returns `(resolved_name, error_message)`. If error_message is nothing, the name is valid.
+"""
+function _resolve_collection(name::Union{String,Nothing}, available::Vector{String}; project_path::String=pwd())
+    # Default to project collection if not specified
+    if name === nothing || isempty(name)
+        name = get_project_collection_name(project_path)
+    end
+
+    # Direct match — fast path
+    if name in available
+        return (name, nothing)
+    end
+
+    # Try normalized match
+    norm_name = normalize_collection_name(name)
+    for col in available
+        if normalize_collection_name(col) == norm_name
+            return (col, nothing)  # Return the actual Qdrant collection name
+        end
+    end
+
+    # No match — build helpful error with suggestions
+    suggestions = _suggest_collections(name, available)
+    msg = "Collection '$name' not found."
+    if !isempty(suggestions)
+        msg *= " Did you mean: $(join(suggestions, ", "))?"
+    elseif !isempty(available)
+        msg *= " Available: $(join(available, ", "))."
+    else
+        msg *= " No collections exist. Run index_project first."
+    end
+    return (name, msg)
 end
 
 """
@@ -994,6 +1089,7 @@ function reindex_file(
     verbose::Bool=true,
     silent::Bool=false,
 )
+    collection = normalize_collection_name(collection)
     !silent && verbose && println("  Re-indexing: $(basename(file_path))")
     with_index_logger(() -> @info "Re-indexing file" file = basename(file_path))
 
@@ -1088,10 +1184,8 @@ function index_project(
     extra_dirs::Vector{String}=String[],
     extensions::Union{Vector{String},Nothing}=nothing,
 )
-    # Use project name as collection if not specified
-    col_name = String(
-        collection === nothing ? get_project_collection_name(project_path) : collection,
-    )
+    # Use project name as collection if not specified; always normalize
+    col_name = collection === nothing ? get_project_collection_name(project_path) : normalize_collection_name(collection)
 
     # Load config to get default directories and extensions
     config = load_security_config(project_path)
@@ -1192,9 +1286,7 @@ function sync_index(
     verbose::Bool=true,
     silent::Bool=false,
 )
-    col_name = String(
-        collection === nothing ? get_project_collection_name(project_path) : collection,
-    )
+    col_name = collection === nothing ? get_project_collection_name(project_path) : normalize_collection_name(collection)
 
     # Load indexing configuration from previous index_project call
     state = load_index_state(project_path)

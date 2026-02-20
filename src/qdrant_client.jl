@@ -37,7 +37,7 @@ function list_collections()
         return String[]
     catch e
         @error "Failed to list collections" exception = e
-        return String[]
+        return String[]  # empty → callers check length; _friendly_error used at tool layer
     end
 end
 
@@ -53,7 +53,7 @@ function get_collection_info(collection::String)
         return get(data, "result", Dict())
     catch e
         @error "Failed to get collection info" collection = collection exception = e
-        return Dict("error" => string(e))
+        return Dict("error" => _friendly_error(e))
     end
 end
 
@@ -103,7 +103,7 @@ function search(
         return get(data, "result", [])
     catch e
         @error "Search failed" collection = collection exception = e
-        return [Dict("error" => string(e))]
+        return [Dict("error" => _friendly_error(e))]
     end
 end
 
@@ -132,7 +132,7 @@ function search_with_text(
         return search(collection, embedding; limit = limit)
     catch e
         @error "Text search failed" collection = collection exception = e
-        return [Dict("error" => string(e))]
+        return [Dict("error" => _friendly_error(e))]
     end
 end
 
@@ -164,7 +164,7 @@ function scroll_points(collection::String; limit::Int = 10, offset = nothing)
         return get(data, "result", Dict())
     catch e
         @error "Scroll failed" collection = collection exception = e
-        return Dict("error" => string(e))
+        return Dict("error" => _friendly_error(e))
     end
 end
 
@@ -181,7 +181,7 @@ function get_point(collection::String, point_id)
     catch e
         @error "Failed to get point" collection = collection point_id = point_id exception =
             e
-        return Dict("error" => string(e))
+        return Dict("error" => _friendly_error(e))
     end
 end
 
@@ -333,6 +333,47 @@ function count_by_file(collection::String, file_path::String)
     catch e
         @error "Count by file failed" collection = collection exception = e
         return -1
+    end
+end
+
+"""
+    ping() -> Bool
+
+Check if Qdrant is reachable. Returns true if /healthz returns 200.
+"""
+function ping()
+    try
+        response = HTTP.get("$(QDRANT_URL[])/healthz"; connect_timeout = 2, readtimeout = 3)
+        return response.status == 200
+    catch
+        return false
+    end
+end
+
+"""
+    _friendly_error(e) -> String
+
+Classify an exception into a user-friendly error message.
+"""
+function _friendly_error(e)
+    msg = string(e)
+    if e isa HTTP.Exceptions.ConnectError ||
+       contains(msg, "ConnectError") ||
+       contains(msg, "connection refused")
+        return "Qdrant is not reachable at $(QDRANT_URL[]). Is it running?"
+    elseif e isa HTTP.Exceptions.StatusError
+        status = e.status
+        if status == 404
+            return "Collection not found (404)"
+        elseif status == 400
+            return "Bad request to Qdrant (400): $(first(msg, 200))"
+        else
+            return "Qdrant returned HTTP $status"
+        end
+    elseif contains(msg, "TimeoutError") || contains(msg, "timeout")
+        return "Qdrant request timed out"
+    else
+        return "Qdrant error: $(first(msg, 300))"
     end
 end
 
